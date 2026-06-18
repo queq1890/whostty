@@ -48,7 +48,7 @@ The `Tests` column below tracks this per layer.
 | VT input encoding | `src/input/` (key/mouse/paste encode) | — (via `ghostty-vt` `input`) | dependency | done | upstream |
 | Entrypoint | `src/main.zig` | `src/main.zig` | port | scaffolded | done (vt wiring) |
 | App | `src/App.zig` | `src/App.zig` | port | scaffolded | port tests |
-| Surface | `src/Surface.zig` | `src/Surface.zig` | port | scaffolded | port tests |
+| Surface | `src/Surface.zig` | `src/Surface.zig` | port | resize done | done (host: sizing) |
 | apprt registry | `src/apprt.zig` | `src/apprt.zig` | port | scaffolded | port tests |
 | apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/Window.zig` | template | done (window+WGL) | fresh tests |
 | Windows API | (ghostty `src/os/windows.zig`) | `src/os/windows.zig` | template | done | fresh tests |

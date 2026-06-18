@@ -27,6 +27,8 @@ comptime {
         _ = &Renderer.deinit;
         _ = &Renderer.setAtlas;
         _ = &Renderer.draw;
+
+        _ = &@import("Surface.zig").Surface.resizePixels;
     }
 }
 
@@ -96,6 +98,7 @@ test {
     _ = @import("input.zig");
     _ = @import("font/Atlas.zig");
     _ = @import("renderer/OpenGL.zig");
+    _ = @import("Surface.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 
