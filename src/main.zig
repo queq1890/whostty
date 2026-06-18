@@ -9,6 +9,21 @@ const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const Pty = @import("pty.zig").Pty;
 
+// Force analysis (and thus link checking) of the Windows-only modules on
+// Windows builds. Full integration is tracked by #11.
+comptime {
+    if (builtin.os.tag == .windows) {
+        const Window = @import("apprt/win32/Window.zig").Window;
+        _ = &Window.init;
+        _ = &Window.deinit;
+        _ = &Window.pump;
+        _ = &Window.poll;
+        _ = &Window.swapBuffers;
+        _ = &Window.clientSize;
+        _ = &Window.makeCurrent;
+    }
+}
+
 pub fn main() !void {
     if (comptime builtin.os.tag == .windows) {
         return runConpty();

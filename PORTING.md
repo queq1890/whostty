@@ -50,7 +50,7 @@ The `Tests` column below tracks this per layer.
 | App | `src/App.zig` | `src/App.zig` | port | scaffolded | port tests |
 | Surface | `src/Surface.zig` | `src/Surface.zig` | port | scaffolded | port tests |
 | apprt registry | `src/apprt.zig` | `src/apprt.zig` | port | scaffolded | port tests |
-| apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/` | template | scaffolded | fresh tests |
+| apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/Window.zig` | template | done (window+WGL) | fresh tests |
 | Windows API | (ghostty `src/os/windows.zig`) | `src/os/windows.zig` | template | done | fresh tests |
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
 | Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done | done (host) |
