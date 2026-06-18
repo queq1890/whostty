@@ -20,6 +20,17 @@ reimplement the VT core — it depends on
 See [CONTEXT.md](CONTEXT.md) for the project glossary and [docs/adr/](docs/adr/)
 for architecture decisions.
 
+## Building
+
+Requires **Zig 0.15.2** (pinned in `.zigversion` and `build.zig.zon`'s
+`minimum_zig_version`, matching the ghostty `v1.3.1` dependency).
+
+```sh
+zig build        # build
+zig build run    # run (bootstrap: prints the libghostty-vt grid wiring check)
+zig build test   # unit tests
+```
+
 ## Upstream tracking
 
 A scheduled Claude Routine watches ghostty major/minor releases weekly and opens
