@@ -69,6 +69,11 @@ fn runVtDemo() !void {
     try out.flush();
 }
 
+test {
+    // Pull in host-testable slice-0 modules' tests.
+    _ = @import("termio.zig");
+}
+
 test "vt: feed bytes and read back grid state" {
     const alloc = std.testing.allocator;
 
