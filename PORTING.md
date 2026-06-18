@@ -53,7 +53,7 @@ The `Tests` column below tracks this per layer.
 | apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/` | template | scaffolded | fresh tests |
 | Windows API | (ghostty `src/os/windows.zig`) | `src/os/windows.zig` | template | done | fresh tests |
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
-| Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | scaffolded | port tests |
+| Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done | done (host) |
 | Renderer registry | `src/renderer.zig` | `src/renderer.zig` | port | scaffolded | port tests |
 | Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL) | port | scaffolded | port tests |
 | Font | `src/font/main.zig` | `src/font/main.zig` (Freetype) | port | scaffolded | port tests |
