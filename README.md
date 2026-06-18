@@ -5,8 +5,11 @@ philosophy. whostty faithfully mirrors ghostty's `src/` layout but does **not**
 reimplement the VT core — it depends on
 [libghostty-vt](https://github.com/ghostty-org/ghostty/pull/8840) instead.
 
-> Status: **early bootstrap.** The first goal is a minimal end-to-end vertical
-> slice (slice-0): a real Win32 window rendering an interactive shell via ConPTY.
+> Status: **slice-0 wired.** The end-to-end vertical slice is implemented — a
+> Win32 window + WGL/OpenGL renderer, a ConPTY-backed shell, a reader thread
+> feeding libghostty-vt, keyboard input, and resize. It cross-compiles and links
+> for `x86_64-windows`. Running it on screen (and the Freetype glyph atlas via
+> `-Dfreetype`) requires a Windows host with a GPU/display.
 
 ## Architecture
 
@@ -26,10 +29,15 @@ Requires **Zig 0.15.2** (pinned in `.zigversion` and `build.zig.zon`'s
 `minimum_zig_version`, matching the ghostty `v1.3.1` dependency).
 
 ```sh
-zig build        # build
-zig build run    # run (bootstrap: prints the libghostty-vt grid wiring check)
-zig build test   # unit tests
+zig build                          # build (host)
+zig build test                     # host unit tests (termio, input, atlas, sizing, …)
+zig build -Dtarget=x86_64-windows  # the real target: Win32 terminal
+zig build -Dfreetype               # also build the Freetype glyph rasterizer
 ```
+
+On a non-Windows host the binary runs a libghostty-vt wiring demo; the actual
+terminal (`apprt/win32`) is produced by the Windows target. `-Dfreetype` fetches
+freetype source, so it needs network access.
 
 ## Upstream tracking
 
