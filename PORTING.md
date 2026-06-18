@@ -57,7 +57,7 @@ The `Tests` column below tracks this per layer.
 | Renderer registry | `src/renderer.zig` | `src/renderer.zig` | port | scaffolded | port tests |
 | Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL) | port | scaffolded | port tests |
 | Font | `src/font/main.zig` | `src/font/main.zig` (Freetype) | port | scaffolded | port tests |
-| Input (app-side) | `src/input.zig` | `src/input.zig` | port | scaffolded | port tests |
+| Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.

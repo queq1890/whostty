@@ -72,6 +72,7 @@ fn runVtDemo() !void {
 test {
     // Pull in host-testable slice-0 modules' tests.
     _ = @import("termio.zig");
+    _ = @import("input.zig");
 }
 
 test "vt: feed bytes and read back grid state" {
