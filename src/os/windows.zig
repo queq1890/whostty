@@ -127,3 +127,160 @@ pub extern "kernel32" fn CreateProcessW(
     lpStartupInfo: *STARTUPINFOW,
     lpProcessInformation: *PROCESS_INFORMATION,
 ) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
+
+// --- GUI types (not in std.os.windows) -------------------------------------
+
+pub const HWND = windows.HWND;
+pub const HDC = windows.HDC;
+pub const HGLRC = windows.HGLRC;
+pub const HINSTANCE = windows.HINSTANCE;
+pub const HMENU = windows.HMENU;
+pub const HICON = windows.HICON;
+pub const HCURSOR = windows.HCURSOR;
+pub const HBRUSH = windows.HBRUSH;
+pub const WPARAM = windows.WPARAM;
+pub const LPARAM = windows.LPARAM;
+pub const LRESULT = windows.LRESULT;
+pub const ATOM = windows.ATOM;
+pub const UINT = c_uint;
+pub const INT = c_int;
+pub const POINT = windows.POINT;
+pub const RECT = windows.RECT;
+pub const LONG_PTR = isize;
+
+pub const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+
+pub const WNDCLASSEXW = extern struct {
+    cbSize: UINT,
+    style: UINT,
+    lpfnWndProc: WNDPROC,
+    cbClsExtra: INT,
+    cbWndExtra: INT,
+    hInstance: HINSTANCE,
+    hIcon: ?HICON,
+    hCursor: ?HCURSOR,
+    hbrBackground: ?HBRUSH,
+    lpszMenuName: ?LPCWSTR,
+    lpszClassName: LPCWSTR,
+    hIconSm: ?HICON,
+};
+
+pub const MSG = extern struct {
+    hwnd: ?HWND,
+    message: UINT,
+    wParam: WPARAM,
+    lParam: LPARAM,
+    time: DWORD,
+    pt: POINT,
+    lPrivate: DWORD,
+};
+
+pub const PIXELFORMATDESCRIPTOR = extern struct {
+    nSize: WORD,
+    nVersion: WORD,
+    dwFlags: DWORD,
+    iPixelType: BYTE,
+    cColorBits: BYTE,
+    cRedBits: BYTE,
+    cRedShift: BYTE,
+    cGreenBits: BYTE,
+    cGreenShift: BYTE,
+    cBlueBits: BYTE,
+    cBlueShift: BYTE,
+    cAlphaBits: BYTE,
+    cAlphaShift: BYTE,
+    cAccumBits: BYTE,
+    cAccumRedBits: BYTE,
+    cAccumGreenBits: BYTE,
+    cAccumBlueBits: BYTE,
+    cAccumAlphaBits: BYTE,
+    cDepthBits: BYTE,
+    cStencilBits: BYTE,
+    cAuxBuffers: BYTE,
+    iLayerType: BYTE,
+    bReserved: BYTE,
+    dwLayerMask: DWORD,
+    dwVisibleMask: DWORD,
+    dwDamageMask: DWORD,
+};
+
+// --- Window style / message / pixel-format constants -----------------------
+
+pub const CS_OWNDC: UINT = 0x0020;
+pub const CS_HREDRAW: UINT = 0x0002;
+pub const CS_VREDRAW: UINT = 0x0001;
+
+pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
+pub const WS_VISIBLE: DWORD = 0x10000000;
+pub const CW_USEDEFAULT: INT = @bitCast(@as(u32, 0x80000000));
+
+pub const SW_SHOW: INT = 5;
+
+pub const WM_DESTROY: UINT = 0x0002;
+pub const WM_SIZE: UINT = 0x0005;
+pub const WM_CLOSE: UINT = 0x0010;
+pub const WM_QUIT: UINT = 0x0012;
+pub const WM_PAINT: UINT = 0x000F;
+pub const WM_KEYDOWN: UINT = 0x0100;
+pub const WM_CHAR: UINT = 0x0102;
+pub const WM_CREATE: UINT = 0x0001;
+
+pub const PM_REMOVE: UINT = 0x0001;
+
+pub const GWLP_USERDATA: INT = -21;
+
+pub const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
+
+pub const PFD_DRAW_TO_WINDOW: DWORD = 0x00000004;
+pub const PFD_SUPPORT_OPENGL: DWORD = 0x00000020;
+pub const PFD_DOUBLEBUFFER: DWORD = 0x00000001;
+pub const PFD_TYPE_RGBA: BYTE = 0;
+pub const PFD_MAIN_PLANE: BYTE = 0;
+
+// --- user32 ----------------------------------------------------------------
+
+pub extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.winapi) ATOM;
+pub extern "user32" fn CreateWindowExW(
+    dwExStyle: DWORD,
+    lpClassName: ?LPCWSTR,
+    lpWindowName: ?LPCWSTR,
+    dwStyle: DWORD,
+    X: INT,
+    Y: INT,
+    nWidth: INT,
+    nHeight: INT,
+    hWndParent: ?HWND,
+    hMenu: ?HMENU,
+    hInstance: ?HINSTANCE,
+    lpParam: ?LPVOID,
+) callconv(.winapi) ?HWND;
+pub extern "user32" fn DefWindowProcW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+pub extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: INT) callconv(.winapi) BOOL;
+pub extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT) callconv(.winapi) BOOL;
+pub extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT, wRemoveMsg: UINT) callconv(.winapi) BOOL;
+pub extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
+pub extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
+pub extern "user32" fn PostQuitMessage(nExitCode: INT) callconv(.winapi) void;
+pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
+pub extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;
+pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: INT, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
+pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.winapi) LONG_PTR;
+
+// --- gdi32 -----------------------------------------------------------------
+
+pub extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) INT;
+pub extern "gdi32" fn SetPixelFormat(hdc: HDC, format: INT, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
+pub extern "gdi32" fn SwapBuffers(hdc: HDC) callconv(.winapi) BOOL;
+
+// --- opengl32 (WGL) --------------------------------------------------------
+
+pub extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
+pub extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, hglrc: ?HGLRC) callconv(.winapi) BOOL;
+pub extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
+pub extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
