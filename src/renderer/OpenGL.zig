@@ -2,15 +2,20 @@
 //!
 //! Reference: ghostty `src/renderer/OpenGL.zig` (strategy: port — ghostty's
 //! renderer is far richer (cell program, image program, custom shaders);
-//! slice-0 draws a single textured-quad pass: one quad per visible glyph
-//! sampling an R8 coverage atlas). GL >= 2.0 entry points are loaded at
-//! runtime via a proc loader (wglGetProcAddress); GL 1.1 calls bind directly
-//! to opengl32. The renderer consumes atlas bytes and per-cell placement, so
-//! it has no dependency on the font/Freetype layer. See PORTING.md.
+//! whostty draws a single textured-quad pass over a flat list of quads. Two
+//! quad kinds share one pass via a per-vertex `mode`: glyph quads sample an R8
+//! coverage atlas (mode 0), solid quads ignore the atlas and fill with their
+//! color (mode 1). Solid quads back SGR background colors and the underline /
+//! strikethrough / overline decorations (#12). GL >= 2.0 entry points are
+//! loaded at runtime via a proc loader (wglGetProcAddress); GL 1.1 calls bind
+//! directly to opengl32. The renderer consumes atlas bytes and per-cell
+//! placement, so it has no dependency on the font/Freetype layer. See
+//! PORTING.md.
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// A drawable cell: a glyph region in the atlas placed at a pixel position.
+/// A drawable glyph: a glyph region in the atlas placed at a pixel position,
+/// tinted by a foreground color.
 pub const Cell = struct {
     /// Top-left pixel position of the glyph bitmap in the window.
     px: i32,
@@ -26,7 +31,32 @@ pub const Cell = struct {
     b: f32 = 1,
 };
 
-/// Interleaved vertex: position (NDC) + atlas uv + color.
+/// A solid filled rectangle in window pixels, tinted by a color. Used for SGR
+/// background fills and the underline / strikethrough / overline decorations.
+pub const SolidRect = struct {
+    px: i32,
+    py: i32,
+    w: u32,
+    h: u32,
+    /// Fill color (0..1).
+    r: f32,
+    g: f32,
+    b: f32,
+};
+
+/// A single drawable primitive. Quads are drawn in slice order, so callers
+/// control layering: emit a cell's background solid before its glyph, and any
+/// decoration solids after it.
+pub const Quad = union(enum) {
+    glyph: Cell,
+    solid: SolidRect,
+};
+
+/// Per-vertex draw mode discriminator (see the fragment shader).
+const mode_glyph: f32 = 0;
+const mode_solid: f32 = 1;
+
+/// Interleaved vertex: position (NDC) + atlas uv + color + draw mode.
 pub const Vertex = extern struct {
     x: f32,
     y: f32,
@@ -35,9 +65,33 @@ pub const Vertex = extern struct {
     r: f32,
     g: f32,
     b: f32,
+    /// 0 = sample the atlas coverage (glyph), 1 = solid fill.
+    m: f32,
 };
 
-/// Append the 6 vertices (two triangles) for one cell into `out`. Pure
+/// Pixel rect -> NDC. y is flipped (pixel y grows down, NDC y grows up).
+/// Returns the four NDC corners as (x0, x1, y0, y1).
+fn ndcRect(px: i32, py: i32, w: u32, h: u32, screen_w: u32, screen_h: u32) struct {
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+} {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const x0f: f32 = @floatFromInt(px);
+    const y0f: f32 = @floatFromInt(py);
+    const x1f: f32 = @floatFromInt(px + @as(i32, @intCast(w)));
+    const y1f: f32 = @floatFromInt(py + @as(i32, @intCast(h)));
+    return .{
+        .x0 = (x0f / sw) * 2.0 - 1.0,
+        .x1 = (x1f / sw) * 2.0 - 1.0,
+        .y0 = 1.0 - (y0f / sh) * 2.0,
+        .y1 = 1.0 - (y1f / sh) * 2.0,
+    };
+}
+
+/// Append the 6 vertices (two triangles) for one glyph cell into `out`. Pure
 /// geometry: pixel rect -> NDC, atlas rect -> uv. Host-testable.
 pub fn pushQuad(
     out: *std.ArrayList(Vertex),
@@ -47,31 +101,36 @@ pub fn pushQuad(
     screen_h: u32,
     atlas_size: u32,
 ) !void {
-    const sw: f32 = @floatFromInt(screen_w);
-    const sh: f32 = @floatFromInt(screen_h);
     const as: f32 = @floatFromInt(atlas_size);
-
-    const x0f: f32 = @floatFromInt(cell.px);
-    const y0f: f32 = @floatFromInt(cell.py);
-    const x1f: f32 = @floatFromInt(cell.px + @as(i32, @intCast(cell.sw)));
-    const y1f: f32 = @floatFromInt(cell.py + @as(i32, @intCast(cell.sh)));
-
-    // Pixel -> NDC. y is flipped (pixel y grows down, NDC y grows up).
-    const nx0 = (x0f / sw) * 2.0 - 1.0;
-    const nx1 = (x1f / sw) * 2.0 - 1.0;
-    const ny0 = 1.0 - (y0f / sh) * 2.0;
-    const ny1 = 1.0 - (y1f / sh) * 2.0;
+    const n = ndcRect(cell.px, cell.py, cell.sw, cell.sh, screen_w, screen_h);
 
     const su0: f32 = @as(f32, @floatFromInt(cell.sx)) / as;
     const su1: f32 = @as(f32, @floatFromInt(cell.sx + cell.sw)) / as;
     const sv0: f32 = @as(f32, @floatFromInt(cell.sy)) / as;
     const sv1: f32 = @as(f32, @floatFromInt(cell.sy + cell.sh)) / as;
 
-    const tl: Vertex = .{ .x = nx0, .y = ny0, .u = su0, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b };
-    const tr: Vertex = .{ .x = nx1, .y = ny0, .u = su1, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b };
-    const bl: Vertex = .{ .x = nx0, .y = ny1, .u = su0, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b };
-    const br: Vertex = .{ .x = nx1, .y = ny1, .u = su1, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b };
+    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = su0, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
+    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = su1, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
+    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = su0, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
+    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = su1, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
 
+    try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
+}
+
+/// Append the 6 vertices for one solid filled rect into `out`. uv is unused
+/// (the fragment shader ignores the atlas in solid mode). Host-testable.
+pub fn pushSolid(
+    out: *std.ArrayList(Vertex),
+    alloc: std.mem.Allocator,
+    rect: SolidRect,
+    screen_w: u32,
+    screen_h: u32,
+) !void {
+    const n = ndcRect(rect.px, rect.py, rect.w, rect.h, screen_w, screen_h);
+    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
+    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
+    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
+    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
     try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
 }
 
@@ -190,11 +249,14 @@ const vertex_shader_src: [:0]const u8 =
     \\layout (location = 0) in vec2 a_pos;
     \\layout (location = 1) in vec2 a_uv;
     \\layout (location = 2) in vec3 a_color;
+    \\layout (location = 3) in float a_mode;
     \\out vec2 v_uv;
     \\out vec3 v_color;
+    \\out float v_mode;
     \\void main() {
     \\    v_uv = a_uv;
     \\    v_color = a_color;
+    \\    v_mode = a_mode;
     \\    gl_Position = vec4(a_pos, 0.0, 1.0);
     \\}
 ;
@@ -203,10 +265,12 @@ const fragment_shader_src: [:0]const u8 =
     \\#version 330 core
     \\in vec2 v_uv;
     \\in vec3 v_color;
+    \\in float v_mode;
     \\out vec4 frag;
     \\uniform sampler2D u_atlas;
     \\void main() {
-    \\    float a = texture(u_atlas, v_uv).r;
+    \\    // mode 0: glyph (alpha from atlas coverage); mode 1: solid fill.
+    \\    float a = (v_mode > 0.5) ? 1.0 : texture(u_atlas, v_uv).r;
     \\    frag = vec4(v_color, a);
     \\}
 ;
@@ -252,6 +316,8 @@ pub const Renderer = struct {
         gl.enableVertexAttribArray(1);
         gl.vertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "r")));
         gl.enableVertexAttribArray(2);
+        gl.vertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "m")));
+        gl.enableVertexAttribArray(3);
 
         var tex: GLuint = 0;
         glGenTextures(1, @ptrCast(&tex));
@@ -288,16 +354,19 @@ pub const Renderer = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
-    /// Clear and draw all cells. `screen_w/h` are the framebuffer pixels.
-    pub fn draw(self: *Renderer, cells: []const Cell, screen_w: u32, screen_h: u32) !void {
+    /// Clear and draw all quads in order. `screen_w/h` are the framebuffer
+    /// pixels. Quads are emitted in slice order so the caller controls
+    /// layering (background solids before glyphs, decoration solids after).
+    pub fn draw(self: *Renderer, quads: []const Quad, screen_w: u32, screen_h: u32) !void {
         glViewport(0, 0, @intCast(screen_w), @intCast(screen_h));
         glClearColor(0.0, 0.0, 0.0, 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
 
         self.verts.clearRetainingCapacity();
-        for (cells) |cell| {
-            try pushQuad(&self.verts, self.alloc, cell, screen_w, screen_h, self.atlas_size);
-        }
+        for (quads) |q| switch (q) {
+            .glyph => |cell| try pushQuad(&self.verts, self.alloc, cell, screen_w, screen_h, self.atlas_size),
+            .solid => |rect| try pushSolid(&self.verts, self.alloc, rect, screen_w, screen_h),
+        };
         if (self.verts.items.len == 0) return;
 
         self.gl.useProgram(self.program);
@@ -352,4 +421,33 @@ test "renderer: center pixel maps near NDC origin" {
     try pushQuad(&verts, alloc, .{ .px = 50, .py = 50, .sx = 0, .sy = 0, .sw = 0, .sh = 0 }, 100, 100, 100);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts.items[0].x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), verts.items[0].y, 0.0001);
+}
+
+test "renderer: glyph quads carry the glyph mode" {
+    const alloc = std.testing.allocator;
+    var verts: std.ArrayList(Vertex) = .empty;
+    defer verts.deinit(alloc);
+    try pushQuad(&verts, alloc, .{ .px = 0, .py = 0, .sx = 0, .sy = 0, .sw = 4, .sh = 4 }, 100, 100, 100);
+    for (verts.items) |v| try std.testing.expectEqual(mode_glyph, v.m);
+}
+
+test "renderer: pushSolid maps full cell rect, solid mode, zero uv" {
+    const alloc = std.testing.allocator;
+    var verts: std.ArrayList(Vertex) = .empty;
+    defer verts.deinit(alloc);
+
+    // A 10x10 fill at top-left of a 100x100 window with color (1, 0, 0).
+    try pushSolid(&verts, alloc, .{ .px = 0, .py = 0, .w = 10, .h = 10, .r = 1, .g = 0, .b = 0 }, 100, 100);
+    try std.testing.expectEqual(@as(usize, 6), verts.items.len);
+
+    for (verts.items) |v| {
+        try std.testing.expectEqual(mode_solid, v.m);
+        // Solid quads do not sample the atlas: uv is pinned to the origin.
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), v.u, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), v.v, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.r, 0.0001);
+    }
+    // Top-left pixel (0,0) -> NDC (-1, +1).
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), verts.items[0].x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts.items[0].y, 0.0001);
 }
