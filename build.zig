@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
     });
     const ghostty_vt = ghostty.module("ghostty-vt");
 
+    // Freetype (built from source) for glyph rasterization is opt-in: the
+    // upstream source download is not reachable in all environments, and the
+    // renderer itself does not depend on it (it consumes atlas bytes). Enable
+    // with -Dfreetype on a network-unrestricted machine.
+    const enable_freetype = b.option(
+        bool,
+        "freetype",
+        "Build the Freetype glyph rasterizer (fetches freetype source)",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "freetype", enable_freetype);
+
     const exe = b.addExecutable(.{
         .name = "whostty",
         .root_module = b.createModule(.{
@@ -25,6 +38,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("ghostty-vt", ghostty_vt);
+    exe.root_module.addImport("build_options", build_options.createModule());
+    if (enable_freetype) {
+        if (b.lazyDependency("freetype", .{ .target = target, .optimize = optimize })) |dep| {
+            exe.root_module.addImport("freetype", dep.module("freetype"));
+        }
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

@@ -21,6 +21,12 @@ comptime {
         _ = &Window.swapBuffers;
         _ = &Window.clientSize;
         _ = &Window.makeCurrent;
+
+        const Renderer = @import("renderer/OpenGL.zig").Renderer;
+        _ = &Renderer.init;
+        _ = &Renderer.deinit;
+        _ = &Renderer.setAtlas;
+        _ = &Renderer.draw;
     }
 }
 
@@ -88,6 +94,9 @@ test {
     // Pull in host-testable slice-0 modules' tests.
     _ = @import("termio.zig");
     _ = @import("input.zig");
+    _ = @import("font/Atlas.zig");
+    _ = @import("renderer/OpenGL.zig");
+    if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 
 test "vt: feed bytes and read back grid state" {

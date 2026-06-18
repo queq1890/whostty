@@ -54,9 +54,9 @@ The `Tests` column below tracks this per layer.
 | Windows API | (ghostty `src/os/windows.zig`) | `src/os/windows.zig` | template | done | fresh tests |
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
 | Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done | done (host) |
-| Renderer registry | `src/renderer.zig` | `src/renderer.zig` | port | scaffolded | port tests |
-| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL) | port | scaffolded | port tests |
-| Font | `src/font/main.zig` | `src/font/main.zig` (Freetype) | port | scaffolded | port tests |
+| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | done (links) | done (host: geometry) |
+| Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
+| Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`) | host (needs font + network) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
