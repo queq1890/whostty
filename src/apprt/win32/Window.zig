@@ -10,12 +10,20 @@ const w = @import("../../os/windows.zig");
 
 const log = std.log.scoped(.window);
 
+/// Modifier-key state captured at the time of a key event.
+pub const Mods = struct {
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false,
+    super: bool = false,
+};
+
 /// Events surfaced from the window message loop.
 pub const Event = union(enum) {
     /// A character was typed (WM_CHAR), as a Unicode codepoint.
     char: u21,
-    /// A virtual key was pressed (WM_KEYDOWN).
-    key: u32,
+    /// A virtual key was pressed (WM_KEYDOWN), with the modifiers held.
+    key: struct { vk: u32, mods: Mods },
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
     /// WHEEL_DELTA), positive when rolled away from the user.
     scroll: i32,
@@ -174,6 +182,20 @@ pub const Window = struct {
         self.tail += 1;
     }
 
+    fn keyDown(vk: w.INT) bool {
+        // GetKeyState's high bit is set while the key is held.
+        return (@as(u16, @bitCast(w.GetKeyState(vk))) & 0x8000) != 0;
+    }
+
+    fn currentMods() Mods {
+        return .{
+            .ctrl = keyDown(w.VK_CONTROL),
+            .shift = keyDown(w.VK_SHIFT),
+            .alt = keyDown(w.VK_MENU),
+            .super = keyDown(w.VK_LWIN) or keyDown(w.VK_RWIN),
+        };
+    }
+
     fn fromHwnd(hwnd: w.HWND) ?*Window {
         const ud = w.GetWindowLongPtrW(hwnd, w.GWLP_USERDATA);
         if (ud == 0) return null;
@@ -204,7 +226,7 @@ pub const Window = struct {
                 return 0;
             },
             w.WM_KEYDOWN => {
-                if (self) |s| s.push(.{ .key = @truncate(wparam) });
+                if (self) |s| s.push(.{ .key = .{ .vk = @truncate(wparam), .mods = currentMods() } });
                 return 0;
             },
             w.WM_MOUSEWHEEL => {

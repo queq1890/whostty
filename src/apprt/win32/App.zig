@@ -24,6 +24,7 @@ const font = if (build_options.freetype) @import("../../font/main.zig") else str
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
+const binding = @import("../../input/Binding.zig");
 
 const log = std.log.scoped(.app);
 
@@ -122,6 +123,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
         log.warn("renderer = direct3d is not implemented yet; using OpenGL", .{});
     }
 
+    // Keybindings: seed defaults, then apply user `keybind` overrides.
+    var binds: binding.Set = .{};
+    defer binds.deinit(alloc);
+    binding.addDefaults(&binds, alloc) catch {};
+    for (cfg.keybinds.list.items) |b| binds.put(alloc, b) catch {};
+
     // --- Glyph atlas + cell metrics ---
     var atlas = try Atlas.init(alloc, 512);
     defer atlas.deinit(alloc);
@@ -182,9 +189,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
                 io.scrollToBottom();
                 writeChar(&pty, cp);
             },
-            .key => |code| {
+            .key => |k| {
+                // A bound chord is consumed as an action; otherwise it's a
+                // normal key written to the shell.
+                if (handleKeybind(k, &binds, io, sfc.rows)) continue;
                 io.scrollToBottom();
-                writeKey(&pty, code);
+                writeKey(&pty, k.vk);
             },
             .scroll => |raw| {
                 const delta = wheel.feed(raw);
@@ -227,6 +237,59 @@ fn writeKey(pty: *Pty, code: u32) void {
     var buf: [16]u8 = undefined;
     const out = input.encode(&buf, .{ .key = key }, .{}) catch return;
     if (out.len > 0) _ = pty.write(out) catch {};
+}
+
+/// Look up a key event in the binding set and run the bound action. Returns true
+/// if a binding matched and was handled (so the key is not also sent to the pty).
+fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) bool {
+    const key = bindKeyFromVk(k.vk) orelse return false;
+    const trigger: binding.Trigger = .{ .key = key, .mods = .{
+        .ctrl = k.mods.ctrl,
+        .shift = k.mods.shift,
+        .alt = k.mods.alt,
+        .super = k.mods.super,
+    } };
+    const action = binds.get(trigger) orelse return false;
+    dispatchAction(action, io, rows);
+    return true;
+}
+
+/// Map a Win32 virtual-key code to a binding key. Returns null for keys that
+/// can't start a chord we recognize.
+fn bindKeyFromVk(vk: u32) ?binding.Key {
+    return switch (vk) {
+        0x25 => .{ .named = .left },
+        0x26 => .{ .named = .up },
+        0x27 => .{ .named = .right },
+        0x28 => .{ .named = .down },
+        0x21 => .{ .named = .page_up },
+        0x22 => .{ .named = .page_down },
+        0x24 => .{ .named = .home },
+        0x23 => .{ .named = .end },
+        0x0D => .{ .named = .enter },
+        0x09 => .{ .named = .tab },
+        0x1B => .{ .named = .escape },
+        0x08 => .{ .named = .backspace },
+        0x20 => .{ .named = .space },
+        '0'...'9' => .{ .codepoint = @intCast(vk) }, // VK digit codes equal ASCII
+        'A'...'Z' => .{ .codepoint = @intCast(vk + 32) }, // fold to lowercase
+        else => null,
+    };
+}
+
+/// Run a bound action. Scrollback actions act on the single current surface;
+/// split/tab actions are recognized but need multi-surface support (#18) before
+/// they can do anything, so they're logged for now.
+fn dispatchAction(action: binding.Action, io: *Termio, rows: u16) void {
+    switch (action) {
+        .scroll_page_up => io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(rows)))),
+        .scroll_page_down => io.scrollViewport(@as(isize, @intCast(scroll.pageRows(rows)))),
+        .scroll_to_bottom => io.scrollToBottom(),
+        .scroll_to_top => io.scrollViewport(-1_000_000), // clamps at the top of history
+        .new_split, .goto_split, .new_tab, .close_surface, .next_tab, .previous_tab, .goto_tab => {
+            log.debug("keybind action '{s}' needs multi-surface support (not yet wired)", .{@tagName(std.meta.activeTag(action))});
+        },
+    }
 }
 
 /// Build the per-glyph atlas for printable ASCII via Freetype. Only compiled

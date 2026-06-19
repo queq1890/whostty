@@ -230,6 +230,13 @@ pub const WM_CREATE: UINT = 0x0001;
 
 pub const PM_REMOVE: UINT = 0x0001;
 
+// Virtual-key codes for reading modifier state via GetKeyState.
+pub const VK_SHIFT: INT = 0x10;
+pub const VK_CONTROL: INT = 0x11;
+pub const VK_MENU: INT = 0x12; // Alt
+pub const VK_LWIN: INT = 0x5B;
+pub const VK_RWIN: INT = 0x5C;
+
 pub const GWLP_USERDATA: INT = -21;
 
 pub const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
@@ -272,6 +279,9 @@ pub extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;
 pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: INT, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.winapi) LONG_PTR;
+
+pub const SHORT = i16;
+pub extern "user32" fn GetKeyState(nVirtKey: INT) callconv(.winapi) SHORT;
 
 // --- gdi32 -----------------------------------------------------------------
 
