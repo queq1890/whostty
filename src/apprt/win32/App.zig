@@ -25,6 +25,7 @@ const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
 const binding = @import("../../input/Binding.zig");
+const keymap = @import("keymap.zig");
 
 const log = std.log.scoped(.app);
 
@@ -242,7 +243,7 @@ fn writeKey(pty: *Pty, code: u32) void {
 /// Look up a key event in the binding set and run the bound action. Returns true
 /// if a binding matched and was handled (so the key is not also sent to the pty).
 fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) bool {
-    const key = bindKeyFromVk(k.vk) orelse return false;
+    const key = keymap.keyFromVk(k.vk) orelse return false;
     const trigger: binding.Trigger = .{ .key = key, .mods = .{
         .ctrl = k.mods.ctrl,
         .shift = k.mods.shift,
@@ -252,29 +253,6 @@ fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) 
     const action = binds.get(trigger) orelse return false;
     dispatchAction(action, io, rows);
     return true;
-}
-
-/// Map a Win32 virtual-key code to a binding key. Returns null for keys that
-/// can't start a chord we recognize.
-fn bindKeyFromVk(vk: u32) ?binding.Key {
-    return switch (vk) {
-        0x25 => .{ .named = .left },
-        0x26 => .{ .named = .up },
-        0x27 => .{ .named = .right },
-        0x28 => .{ .named = .down },
-        0x21 => .{ .named = .page_up },
-        0x22 => .{ .named = .page_down },
-        0x24 => .{ .named = .home },
-        0x23 => .{ .named = .end },
-        0x0D => .{ .named = .enter },
-        0x09 => .{ .named = .tab },
-        0x1B => .{ .named = .escape },
-        0x08 => .{ .named = .backspace },
-        0x20 => .{ .named = .space },
-        '0'...'9' => .{ .codepoint = @intCast(vk) }, // VK digit codes equal ASCII
-        'A'...'Z' => .{ .codepoint = @intCast(vk + 32) }, // fold to lowercase
-        else => null,
-    };
 }
 
 /// Run a bound action. Scrollback actions act on the single current surface;
