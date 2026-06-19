@@ -23,6 +23,7 @@ const w = @import("../../os/windows.zig");
 const font = if (build_options.freetype) @import("../../font/main.zig") else struct {};
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
+const scroll = @import("../../scroll.zig");
 
 const log = std.log.scoped(.app);
 
@@ -165,12 +166,24 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // --- Main loop ---
     var quads: std.ArrayList(gl.Quad) = .empty;
     defer quads.deinit(alloc);
+    var wheel: scroll.WheelAccumulator = .{};
 
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
-            .char => |cp| writeChar(&pty, cp),
-            .key => |code| writeKey(&pty, code),
+            // Typing snaps back to the bottom, matching common terminals.
+            .char => |cp| {
+                io.scrollToBottom();
+                writeChar(&pty, cp);
+            },
+            .key => |code| {
+                io.scrollToBottom();
+                writeKey(&pty, code);
+            },
+            .scroll => |raw| {
+                const delta = wheel.feed(raw);
+                if (delta != 0) io.scrollViewport(delta);
+            },
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
             .close => closed = true,
         };

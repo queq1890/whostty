@@ -47,6 +47,7 @@ test {
     _ = @import("renderer/OpenGL.zig");
     _ = @import("Surface.zig");
     _ = @import("config.zig");
+    _ = @import("scroll.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 

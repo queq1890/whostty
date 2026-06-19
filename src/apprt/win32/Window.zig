@@ -16,6 +16,9 @@ pub const Event = union(enum) {
     char: u21,
     /// A virtual key was pressed (WM_KEYDOWN).
     key: u32,
+    /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
+    /// WHEEL_DELTA), positive when rolled away from the user.
+    scroll: i32,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
     /// The user requested the window close.
@@ -202,6 +205,14 @@ pub const Window = struct {
             },
             w.WM_KEYDOWN => {
                 if (self) |s| s.push(.{ .key = @truncate(wparam) });
+                return 0;
+            },
+            w.WM_MOUSEWHEEL => {
+                if (self) |s| {
+                    // The wheel delta is the signed high word of wParam.
+                    const hi: u16 = @truncate((wparam >> 16) & 0xFFFF);
+                    s.push(.{ .scroll = @as(i16, @bitCast(hi)) });
+                }
                 return 0;
             },
             else => return w.DefWindowProcW(hwnd, msg, wparam, lparam),

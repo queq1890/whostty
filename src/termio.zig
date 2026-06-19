@@ -55,6 +55,22 @@ pub const Termio = struct {
         try self.terminal.resize(self.alloc, cols, rows);
     }
 
+    /// Scroll the viewport into (negative) or back out of (positive) the
+    /// scrollback history by `delta_rows`. The scrollback storage and clamping
+    /// live in libghostty-vt's PageList. Thread-safe.
+    pub fn scrollViewport(self: *Termio, delta_rows: isize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.terminal.screens.active.pages.scroll(.{ .delta_row = delta_rows });
+    }
+
+    /// Snap the viewport back to the active (bottom) area. Thread-safe.
+    pub fn scrollToBottom(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.terminal.screens.active.pages.scroll(.active);
+    }
+
     /// Lock the terminal for reading the grid; pair with `unlock`.
     pub fn lock(self: *Termio) void {
         self.mutex.lock();
