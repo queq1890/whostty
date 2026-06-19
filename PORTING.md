@@ -55,6 +55,7 @@ The `Tests` column below tracks this per layer.
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
 | Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done + viewport scroll (#16) | done (host) |
 | Scrollback scroll | `src/Surface.zig` (scroll); storage in VT core | `src/scroll.zig` (wheel→rows) + `termio` scroll, viewport in `ghostty-vt` `PageList` | port + dependency | wheel scroll + scroll-to-bottom (#16) | done (host: wheel accum) |
+| Renderer registry | `src/renderer.zig` | `src/renderer.zig` | template | backend abstraction + `renderer` config selector; Direct3D backend pending a Windows host (#15) | done (host: enum guard) |
 | Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | SGR fg/bg + decorations (#12) | done (host: geometry, solid quads) |
 | SGR color/attrs | `src/terminal/sgr.zig`, `src/terminal/style.zig` | resolved via `ghostty-vt` (`Style.fg`/`bg`, palette) in `apprt/win32/App.zig` | dependency | fg/bg/inverse/underline/strike/overline (#12) | upstream (resolution) |
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |

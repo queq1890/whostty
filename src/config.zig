@@ -78,6 +78,11 @@ pub const Color = struct {
 /// The shape the cursor is drawn as.
 pub const CursorStyle = enum { block, bar, underline };
 
+/// Which renderer backend draws the terminal. `opengl` (WGL) is the bring-up
+/// path and the default; `direct3d` is the long-term native Windows target
+/// (#15) and is selected here but not yet implemented — see `src/renderer.zig`.
+pub const RendererBackend = enum { opengl, direct3d };
+
 /// A parsed `key = value` pair from a config file line.
 pub const KeyValue = struct {
     key: []const u8,
@@ -140,6 +145,7 @@ pub const Config = struct {
     background: Color = .{ .r = 0, .g = 0, .b = 0 },
     foreground: Color = .{ .r = 0xff, .g = 0xff, .b = 0xff },
     cursor_style: CursorStyle = .block,
+    renderer: RendererBackend = .opengl,
 
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
@@ -192,6 +198,9 @@ pub const Config = struct {
             self.foreground = try Color.parse(value);
         } else if (std.mem.eql(u8, key, "cursor-style")) {
             self.cursor_style = std.meta.stringToEnum(CursorStyle, value) orelse
+                return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "renderer")) {
+            self.renderer = std.meta.stringToEnum(RendererBackend, value) orelse
                 return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "palette")) {
             const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidValue;
@@ -291,6 +300,20 @@ test "config: parse sets fields" {
     try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, cfg.foreground);
     try testing.expectEqual(CursorStyle.bar, cfg.cursor_style);
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: renderer backend selection" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "renderer = direct3d\n");
+    defer cfg.deinit();
+    try testing.expectEqual(RendererBackend.direct3d, cfg.renderer);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+
+    // Default is opengl; a bad value is a diagnostic and leaves the default.
+    var bad = try Config.parse(testing.allocator, "renderer = vulkan\n");
+    defer bad.deinit();
+    try testing.expectEqual(RendererBackend.opengl, bad.renderer);
+    try testing.expectEqual(@as(usize, 1), bad.diagnostics.items.len);
 }
 
 test "config: defaults survive an empty load" {
