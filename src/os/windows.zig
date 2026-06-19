@@ -225,6 +225,7 @@ pub const WM_QUIT: UINT = 0x0012;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_CHAR: UINT = 0x0102;
+pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_CREATE: UINT = 0x0001;
 
 pub const PM_REMOVE: UINT = 0x0001;

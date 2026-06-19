@@ -21,6 +21,9 @@ const Atlas = @import("../../font/Atlas.zig");
 const w = @import("../../os/windows.zig");
 
 const font = if (build_options.freetype) @import("../../font/main.zig") else struct {};
+const vt = @import("ghostty-vt");
+const config = @import("../../config.zig");
+const scroll = @import("../../scroll.zig");
 
 const log = std.log.scoped(.app);
 
@@ -34,6 +37,68 @@ const GlyphInfo = struct {
 const first_glyph = 32;
 const last_glyph = 126;
 
+/// The resolved color theme the renderer uses: default fg/bg for cells with no
+/// explicit SGR color, plus the effective 256-color palette (vt defaults with
+/// any config `palette` overrides applied). Built once from the config.
+const Theme = struct {
+    fg: vt.color.RGB,
+    bg: vt.color.RGB,
+    palette: vt.color.Palette,
+
+    fn fromConfig(cfg: *const config.Config) Theme {
+        var palette: vt.color.Palette = vt.color.default;
+        for (cfg.palette, 0..) |override, i| {
+            if (override) |c| palette[i] = toVtRgb(c);
+        }
+        return .{
+            .fg = toVtRgb(cfg.foreground),
+            .bg = toVtRgb(cfg.background),
+            .palette = palette,
+        };
+    }
+};
+
+/// Convert a config color to a libghostty-vt RGB (both are 8-bit per channel).
+fn toVtRgb(c: config.Color) vt.color.RGB {
+    return .{ .r = c.r, .g = c.g, .b = c.b };
+}
+
+/// Convert a libghostty-vt RGB (0..255 per channel) to the renderer's 0..1.
+fn rgbf(c: vt.color.RGB) [3]f32 {
+    return .{
+        @as(f32, @floatFromInt(c.r)) / 255.0,
+        @as(f32, @floatFromInt(c.g)) / 255.0,
+        @as(f32, @floatFromInt(c.b)) / 255.0,
+    };
+}
+
+/// Resolve a style color (the underline color in particular) against the
+/// palette. `none` falls back to `fallback` (the cell's foreground).
+fn resolveColor(c: vt.Style.Color, palette: *const vt.color.Palette, fallback: vt.color.RGB) vt.color.RGB {
+    return switch (c) {
+        .none => fallback,
+        .palette => |idx| palette[idx],
+        .rgb => |rgb| rgb,
+    };
+}
+
+/// Load the user config from `%APPDATA%\whostty\config`, falling back to
+/// defaults if it is missing or unreadable. font-family discovery is deferred
+/// to #14, so only size/colors take effect today.
+fn loadConfig(alloc: std.mem.Allocator) config.Config {
+    return loadConfigFile(alloc) catch config.Config.init(alloc);
+}
+
+fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
+    const appdata = try std.process.getEnvVarOwned(alloc, "APPDATA");
+    defer alloc.free(appdata);
+    const path = try std.fs.path.join(alloc, &.{ appdata, "whostty", "config" });
+    defer alloc.free(path);
+    const data = try std.fs.cwd().readFileAlloc(alloc, path, 1 << 20);
+    defer alloc.free(data);
+    return try config.Config.parse(alloc, data);
+}
+
 /// The full slice-0 terminal. Run on the main thread.
 pub fn run(alloc: std.mem.Allocator) !void {
     // --- Window + GL context (UI thread) ---
@@ -46,6 +111,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var renderer = try gl.Renderer.init(alloc, w.wglGetProcAddress);
     defer renderer.deinit();
 
+    // --- Config (colors, font size, palette overrides) ---
+    var cfg = loadConfig(alloc);
+    defer cfg.deinit();
+    const theme: Theme = .fromConfig(&cfg);
+
     // --- Glyph atlas + cell metrics ---
     var atlas = try Atlas.init(alloc, 512);
     defer atlas.deinit(alloc);
@@ -55,7 +125,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var ascent: u32 = 12;
 
     if (build_options.freetype) {
-        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent);
+        const px: u32 = @intFromFloat(@max(1, @round(cfg.font_size)));
+        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px);
     }
     renderer.setAtlas(atlas.data, atlas.size);
 
@@ -93,22 +164,34 @@ pub fn run(alloc: std.mem.Allocator) !void {
     };
 
     // --- Main loop ---
-    var cells: std.ArrayList(gl.Cell) = .empty;
-    defer cells.deinit(alloc);
+    var quads: std.ArrayList(gl.Quad) = .empty;
+    defer quads.deinit(alloc);
+    var wheel: scroll.WheelAccumulator = .{};
 
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
-            .char => |cp| writeChar(&pty, cp),
-            .key => |code| writeKey(&pty, code),
+            // Typing snaps back to the bottom, matching common terminals.
+            .char => |cp| {
+                io.scrollToBottom();
+                writeChar(&pty, cp);
+            },
+            .key => |code| {
+                io.scrollToBottom();
+                writeKey(&pty, code);
+            },
+            .scroll => |raw| {
+                const delta = wheel.feed(raw);
+                if (delta != 0) io.scrollViewport(delta);
+            },
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
             .close => closed = true,
         };
         if (closed) break;
 
         const sz = win.clientSize();
-        try buildCells(alloc, &cells, io, &glyphs, cell_w, cell_h, ascent);
-        try renderer.draw(cells.items, sz.width, sz.height);
+        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme);
+        try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
         win.swapBuffers();
     }
 }
@@ -149,12 +232,14 @@ fn buildAtlas(
     cell_w: *u32,
     cell_h: *u32,
     ascent: *u32,
+    px: u32,
 ) !void {
     var lib = try font.Library.init();
     defer lib.deinit();
 
-    // A reasonable default monospace font on Windows.
-    var face = try font.Face.init(lib, "C:\\Windows\\Fonts\\consola.ttf", 16);
+    // A reasonable default monospace font on Windows. font-family selection is
+    // deferred to DirectWrite discovery (#14); the configured size applies now.
+    var face = try font.Face.init(lib, "C:\\Windows\\Fonts\\consola.ttf", px);
     defer face.deinit();
 
     const m = face.metrics();
@@ -177,43 +262,133 @@ fn buildAtlas(
     }
 }
 
-/// Translate the terminal viewport (as plain text rows) into renderable cells.
-/// slice-0 renders monospace ASCII with no attributes/colors.
-fn buildCells(
+/// Translate the terminal viewport into renderable quads, honoring SGR colors
+/// and attributes (#12): per-cell foreground/background colors (default, 256
+/// palette, or truecolor), inverse video, and the underline / strikethrough /
+/// overline decorations. For each cell we emit, in order, an optional
+/// background fill, the foreground glyph, then any decoration lines, so the
+/// renderer layers them correctly.
+///
+/// Color resolution is delegated to libghostty-vt (`Style.fg`/`Style.bg` and
+/// the default palette) rather than reimplemented here, per the hybrid
+/// architecture (ADR 0002). Synthetic bold/italic glyphs require additional
+/// font faces and are deferred to the font work (#13/#14); bold still
+/// brightens palette colors via vt's resolution.
+fn buildQuads(
     alloc: std.mem.Allocator,
-    cells: *std.ArrayList(gl.Cell),
+    quads: *std.ArrayList(gl.Quad),
     io: *Termio,
     glyphs: *const [last_glyph - first_glyph + 1]?GlyphInfo,
     cell_w: u32,
     cell_h: u32,
     ascent: u32,
+    theme: *const Theme,
 ) !void {
-    cells.clearRetainingCapacity();
+    quads.clearRetainingCapacity();
 
-    const text = try io.dumpAlloc(alloc);
-    defer alloc.free(text);
+    io.lock();
+    defer io.unlock();
+
+    const term = &io.terminal;
+    const screen = term.screens.active;
+    const palette = &theme.palette;
+    const rows: u32 = term.rows;
+    const cols: u32 = term.cols;
+    const line_h: u32 = @max(1, cell_h / 16);
+    const ascent_i: i32 = @intCast(ascent);
 
     var row: u32 = 0;
-    var col: u32 = 0;
-    for (text) |ch| {
-        if (ch == '\n') {
-            row += 1;
-            col = 0;
-            continue;
-        }
-        defer col += 1;
-        if (ch < first_glyph or ch > last_glyph) continue;
-        const gi = glyphs[ch - first_glyph] orelse continue;
+    while (row < rows) : (row += 1) {
+        var col: u32 = 0;
+        while (col < cols) : (col += 1) {
+            const gc = screen.pages.getCell(.{ .viewport = .{
+                .x = @intCast(col),
+                .y = @intCast(row),
+            } }) orelse continue;
+            const cell = gc.cell;
+            const style = gc.style();
 
-        const px: i32 = @as(i32, @intCast(col * cell_w)) + gi.bearing_x;
-        const py: i32 = @as(i32, @intCast(row * cell_h + ascent)) - gi.bearing_y;
-        try cells.append(alloc, .{
-            .px = px,
-            .py = py,
-            .sx = gi.region.x,
-            .sy = gi.region.y,
-            .sw = gi.region.width,
-            .sh = gi.region.height,
-        });
+            // Resolve fg/bg against the configured theme, then apply inverse
+            // video by swapping them.
+            const fg_rgb = style.fg(.{ .default = theme.fg, .palette = palette });
+            var fg = rgbf(fg_rgb);
+            var bg: ?[3]f32 = if (style.bg(cell, palette)) |c| rgbf(c) else null;
+            if (style.flags.inverse) {
+                const old_fg = fg;
+                fg = bg orelse rgbf(theme.bg);
+                bg = old_fg;
+            }
+
+            const cell_x: i32 = @intCast(col * cell_w);
+            const cell_y: i32 = @intCast(row * cell_h);
+
+            // Background fill. The cleared framebuffer already provides the
+            // default background, so only non-default backgrounds emit a quad.
+            if (bg) |c| try quads.append(alloc, .{ .solid = .{
+                .px = cell_x,
+                .py = cell_y,
+                .w = cell_w,
+                .h = cell_h,
+                .r = c[0],
+                .g = c[1],
+                .b = c[2],
+            } });
+
+            // Foreground glyph (invisible attribute suppresses it).
+            if (!style.flags.invisible) {
+                const cp = cell.codepoint();
+                if (cp >= first_glyph and cp <= last_glyph) {
+                    if (glyphs[cp - first_glyph]) |gi| {
+                        try quads.append(alloc, .{ .glyph = .{
+                            .px = cell_x + gi.bearing_x,
+                            .py = cell_y + ascent_i - gi.bearing_y,
+                            .sx = gi.region.x,
+                            .sy = gi.region.y,
+                            .sw = gi.region.width,
+                            .sh = gi.region.height,
+                            .r = fg[0],
+                            .g = fg[1],
+                            .b = fg[2],
+                        } });
+                    }
+                }
+            }
+
+            // Decorations, drawn on top. Underlines use the explicit underline
+            // color when set; strikethrough/overline use the foreground.
+            if (style.flags.underline != .none) {
+                const uc = if (style.underline_color != .none)
+                    rgbf(resolveColor(style.underline_color, palette, fg_rgb))
+                else
+                    fg;
+                try quads.append(alloc, .{ .solid = .{
+                    .px = cell_x,
+                    .py = cell_y + ascent_i + 1,
+                    .w = cell_w,
+                    .h = line_h,
+                    .r = uc[0],
+                    .g = uc[1],
+                    .b = uc[2],
+                } });
+            }
+            if (style.flags.strikethrough) try quads.append(alloc, .{ .solid = .{
+                .px = cell_x,
+                .py = cell_y + @divTrunc(ascent_i, 2),
+                .w = cell_w,
+                .h = line_h,
+                .r = fg[0],
+                .g = fg[1],
+                .b = fg[2],
+            } });
+            if (style.flags.overline) try quads.append(alloc, .{ .solid = .{
+                .px = cell_x,
+                .py = cell_y,
+                .w = cell_w,
+                .h = line_h,
+                .r = fg[0],
+                .g = fg[1],
+                .b = fg[2],
+            } });
+        }
     }
 }

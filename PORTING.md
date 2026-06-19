@@ -47,24 +47,27 @@ The `Tests` column below tracks this per layer.
 | VT core | `src/terminal/` | — (via `ghostty-vt` module) | dependency | done | upstream |
 | VT input encoding | `src/input/` (key/mouse/paste encode) | — (via `ghostty-vt` `input`) | dependency | done | upstream |
 | Entrypoint | `src/main.zig` | `src/main.zig` | port | done | done (vt wiring) |
-| App (Windows) | `src/apprt/gtk/App.zig` | `src/apprt/win32/App.zig` | template | slice-0 integration | links |
+| App (Windows) | `src/apprt/gtk/App.zig` | `src/apprt/win32/App.zig` | template | slice-0 + SGR cells, config-driven colors/size (#12/#17) | links |
 | Surface | `src/Surface.zig` | `src/Surface.zig` | port | resize done | done (host: sizing) |
 | apprt registry | `src/apprt.zig` | `src/apprt.zig` | port | scaffolded | port tests |
 | apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/Window.zig` | template | done (window+WGL) | fresh tests |
 | Windows API | (ghostty `src/os/windows.zig`) | `src/os/windows.zig` | template | done | fresh tests |
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
-| Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done | done (host) |
-| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | done (links) | done (host: geometry) |
+| Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done + viewport scroll (#16) | done (host) |
+| Scrollback scroll | `src/Surface.zig` (scroll); storage in VT core | `src/scroll.zig` (wheel→rows) + `termio` scroll, viewport in `ghostty-vt` `PageList` | port + dependency | wheel scroll + scroll-to-bottom (#16) | done (host: wheel accum) |
+| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | SGR fg/bg + decorations (#12) | done (host: geometry, solid quads) |
+| SGR color/attrs | `src/terminal/sgr.zig`, `src/terminal/style.zig` | resolved via `ghostty-vt` (`Style.fg`/`bg`, palette) in `apprt/win32/App.zig` | dependency | fg/bg/inverse/underline/strike/overline (#12) | upstream (resolution) |
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
-| Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`) | host (needs font + network) |
+| Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`); synthetic bold/italic deferred (#13/#14) | host (needs font + network) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
+| Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + initial options (#17) | done (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
 
 ## Explicitly excluded (for now)
 
-These ghostty paths are out of scope until after slice-0 and are intentionally
-not mirrored yet: `cli/`, `config/` (config file), `inspector/`, `crash/`,
-`benchmark/`, `synthetic/`, `shell-integration/`, `terminfo/`, plus the
-macOS/GTK-specific apprt layers.
+These ghostty paths are out of scope and intentionally not mirrored yet:
+`cli/` (full CLI arg parsing — only the config line format is ported, see the
+Config row), `inspector/`, `crash/`, `benchmark/`, `synthetic/`,
+`shell-integration/`, `terminfo/`, plus the macOS/GTK-specific apprt layers.
