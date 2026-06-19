@@ -18,13 +18,17 @@ pub const Termio = struct {
     mutex: std.Thread.Mutex,
     alloc: std.mem.Allocator,
 
-    pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16) !*Termio {
+    pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16, max_scrollback: usize) !*Termio {
         const self = try alloc.create(Termio);
         errdefer alloc.destroy(self);
 
         self.alloc = alloc;
         self.mutex = .{};
-        self.terminal = try vt.Terminal.init(alloc, .{ .cols = cols, .rows = rows });
+        self.terminal = try vt.Terminal.init(alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .max_scrollback = max_scrollback,
+        });
         errdefer self.terminal.deinit(alloc);
 
         // The handler holds &self.terminal, which is stable because `self` is
@@ -90,7 +94,7 @@ pub const Termio = struct {
 
 test "termio: plain text updates the grid" {
     const alloc = std.testing.allocator;
-    const io = try Termio.create(alloc, 20, 3);
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
     defer io.destroy();
 
     try io.process("hello");
@@ -102,7 +106,7 @@ test "termio: plain text updates the grid" {
 
 test "termio: escape sequences move the cursor (overwrite)" {
     const alloc = std.testing.allocator;
-    const io = try Termio.create(alloc, 20, 3);
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
     defer io.destroy();
 
     // Print, then home the cursor and overwrite the first two cells.
@@ -118,7 +122,7 @@ test "termio: escape sequences move the cursor (overwrite)" {
 
 test "termio: resize changes dimensions" {
     const alloc = std.testing.allocator;
-    const io = try Termio.create(alloc, 20, 3);
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
     defer io.destroy();
 
     try io.resize(40, 10);

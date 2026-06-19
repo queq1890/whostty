@@ -151,7 +151,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // --- ConPTY + shell ---
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
     var child = try pty.spawn(alloc, shellCommandLine());
-    const io = try Termio.create(alloc, grid0.cols, grid0.rows);
+    const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
 
     // --- Reader thread: pty -> libghostty-vt ---
     var stop = std.atomic.Value(bool).init(false);
