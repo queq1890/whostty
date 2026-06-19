@@ -42,6 +42,13 @@ pub fn build(b: *std.Build) void {
     if (enable_freetype) {
         if (b.lazyDependency("freetype", .{ .target = target, .optimize = optimize })) |dep| {
             exe.root_module.addImport("freetype", dep.module("freetype"));
+            // The freetype module's `@cImport` pulls in libc headers (e.g.
+            // <string.h>). Link libc so they resolve — for cross-compiled
+            // Windows targets this is satisfied by Zig's bundled MinGW.
+            exe.root_module.link_libc = true;
+            // The module only provides the Zig bindings; link the compiled
+            // freetype C library so the FT_* symbols resolve.
+            exe.root_module.linkLibrary(dep.artifact("freetype"));
         }
     }
     b.installArtifact(exe);

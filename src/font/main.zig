@@ -82,17 +82,22 @@ pub const Face = struct {
         const pixels = try alloc.alloc(u8, width * height);
         errdefer alloc.free(pixels);
 
-        // Copy row by row honoring pitch (may be negative for bottom-up).
-        const pitch: i32 = bm.pitch;
-        const src: [*]const u8 = @ptrCast(bm.buffer);
-        var y: u32 = 0;
-        while (y < height) : (y += 1) {
-            const row_off: i64 = @as(i64, @intCast(y)) * pitch;
-            const src_row: [*]const u8 = if (pitch >= 0)
-                src + @as(usize, @intCast(row_off))
-            else
-                src + @as(usize, @intCast(@as(i64, @intCast((height - 1 - y))) * (-pitch)));
-            @memcpy(pixels[y * width ..][0..width], src_row[0..width]);
+        // An empty bitmap (e.g. the space glyph) has zero extent and a null
+        // `buffer`; @ptrCast of null to a non-optional pointer would panic, so
+        // skip the copy entirely and return the empty glyph.
+        if (width != 0 and height != 0) {
+            // Copy row by row honoring pitch (may be negative for bottom-up).
+            const pitch: i32 = bm.pitch;
+            const src: [*]const u8 = @ptrCast(bm.buffer);
+            var y: u32 = 0;
+            while (y < height) : (y += 1) {
+                const row_off: i64 = @as(i64, @intCast(y)) * pitch;
+                const src_row: [*]const u8 = if (pitch >= 0)
+                    src + @as(usize, @intCast(row_off))
+                else
+                    src + @as(usize, @intCast(@as(i64, @intCast((height - 1 - y))) * (-pitch)));
+                @memcpy(pixels[y * width ..][0..width], src_row[0..width]);
+            }
         }
 
         return .{
@@ -146,7 +151,13 @@ test "font: space glyph has zero-area bitmap but positive advance" {
     var face = try Face.init(lib, path, 16);
     defer face.deinit();
 
+    // Regression: a space has an empty bitmap whose `buffer` is null.
+    // rasterize must not @ptrCast that null pointer (which panics in safe
+    // builds); it returns a zero-area glyph with no pixels.
     var g = try face.rasterize(std.testing.allocator, ' ');
     defer g.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), g.width);
+    try std.testing.expectEqual(@as(u32, 0), g.height);
+    try std.testing.expectEqual(@as(usize, 0), g.pixels.len);
     try std.testing.expect(g.advance > 0);
 }
