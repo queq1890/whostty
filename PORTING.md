@@ -60,6 +60,7 @@ The `Tests` column below tracks this per layer.
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
 | Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`); synthetic bold/italic deferred (#13/#14) | host (needs font + network) |
 | Font discovery | `src/font/discovery.zig` (Descriptor + backend) | `src/font/discovery.zig` (DirectWrite) | template | Descriptor + family resolution/fallback + DW weight/style mapping (#14); DirectWrite COM enumeration pending a Windows host | done (host: core); COM untested |
+| Text shaping | `src/font/shaper/run.zig`, `shaper/harfbuzz.zig` | `src/font/shaper.zig` | port | run segmentation (#13); Harfbuzz shaping seamed pending the dependency + a compiler | done (host: run iterator) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
 | Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + initial options (#17) | done (host) |
 | Surface mgmt (tabs/splits) | `src/apprt/gtk/` (Split/Notebook) | `src/apprt/win32/SplitTree.zig` | template | split tree (split/close/layout/equalize/focus-nav) + tab list model (#18) | fresh (host) |
