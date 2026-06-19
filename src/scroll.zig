@@ -32,6 +32,52 @@ pub const WheelAccumulator = struct {
     }
 };
 
+/// Scrollbar thumb geometry, in track-pixel units measured from the track top.
+pub const Thumb = struct {
+    offset: f32,
+    size: f32,
+};
+
+/// Compute the scrollbar thumb over a track of `track` pixels.
+///   - `total_rows`: scrollback history + the visible viewport.
+///   - `viewport_rows`: rows currently on screen.
+///   - `rows_above`: rows of history above the viewport's first visible row
+///     (0 = scrolled to the oldest line; max = at the live bottom).
+/// When everything fits, the thumb fills the track. The thumb has a 1px floor so
+/// it stays grabbable in deep scrollback.
+pub fn scrollbarThumb(total_rows: usize, viewport_rows: usize, rows_above: usize, track: f32) Thumb {
+    if (total_rows <= viewport_rows or total_rows == 0) return .{ .offset = 0, .size = track };
+
+    const total_f: f32 = @floatFromInt(total_rows);
+    const view_f: f32 = @floatFromInt(viewport_rows);
+    const size = @max(track * (view_f / total_f), 1);
+
+    const max_above = total_rows - viewport_rows;
+    const above = @min(rows_above, max_above);
+    const frac: f32 = @as(f32, @floatFromInt(above)) / @as(f32, @floatFromInt(max_above));
+    return .{ .offset = (track - size) * frac, .size = size };
+}
+
+test "scroll: scrollbarThumb fills the track when everything fits" {
+    const t = scrollbarThumb(20, 24, 0, 200);
+    try std.testing.expectEqual(@as(f32, 0), t.offset);
+    try std.testing.expectEqual(@as(f32, 200), t.size);
+}
+
+test "scroll: scrollbarThumb sizes and positions by scroll fraction" {
+    // 25 of 100 rows visible over a 400px track -> 100px thumb, 300px of travel.
+    const top = scrollbarThumb(100, 25, 0, 400);
+    try std.testing.expectEqual(@as(f32, 100), top.size);
+    try std.testing.expectEqual(@as(f32, 0), top.offset); // oldest line: thumb at top
+
+    const bottom = scrollbarThumb(100, 25, 75, 400);
+    try std.testing.expectEqual(@as(f32, 300), bottom.offset); // live bottom: thumb at end
+
+    // rows_above clamps to the maximum.
+    const clamped = scrollbarThumb(100, 25, 999, 400);
+    try std.testing.expectEqual(@as(f32, 300), clamped.offset);
+}
+
 /// Rows to move the viewport for a page scroll, given the number of visible
 /// rows. One row of overlap is kept so the boundary line stays on screen, as
 /// most terminals do. Always at least 1. The caller applies the sign (negative
