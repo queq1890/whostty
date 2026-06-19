@@ -127,13 +127,32 @@ pub fn resolveFamily(requested: ?[]const u8, available: []const []const u8) ?[]c
         }
     }
 
-    for (default_monospace) |fallback| {
+    return firstInChain(&default_monospace, available) orelse available[0];
+}
+
+/// Like `resolveFamily`, but presentation-aware: emoji codepoints ignore the
+/// (monospace) requested family — which won't carry color glyphs — and use the
+/// emoji fallback chain instead. Text uses the normal path.
+pub fn resolveFamilyFor(
+    requested: ?[]const u8,
+    pres: Presentation,
+    available: []const []const u8,
+) ?[]const u8 {
+    if (available.len == 0) return null;
+    return switch (pres) {
+        .text => resolveFamily(requested, available),
+        .emoji => firstInChain(&default_emoji, available) orelse available[0],
+    };
+}
+
+/// The first family in `chain` that's present in `available` (case-insensitive).
+fn firstInChain(chain: []const []const u8, available: []const []const u8) ?[]const u8 {
+    for (chain) |want| {
         for (available) |a| {
-            if (std.ascii.eqlIgnoreCase(a, fallback)) return a;
+            if (std.ascii.eqlIgnoreCase(a, want)) return a;
         }
     }
-
-    return available[0];
+    return null;
 }
 
 /// Resolve a descriptor to a concrete font file on this system.
@@ -229,6 +248,27 @@ test "discovery: resolveFamily returns the first available when nothing matches"
 test "discovery: resolveFamily on an empty system list is null" {
     const empty = [_][]const u8{};
     try testing.expect(resolveFamily("Consolas", &empty) == null);
+}
+
+test "discovery: resolveFamilyFor routes emoji to the emoji chain" {
+    const available = [_][]const u8{ "Consolas", "Segoe UI Emoji", "Arial" };
+    // Emoji ignores the requested monospace family and picks the emoji font.
+    try testing.expectEqualStrings(
+        "Segoe UI Emoji",
+        resolveFamilyFor("Consolas", .emoji, &available).?,
+    );
+    // Text behaves like resolveFamily.
+    try testing.expectEqualStrings(
+        "Consolas",
+        resolveFamilyFor("Consolas", .text, &available).?,
+    );
+}
+
+test "discovery: resolveFamilyFor falls back to first available when no emoji font" {
+    const available = [_][]const u8{ "Consolas", "Arial" };
+    try testing.expectEqualStrings("Consolas", resolveFamilyFor(null, .emoji, &available).?);
+    const empty = [_][]const u8{};
+    try testing.expect(resolveFamilyFor(null, .emoji, &empty) == null);
 }
 
 test "discovery: discover is unsupported off-Windows" {
