@@ -44,7 +44,8 @@ test {
     _ = @import("termio.zig");
     _ = @import("input.zig");
     _ = @import("font/Atlas.zig");
-    _ = @import("renderer/OpenGL.zig");
+    _ = @import("renderer/geometry.zig");
+    _ = @import("renderer.zig");
     _ = @import("Surface.zig");
     _ = @import("config.zig");
     _ = @import("scroll.zig");

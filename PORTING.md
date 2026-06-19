@@ -55,7 +55,9 @@ The `Tests` column below tracks this per layer.
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
 | Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done + viewport scroll (#16) | done (host) |
 | Scrollback scroll | `src/Surface.zig` (scroll); storage in VT core | `src/scroll.zig` (wheel→rows) + `termio` scroll, viewport in `ghostty-vt` `PageList` | port + dependency | wheel scroll + scroll-to-bottom (#16) | done (host: wheel accum) |
-| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | SGR fg/bg + decorations (#12) | done (host: geometry, solid quads) |
+| Renderer registry | `src/renderer.zig` | `src/renderer.zig` | port | backend abstraction; D3D seam (#15) | done (host: selection compiles) |
+| Renderer geometry | `src/renderer/` cell geometry | `src/renderer/geometry.zig` | port | backend-neutral quads/vertices | done (host: geometry) |
+| Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | SGR fg/bg + decorations (#12); GL backend | links |
 | SGR color/attrs | `src/terminal/sgr.zig`, `src/terminal/style.zig` | resolved via `ghostty-vt` (`Style.fg`/`bg`, palette) in `apprt/win32/App.zig` | dependency | fg/bg/inverse/underline/strike/overline (#12) | upstream (resolution) |
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
 | Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`); synthetic bold/italic deferred (#13/#14) | host (needs font + network) |
