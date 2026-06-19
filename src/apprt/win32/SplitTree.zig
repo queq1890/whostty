@@ -652,18 +652,18 @@ test "SplitTree: resize moves the nearest matching divider" {
     defer tree.deinit();
     try tree.split(1, .right, 2); // [1 | 2], ratio 0.5
 
-    // Grow pane 1 to the right.
+    // Grow pane 1 to the right. (Ratios are f32, so allow rounding slop.)
     try tree.resize(1, .right, 0.1);
     var out: std.ArrayList(Placement) = .empty;
     defer out.deinit(testing.allocator);
     try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
-    try testing.expectEqual(@as(f32, 480), out.items[0].rect.width); // 0.6 * 800
+    try testing.expectApproxEqAbs(@as(f32, 480), out.items[0].rect.width, 0.01); // 0.6 * 800
 
     // Shrink it back and past center.
     try tree.resize(1, .left, 0.2);
     out.clearRetainingCapacity();
     try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
-    try testing.expectEqual(@as(f32, 320), out.items[0].rect.width); // 0.4 * 800
+    try testing.expectApproxEqAbs(@as(f32, 320), out.items[0].rect.width, 0.01); // 0.4 * 800
 }
 
 test "SplitTree: resize clamps to the minimum ratio" {
@@ -697,9 +697,9 @@ test "SplitTree: resize picks the split matching the axis" {
     try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
 
     // Pane 1 still owns exactly the left half (outer ratio unchanged).
-    try testing.expectEqual(@as(f32, 400), out.items[0].rect.width);
+    try testing.expectApproxEqAbs(@as(f32, 400), out.items[0].rect.width, 0.01);
     // Pane 2 grew downward: 0.6 * 600 = 360.
-    try testing.expectEqual(@as(f32, 360), out.items[1].rect.height);
+    try testing.expectApproxEqAbs(@as(f32, 360), out.items[1].rect.height, 0.01);
 }
 
 test "SplitTree: resize with no matching split errors" {
