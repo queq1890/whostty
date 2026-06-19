@@ -52,6 +52,7 @@ test {
     _ = @import("apprt/win32/SplitTree.zig");
     _ = @import("font/discovery.zig");
     _ = @import("font/shaper.zig");
+    _ = @import("input/Binding.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 
