@@ -225,6 +225,52 @@ pub const SplitTree = struct {
         }
     }
 
+    /// The smallest fraction a pane is allowed to shrink to, so a divider can't
+    /// be dragged onto an edge and make a pane vanish.
+    pub const min_ratio: f32 = 0.05;
+
+    /// Move the divider nearest to `surface` along `dir` by `amount` (a fraction
+    /// of that split's extent, e.g. 0.1). `dir` is the direction the divider
+    /// moves: `right`/`down` grow the first child, `left`/`up` shrink it. The
+    /// affected split is the deepest ancestor of `surface` whose orientation
+    /// matches `dir`'s axis. The new ratio is clamped to [`min_ratio`,
+    /// 1 - `min_ratio`]. Errors if there's no such split above `surface`.
+    pub fn resize(self: *SplitTree, surface: SurfaceId, dir: Direction, amount: f32) !void {
+        if (!self.contains(surface)) return error.SurfaceNotFound;
+        const node = nearestSplit(self.root, surface, dir.orientation()) orelse
+            return error.NoSplitInDirection;
+        const delta: f32 = switch (dir) {
+            .right, .down => amount,
+            .left, .up => -amount,
+        };
+        switch (node.*) {
+            .split => |*s| s.ratio = std.math.clamp(s.ratio + delta, min_ratio, 1 - min_ratio),
+            .leaf => unreachable,
+        }
+    }
+
+    /// The deepest split on the path from the root to `surface` whose
+    /// orientation is `axis`, or null if none.
+    fn nearestSplit(node: *Node, surface: SurfaceId, axis: Orientation) ?*Node {
+        switch (node.*) {
+            .leaf => return null,
+            .split => |s| {
+                // Prefer a deeper match in whichever child holds the surface.
+                const child: ?*Node = if (findLeaf(s.a, surface) != null)
+                    s.a
+                else if (findLeaf(s.b, surface) != null)
+                    s.b
+                else
+                    null;
+                if (child) |c| {
+                    if (nearestSplit(c, surface, axis)) |deeper| return deeper;
+                    if (s.orientation == axis) return node;
+                }
+                return null;
+            },
+        }
+    }
+
     /// Compute the rect for every surface within `bounds`, appending a
     /// `Placement` per leaf to `out` (in left-to-right, top-to-bottom tree
     /// order).
@@ -552,6 +598,72 @@ test "SplitTree: equalize resets ratios" {
     defer out.deinit(testing.allocator);
     try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
     try testing.expectEqual(@as(f32, 400), out.items[0].rect.width);
+}
+
+test "SplitTree: resize moves the nearest matching divider" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try tree.split(1, .right, 2); // [1 | 2], ratio 0.5
+
+    // Grow pane 1 to the right.
+    try tree.resize(1, .right, 0.1);
+    var out: std.ArrayList(Placement) = .empty;
+    defer out.deinit(testing.allocator);
+    try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
+    try testing.expectEqual(@as(f32, 480), out.items[0].rect.width); // 0.6 * 800
+
+    // Shrink it back and past center.
+    try tree.resize(1, .left, 0.2);
+    out.clearRetainingCapacity();
+    try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
+    try testing.expectEqual(@as(f32, 320), out.items[0].rect.width); // 0.4 * 800
+}
+
+test "SplitTree: resize clamps to the minimum ratio" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try tree.split(1, .right, 2);
+
+    try tree.resize(1, .left, 5.0); // absurd shrink
+    switch (tree.root.*) {
+        .split => |s| try testing.expectEqual(SplitTree.min_ratio, s.ratio),
+        .leaf => unreachable,
+    }
+    try tree.resize(1, .right, 5.0); // absurd grow
+    switch (tree.root.*) {
+        .split => |s| try testing.expectEqual(1 - SplitTree.min_ratio, s.ratio),
+        .leaf => unreachable,
+    }
+}
+
+test "SplitTree: resize picks the split matching the axis" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try tree.split(1, .right, 2); // outer horizontal [1 | 2]
+    try tree.split(2, .down, 3); // inner vertical (2 over 3) on the right
+
+    // Resizing pane 2 vertically must hit the inner vertical split, leaving the
+    // outer horizontal divider untouched.
+    try tree.resize(2, .down, 0.1);
+    var out: std.ArrayList(Placement) = .empty;
+    defer out.deinit(testing.allocator);
+    try tree.layout(.{ .width = 800, .height = 600 }, testing.allocator, &out);
+
+    // Pane 1 still owns exactly the left half (outer ratio unchanged).
+    try testing.expectEqual(@as(f32, 400), out.items[0].rect.width);
+    // Pane 2 grew downward: 0.6 * 600 = 360.
+    try testing.expectEqual(@as(f32, 360), out.items[1].rect.height);
+}
+
+test "SplitTree: resize with no matching split errors" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try tree.split(1, .right, 2); // only a horizontal split exists
+
+    // No vertical split above pane 1.
+    try testing.expectError(error.NoSplitInDirection, tree.resize(1, .down, 0.1));
+    // Unknown surface.
+    try testing.expectError(error.SurfaceNotFound, tree.resize(9, .right, 0.1));
 }
 
 test "SplitTree: focusTarget moves between panes" {
