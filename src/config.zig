@@ -9,6 +9,7 @@
 //! options are added lazily as the layers that need them land. See PORTING.md.
 const std = @import("std");
 const shaper = @import("font/shaper.zig");
+const binding = @import("input/Binding.zig");
 
 /// An RGB color. Ported from ghostty `Config.Color` — the `#RRGGBB` grammar
 /// (leading `#` optional, 3- or 6-digit hex) plus a small set of named colors.
@@ -158,6 +159,11 @@ pub const Config = struct {
     /// the arena.
     font_features: std.ArrayList(shaper.Feature) = .empty,
 
+    /// User keybindings (#18/#16), from repeated `keybind = <trigger>=<action>`
+    /// lines. The apprt seeds defaults first, then these override per trigger.
+    /// Owned by the arena.
+    keybinds: binding.Set = .{},
+
     /// Non-fatal problems encountered while loading (unknown keys, bad values).
     /// Owned by the arena. Loading never fails on these; it collects and
     /// continues, matching ghostty's behavior.
@@ -214,6 +220,8 @@ pub const Config = struct {
             self.palette[idx] = try Color.parse(std.mem.trim(u8, value[eq + 1 ..], " \t"));
         } else if (std.mem.eql(u8, key, "font-feature")) {
             try self.font_features.append(alloc, try shaper.Feature.parse(value));
+        } else if (std.mem.eql(u8, key, "keybind")) {
+            try self.keybinds.putLine(alloc, value);
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -370,6 +378,28 @@ test "config: a bad font-feature is a diagnostic, not a failure" {
     var cfg = try Config.parse(testing.allocator, "font-feature = waytoolong\n");
     defer cfg.deinit();
     try testing.expectEqual(@as(usize, 0), cfg.font_features.items.len);
+    try testing.expectEqual(@as(usize, 1), cfg.diagnostics.items.len);
+}
+
+test "config: keybind lines populate the binding set" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\keybind = ctrl+shift+t=new_tab
+        \\keybind = ctrl+shift+right=new_split:right
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 2), cfg.keybinds.count());
+    const t: binding.Trigger = .{ .key = .{ .codepoint = 't' }, .mods = .{ .ctrl = true, .shift = true } };
+    try testing.expectEqual(binding.Action.new_tab, cfg.keybinds.get(t).?);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: a bad keybind is a diagnostic, not a failure" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "keybind = ctrl+shift+t=frobnicate\n");
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 0), cfg.keybinds.count());
     try testing.expectEqual(@as(usize, 1), cfg.diagnostics.items.len);
 }
 
