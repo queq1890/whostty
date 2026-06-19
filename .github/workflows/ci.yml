@@ -1,0 +1,44 @@
+name: CI
+
+# Build/test CI. This is separate from upstream tracking (which uses a Claude
+# Routine, not Actions — see docs/release-routine.md); it only compiles the
+# project and runs the host unit tests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install the pinned Zig straight from the canonical release path. The
+      # setup-zig action resolves versions via a mirror index that didn't carry
+      # this version, so fetch the tarball directly. Zig changed its archive
+      # naming to `zig-<arch>-<os>` in the 0.15 series, so try the new naming
+      # first and fall back to the old `zig-<os>-<arch>` form.
+      - name: Install Zig
+        run: |
+          version="$(cat .zigversion)"
+          base="https://ziglang.org/download/${version}"
+          ok=""
+          for name in "zig-x86_64-linux-${version}" "zig-linux-x86_64-${version}"; do
+            url="${base}/${name}.tar.xz"
+            echo "Trying $url"
+            if curl -fsSL "$url" -o zig.tar.xz; then ok=1; break; fi
+          done
+          if [ -z "$ok" ]; then echo "could not download Zig ${version}"; exit 1; fi
+          mkdir -p "$HOME/zig"
+          tar -xJf zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Host unit tests
+        run: zig build test
+
+      - name: Cross-compile the Win32 terminal (link check)
+        run: zig build -Dtarget=x86_64-windows
