@@ -19,6 +19,34 @@ const builtin = @import("builtin");
 /// when the system has one.
 pub const Style = enum { regular, bold, italic, bold_italic };
 
+/// Whether a codepoint should render with its text or emoji (color) glyph. Text
+/// and emoji come from different faces, so the shaper splits runs on it and
+/// discovery picks a different family for each (#13/#14).
+pub const Presentation = enum { text, emoji };
+
+/// The default presentation of a codepoint. This is a pragmatic subset of the
+/// Unicode emoji ranges — enough to route the common pictographic/emoji blocks
+/// to a color-emoji face — not the full emoji-data table (which, with its
+/// text-default exceptions and variation-selector overrides, belongs in a
+/// generated Unicode source and can be wired in later). Returns `.text` for
+/// everything else, including CJK (which is wide but not emoji).
+pub fn presentation(cp: u32) Presentation {
+    return if (isEmojiPresentation(cp)) .emoji else .text;
+}
+
+fn isEmojiPresentation(cp: u32) bool {
+    return (cp >= 0x1F300 and cp <= 0x1FAFF) or // pictographs, emoticons, transport, supplemental
+        (cp >= 0x2600 and cp <= 0x27BF) or // misc symbols + dingbats
+        (cp >= 0x1F1E6 and cp <= 0x1F1FF) or // regional indicators (flags)
+        cp == 0x2B50 or cp == 0x2B55; // star, heavy circle
+}
+
+/// Default emoji-font fallbacks, best-first. Segoe UI Emoji ships on Windows.
+pub const default_emoji = [_][]const u8{
+    "Segoe UI Emoji",
+    "Segoe UI Symbol",
+};
+
 /// A request for a font. A faithful subset of ghostty's `font.Descriptor`:
 /// enough fields to pick a family and a style at a size. `family == null` means
 /// "use the default monospace fallback chain".
@@ -99,13 +127,32 @@ pub fn resolveFamily(requested: ?[]const u8, available: []const []const u8) ?[]c
         }
     }
 
-    for (default_monospace) |fallback| {
+    return firstInChain(&default_monospace, available) orelse available[0];
+}
+
+/// Like `resolveFamily`, but presentation-aware: emoji codepoints ignore the
+/// (monospace) requested family — which won't carry color glyphs — and use the
+/// emoji fallback chain instead. Text uses the normal path.
+pub fn resolveFamilyFor(
+    requested: ?[]const u8,
+    pres: Presentation,
+    available: []const []const u8,
+) ?[]const u8 {
+    if (available.len == 0) return null;
+    return switch (pres) {
+        .text => resolveFamily(requested, available),
+        .emoji => firstInChain(&default_emoji, available) orelse available[0],
+    };
+}
+
+/// The first family in `chain` that's present in `available` (case-insensitive).
+fn firstInChain(chain: []const []const u8, available: []const []const u8) ?[]const u8 {
+    for (chain) |want| {
         for (available) |a| {
-            if (std.ascii.eqlIgnoreCase(a, fallback)) return a;
+            if (std.ascii.eqlIgnoreCase(a, want)) return a;
         }
     }
-
-    return available[0];
+    return null;
 }
 
 /// Resolve a descriptor to a concrete font file on this system.
@@ -169,6 +216,15 @@ test "discovery: DirectWrite weight/style mapping" {
     try testing.expectEqual(@as(u32, 2), (Descriptor{ .italic = true }).dwriteStyle());
 }
 
+test "discovery: presentation routes emoji vs text" {
+    try testing.expectEqual(Presentation.text, presentation('A'));
+    try testing.expectEqual(Presentation.text, presentation(0x4E00)); // CJK: wide but text
+    try testing.expectEqual(Presentation.emoji, presentation(0x1F600)); // grinning face
+    try testing.expectEqual(Presentation.emoji, presentation(0x2764)); // heavy black heart
+    try testing.expectEqual(Presentation.emoji, presentation(0x1F1FA)); // regional indicator U
+    try testing.expectEqual(Presentation.emoji, presentation(0x1FAE0)); // melting face (extended-A)
+}
+
 test "discovery: resolveFamily prefers the requested family (case-insensitive)" {
     const available = [_][]const u8{ "Arial", "Consolas", "Cascadia Mono" };
     try testing.expectEqualStrings("Consolas", resolveFamily("consolas", &available).?);
@@ -192,6 +248,27 @@ test "discovery: resolveFamily returns the first available when nothing matches"
 test "discovery: resolveFamily on an empty system list is null" {
     const empty = [_][]const u8{};
     try testing.expect(resolveFamily("Consolas", &empty) == null);
+}
+
+test "discovery: resolveFamilyFor routes emoji to the emoji chain" {
+    const available = [_][]const u8{ "Consolas", "Segoe UI Emoji", "Arial" };
+    // Emoji ignores the requested monospace family and picks the emoji font.
+    try testing.expectEqualStrings(
+        "Segoe UI Emoji",
+        resolveFamilyFor("Consolas", .emoji, &available).?,
+    );
+    // Text behaves like resolveFamily.
+    try testing.expectEqualStrings(
+        "Consolas",
+        resolveFamilyFor("Consolas", .text, &available).?,
+    );
+}
+
+test "discovery: resolveFamilyFor falls back to first available when no emoji font" {
+    const available = [_][]const u8{ "Consolas", "Arial" };
+    try testing.expectEqualStrings("Consolas", resolveFamilyFor(null, .emoji, &available).?);
+    const empty = [_][]const u8{};
+    try testing.expect(resolveFamilyFor(null, .emoji, &empty) == null);
 }
 
 test "discovery: discover is unsupported off-Windows" {
