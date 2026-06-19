@@ -379,6 +379,53 @@ pub const SplitTree = struct {
     fn overlap1d(a_start: f32, a_len: f32, b_start: f32, b_len: f32) bool {
         return a_start < b_start + b_len and b_start < a_start + a_len;
     }
+
+    /// The surface whose laid-out rect contains the point (x, y), or null if the
+    /// point is outside `bounds`. Recurses without allocating, mirroring
+    /// `layout`'s split math — used to route mouse events to a pane.
+    pub fn surfaceAt(self: *const SplitTree, x: f32, y: f32, bounds: Rect) ?SurfaceId {
+        return nodeAt(self.root, x, y, bounds);
+    }
+
+    fn nodeAt(node: *const Node, x: f32, y: f32, bounds: Rect) ?SurfaceId {
+        switch (node.*) {
+            .leaf => |id| return if (inRect(x, y, bounds)) id else null,
+            .split => |s| switch (s.orientation) {
+                .horizontal => {
+                    const aw = bounds.width * s.ratio;
+                    return nodeAt(s.a, x, y, .{
+                        .x = bounds.x,
+                        .y = bounds.y,
+                        .width = aw,
+                        .height = bounds.height,
+                    }) orelse nodeAt(s.b, x, y, .{
+                        .x = bounds.x + aw,
+                        .y = bounds.y,
+                        .width = bounds.width - aw,
+                        .height = bounds.height,
+                    });
+                },
+                .vertical => {
+                    const ah = bounds.height * s.ratio;
+                    return nodeAt(s.a, x, y, .{
+                        .x = bounds.x,
+                        .y = bounds.y,
+                        .width = bounds.width,
+                        .height = ah,
+                    }) orelse nodeAt(s.b, x, y, .{
+                        .x = bounds.x,
+                        .y = bounds.y + ah,
+                        .width = bounds.width,
+                        .height = bounds.height - ah,
+                    });
+                },
+            },
+        }
+    }
+
+    fn inRect(x: f32, y: f32, r: Rect) bool {
+        return x >= r.x and x < r.x + r.width and y >= r.y and y < r.y + r.height;
+    }
 };
 
 /// An ordered list of tabs, each owning a `SplitTree`, with one active tab.
@@ -683,6 +730,21 @@ test "SplitTree: focusTarget moves between panes" {
     try testing.expectEqual(@as(?SurfaceId, 1), try tree.focusTarget(2, .left, bounds, testing.allocator));
     // Nothing to the left of pane 1.
     try testing.expectEqual(@as(?SurfaceId, null), try tree.focusTarget(1, .left, bounds, testing.allocator));
+}
+
+test "SplitTree: surfaceAt hit-tests the layout" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try tree.split(1, .right, 2); // [1 | 2] over 800x600
+    const b: Rect = .{ .width = 800, .height = 600 };
+
+    try testing.expectEqual(@as(?SurfaceId, 1), tree.surfaceAt(100, 300, b));
+    try testing.expectEqual(@as(?SurfaceId, 2), tree.surfaceAt(500, 300, b));
+    // On the divider, the right pane owns the boundary column (half-open rects).
+    try testing.expectEqual(@as(?SurfaceId, 2), tree.surfaceAt(400, 300, b));
+    // Outside the bounds.
+    try testing.expectEqual(@as(?SurfaceId, null), tree.surfaceAt(900, 300, b));
+    try testing.expectEqual(@as(?SurfaceId, null), tree.surfaceAt(100, 700, b));
 }
 
 test "TabList: add, switch, and close tabs" {
