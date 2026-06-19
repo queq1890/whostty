@@ -42,8 +42,10 @@ freetype source, so it needs network access.
 ## Upstream tracking
 
 A scheduled Claude Routine watches ghostty major/minor releases weekly and opens
-a porting-checklist issue describing what changed under the mirrored paths. See
-[PORTING.md](PORTING.md) for the mirrored-path map.
+a porting-checklist issue describing what changed under the mirrored paths. The
+routine's spec and operating prompt live in
+[docs/release-routine.md](docs/release-routine.md); see
+[PORTING.md](PORTING.md) for the mirrored-path map it reads.
 
 ## Acknowledgements
 
