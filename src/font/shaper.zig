@@ -49,6 +49,12 @@ pub const Run = struct {
     len: usize,
     style: Style,
     presentation: Presentation = .text,
+
+    /// The absolute cell column of a shaped glyph, mapping its run-relative
+    /// cluster (as Harfbuzz reports it) back to the row.
+    pub fn column(self: Run, cluster: u32) usize {
+        return self.start + cluster;
+    }
 };
 
 /// Splits a row of cells into runs. A run breaks when the face style changes;
@@ -256,6 +262,12 @@ test "shaper: presentation change breaks the run" {
     try testing.expectEqual(Presentation.text, r2.presentation);
 
     try testing.expect(it.next() == null);
+}
+
+test "shaper: Run.column maps a cluster to its grid column" {
+    const r: Run = .{ .start = 5, .len = 3, .style = .regular };
+    try testing.expectEqual(@as(usize, 5), r.column(0));
+    try testing.expectEqual(@as(usize, 7), r.column(2));
 }
 
 test "shaper: empty input yields no runs" {

@@ -32,6 +32,20 @@ pub const WheelAccumulator = struct {
     }
 };
 
+/// Rows to move the viewport for a page scroll, given the number of visible
+/// rows. One row of overlap is kept so the boundary line stays on screen, as
+/// most terminals do. Always at least 1. The caller applies the sign (negative
+/// for up, matching the VT viewport's `delta_row`).
+pub fn pageRows(visible_rows: usize) usize {
+    return if (visible_rows > 1) visible_rows - 1 else 1;
+}
+
+test "scroll: pageRows keeps one row of overlap" {
+    try std.testing.expectEqual(@as(usize, 23), pageRows(24));
+    try std.testing.expectEqual(@as(usize, 1), pageRows(1));
+    try std.testing.expectEqual(@as(usize, 1), pageRows(0));
+}
+
 test "scroll: one notch up yields negative delta_row" {
     var w: WheelAccumulator = .{};
     try std.testing.expectEqual(@as(isize, -3), w.feed(WheelAccumulator.notch));
