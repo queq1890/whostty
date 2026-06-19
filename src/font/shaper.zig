@@ -16,9 +16,15 @@
 //! types, so it compiles and unit-tests on the host.
 const std = @import("std");
 
+const discovery = @import("discovery.zig");
+
 /// The face style of a cell, reused from discovery so the two layers agree on
 /// the regular/bold/italic/bold-italic split.
-pub const Style = @import("discovery.zig").Style;
+pub const Style = discovery.Style;
+
+/// Text vs emoji presentation, reused from discovery. Runs don't cross it: text
+/// and emoji come from different faces.
+pub const Presentation = discovery.Presentation;
 
 /// How a cell participates in character width. A wide character (CJK, some
 /// emoji) occupies its own cell plus a trailing `spacer_tail` cell; the tail
@@ -31,6 +37,7 @@ pub const Width = enum { narrow, wide, spacer_tail };
 pub const Cell = struct {
     codepoint: u21,
     style: Style = .regular,
+    presentation: Presentation = .text,
     width: Width = .narrow,
 };
 
@@ -41,6 +48,7 @@ pub const Run = struct {
     start: usize,
     len: usize,
     style: Style,
+    presentation: Presentation = .text,
 };
 
 /// Splits a row of cells into runs. A run breaks when the face style changes;
@@ -60,17 +68,18 @@ pub const RunIterator = struct {
 
         const start = self.i;
         const style = self.cells[start].style;
+        const pres = self.cells[start].presentation;
         self.i += 1;
 
-        // Extend while the style matches. Spacer tails always continue the run
-        // regardless of their (unused) style field.
+        // Extend while the style and presentation match. Spacer tails always
+        // continue the run regardless of their (unused) style/presentation.
         while (self.i < self.cells.len) : (self.i += 1) {
             const cell = self.cells[self.i];
             if (cell.width == .spacer_tail) continue;
-            if (cell.style != style) break;
+            if (cell.style != style or cell.presentation != pres) break;
         }
 
-        return .{ .start = start, .len = self.i - start, .style = style };
+        return .{ .start = start, .len = self.i - start, .style = style, .presentation = pres };
     }
 };
 
@@ -218,6 +227,34 @@ test "shaper: a wide cell keeps its spacer tail in the same run" {
     // despite its differing style field.
     try testing.expectEqual(@as(usize, 0), r.start);
     try testing.expectEqual(@as(usize, 4), r.len);
+    try testing.expect(it.next() == null);
+}
+
+test "shaper: presentation change breaks the run" {
+    const cells = [_]Cell{
+        .{ .codepoint = 'h', .presentation = .text },
+        .{ .codepoint = 'i', .presentation = .text },
+        .{ .codepoint = 0x1F600, .presentation = .emoji, .width = .wide },
+        .{ .codepoint = 0, .presentation = .text, .width = .spacer_tail }, // stays with emoji
+        .{ .codepoint = '!', .presentation = .text },
+    };
+    var it = RunIterator.init(&cells);
+
+    const r0 = it.next().?;
+    try testing.expectEqual(@as(usize, 0), r0.start);
+    try testing.expectEqual(@as(usize, 2), r0.len);
+    try testing.expectEqual(Presentation.text, r0.presentation);
+
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(usize, 2), r1.start);
+    try testing.expectEqual(@as(usize, 2), r1.len); // emoji + its spacer tail
+    try testing.expectEqual(Presentation.emoji, r1.presentation);
+
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(usize, 4), r2.start);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(Presentation.text, r2.presentation);
+
     try testing.expect(it.next() == null);
 }
 
