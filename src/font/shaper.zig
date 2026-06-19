@@ -74,6 +74,49 @@ pub const RunIterator = struct {
     }
 };
 
+/// An OpenType font feature toggle (e.g. ligatures `liga`, contextual
+/// alternates `calt`, stylistic sets `ss01`). Faithful to ghostty's
+/// `font-feature` config: a 4-byte tag (space-padded for short tags, as
+/// OpenType requires) plus an integer value (0 = off, 1 = on, or an explicit
+/// count). These feed `hb_shape`'s feature array.
+pub const Feature = struct {
+    tag: [4]u8,
+    value: u32,
+
+    /// Parse one `font-feature` value. Accepts: a bare tag (`liga` -> on),
+    /// a `+`/`-` prefix (`+liga` on, `-liga` off), or an explicit `tag=value`
+    /// (`ss01=2`). A prefix and an explicit value together is an error.
+    pub fn parse(input: []const u8) !Feature {
+        var s = std.mem.trim(u8, input, " \t");
+        if (s.len == 0) return error.InvalidValue;
+
+        var value: ?u32 = null;
+        if (s[0] == '-') {
+            value = 0;
+            s = s[1..];
+        } else if (s[0] == '+') {
+            value = 1;
+            s = s[1..];
+        }
+
+        if (std.mem.indexOfScalar(u8, s, '=')) |eq| {
+            if (value != null) return error.InvalidValue; // both a sign and =value
+            value = try std.fmt.parseInt(u32, std.mem.trim(u8, s[eq + 1 ..], " \t"), 10);
+            s = std.mem.trim(u8, s[0..eq], " \t");
+        }
+
+        if (s.len == 0 or s.len > 4) return error.InvalidValue;
+
+        // OpenType tags are 4 ASCII graphic chars, right-padded with spaces.
+        var tag = [_]u8{' '} ** 4;
+        for (s, 0..) |ch, i| {
+            if (ch <= ' ' or ch > '~') return error.InvalidValue;
+            tag[i] = ch;
+        }
+        return .{ .tag = tag, .value = value orelse 1 };
+    }
+};
+
 /// A glyph produced by shaping: the font's glyph index plus its cluster (the
 /// originating cell offset within the run) and pen advance/offset in pixels.
 /// Mirrors the fields whostty needs from a Harfbuzz `hb_glyph_info_t` +
@@ -187,4 +230,32 @@ test "shaper: shape is seamed until the harfbuzz binding lands" {
     const cells = [_]Cell{.{ .codepoint = 'x' }};
     var sh: Shaper = .{};
     try testing.expectError(error.Unimplemented, sh.shape(testing.allocator, .{ .start = 0, .len = 1, .style = .regular }, &cells));
+}
+
+test "shaper: Feature.parse forms" {
+    // Bare tag enables it.
+    const liga = try Feature.parse("liga");
+    try testing.expectEqualSlices(u8, "liga", &liga.tag);
+    try testing.expectEqual(@as(u32, 1), liga.value);
+
+    // Sign prefixes.
+    try testing.expectEqual(@as(u32, 0), (try Feature.parse("-liga")).value);
+    try testing.expectEqual(@as(u32, 1), (try Feature.parse("+calt")).value);
+
+    // Explicit value.
+    const ss = try Feature.parse("ss01=2");
+    try testing.expectEqualSlices(u8, "ss01", &ss.tag);
+    try testing.expectEqual(@as(u32, 2), ss.value);
+    try testing.expectEqual(@as(u32, 0), (try Feature.parse("calt=0")).value);
+
+    // Short tags are right-padded with spaces.
+    const short = try Feature.parse("aa");
+    try testing.expectEqualSlices(u8, "aa  ", &short.tag);
+}
+
+test "shaper: Feature.parse rejects malformed input" {
+    try testing.expectError(error.InvalidValue, Feature.parse(""));
+    try testing.expectError(error.InvalidValue, Feature.parse("toolong"));
+    try testing.expectError(error.InvalidValue, Feature.parse("-liga=2")); // sign + value
+    try testing.expectError(error.InvalidValue, Feature.parse("ss01=x")); // non-numeric
 }
