@@ -101,7 +101,8 @@ pub const Feature = struct {
 
         if (std.mem.indexOfScalar(u8, s, '=')) |eq| {
             if (value != null) return error.InvalidValue; // both a sign and =value
-            value = try std.fmt.parseInt(u32, std.mem.trim(u8, s[eq + 1 ..], " \t"), 10);
+            value = std.fmt.parseInt(u32, std.mem.trim(u8, s[eq + 1 ..], " \t"), 10) catch
+                return error.InvalidValue;
             s = std.mem.trim(u8, s[0..eq], " \t");
         }
 
