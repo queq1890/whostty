@@ -39,6 +39,12 @@ On a non-Windows host the binary runs a libghostty-vt wiring demo; the actual
 terminal (`apprt/win32`) is produced by the Windows target. `-Dfreetype` fetches
 freetype source, so it needs network access.
 
+## Configuration
+
+whostty reads `%APPDATA%\whostty\config` (ghostty's `key = value` format). All
+options — colors, fonts, font features, the renderer backend, and keybindings —
+are documented in [docs/configuration.md](docs/configuration.md).
+
 ## Upstream tracking
 
 A scheduled Claude Routine watches ghostty major/minor releases weekly and opens
