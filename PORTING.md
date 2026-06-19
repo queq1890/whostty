@@ -59,13 +59,14 @@ The `Tests` column below tracks this per layer.
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
 | Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`); synthetic bold/italic deferred (#13/#14) | host (needs font + network) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
+| Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + initial options (#17) | done (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
 
 ## Explicitly excluded (for now)
 
-These ghostty paths are out of scope until after slice-0 and are intentionally
-not mirrored yet: `cli/`, `config/` (config file), `inspector/`, `crash/`,
-`benchmark/`, `synthetic/`, `shell-integration/`, `terminfo/`, plus the
-macOS/GTK-specific apprt layers.
+These ghostty paths are out of scope and intentionally not mirrored yet:
+`cli/` (full CLI arg parsing — only the config line format is ported, see the
+Config row), `inspector/`, `crash/`, `benchmark/`, `synthetic/`,
+`shell-integration/`, `terminfo/`, plus the macOS/GTK-specific apprt layers.
