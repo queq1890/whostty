@@ -53,6 +53,7 @@ test {
     _ = @import("font/discovery.zig");
     _ = @import("font/shaper.zig");
     _ = @import("input/Binding.zig");
+    _ = @import("apprt/win32/keymap.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 
