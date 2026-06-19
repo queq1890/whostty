@@ -149,6 +149,16 @@ pub const Config = struct {
     cursor_style: CursorStyle = .block,
     renderer: RendererBackend = .opengl,
 
+    /// Optional color overrides. `null` means "derive from fg/bg" (the renderer
+    /// picks a sensible default — e.g. the cursor uses the foreground).
+    cursor_color: ?Color = null,
+    selection_background: ?Color = null,
+    selection_foreground: ?Color = null,
+
+    /// Render bold text with the bright (8–15) palette color, as many terminals
+    /// do. Ported from ghostty's `bold-is-bright`.
+    bold_is_bright: bool = false,
+
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
     /// `palette = <index>=<color>` lines (ghostty syntax).
@@ -222,6 +232,14 @@ pub const Config = struct {
             try self.font_features.append(alloc, try shaper.Feature.parse(value));
         } else if (std.mem.eql(u8, key, "keybind")) {
             try self.keybinds.putLine(alloc, value);
+        } else if (std.mem.eql(u8, key, "cursor-color")) {
+            self.cursor_color = try Color.parse(value);
+        } else if (std.mem.eql(u8, key, "selection-background")) {
+            self.selection_background = try Color.parse(value);
+        } else if (std.mem.eql(u8, key, "selection-foreground")) {
+            self.selection_foreground = try Color.parse(value);
+        } else if (std.mem.eql(u8, key, "bold-is-bright")) {
+            self.bold_is_bright = try parseBool(value);
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -232,6 +250,18 @@ pub const Config = struct {
         try self.diagnostics.append(alloc, msg);
     }
 };
+
+/// Parse a boolean config value. A bare key (empty value) is `true` — the flag
+/// form, matching ghostty — as are `true`/`yes`/`1`; `false`/`no`/`0` are
+/// `false`. Anything else is an error.
+fn parseBool(value: []const u8) !bool {
+    if (value.len == 0) return true;
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "1"))
+        return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "no") or std.mem.eql(u8, value, "0"))
+        return false;
+    return error.InvalidValue;
+}
 
 test "config: Color.fromHex" {
     const testing = std.testing;
@@ -316,6 +346,41 @@ test "config: parse sets fields" {
     try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, cfg.foreground);
     try testing.expectEqual(CursorStyle.bar, cfg.cursor_style);
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: optional color overrides and bold-is-bright" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\cursor-color = #ff8800
+        \\selection-background = #222244
+        \\selection-foreground = white
+        \\bold-is-bright = true
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(Color{ .r = 0xff, .g = 0x88, .b = 0x00 }, cfg.cursor_color.?);
+    try testing.expectEqual(Color{ .r = 0x22, .g = 0x22, .b = 0x44 }, cfg.selection_background.?);
+    try testing.expectEqual(Color{ .r = 0xff, .g = 0xff, .b = 0xff }, cfg.selection_foreground.?);
+    try testing.expect(cfg.bold_is_bright);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: color overrides default to null; bool flag form is true" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "bold-is-bright\n");
+    defer cfg.deinit();
+    try testing.expect(cfg.cursor_color == null);
+    try testing.expect(cfg.selection_background == null);
+    try testing.expect(cfg.bold_is_bright); // bare flag => true
+}
+
+test "config: parseBool forms and errors" {
+    const testing = std.testing;
+    try testing.expect(try parseBool(""));
+    try testing.expect(try parseBool("yes"));
+    try testing.expect(!try parseBool("false"));
+    try testing.expect(!try parseBool("0"));
+    try testing.expectError(error.InvalidValue, parseBool("maybe"));
 }
 
 test "config: renderer backend selection" {

@@ -64,7 +64,7 @@ The `Tests` column below tracks this per layer.
 | Text shaping | `src/font/shaper/run.zig`, `shaper/harfbuzz.zig` | `src/font/shaper.zig` | port | presentation-aware run segmentation + `font-feature` parsing (#13); Harfbuzz shaping seamed pending the dependency + a compiler | done (host: run iterator, features) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
 | Keybindings | `src/input/Binding.zig` | `src/input/Binding.zig` | port | chord/action grammar + Set + defaults + `keybind` config (#18/#16); apprt event→trigger lookup pending (Windows) | done (host) |
-| Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + initial options (#17) | done (host) |
+| Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + options: colors/font/cursor/palette/renderer/font-feature/keybind/cursor+selection colors/bold-is-bright (#17) | done (host) |
 | Surface mgmt (tabs/splits) | `src/apprt/gtk/` (Split/Notebook) | `src/apprt/win32/SplitTree.zig` | template | split tree (split/close/resize/equalize/layout/focus-nav) + tab list model (#18) | fresh (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
