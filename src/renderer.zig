@@ -61,10 +61,10 @@ test "renderer: backend enum mirrors the config selector names" {
     // Guards against the two enums drifting apart. Both must list the same
     // backends in the same spelling so the app can map one to the other.
     const config = @import("config.zig");
-    const a = @typeInfo(Backend).@"enum";
-    const b = @typeInfo(config.RendererBackend).@"enum";
-    try std.testing.expectEqual(a.fields.len, b.fields.len);
-    inline for (a.fields, b.fields) |fa, fb| {
+    const a = std.meta.fields(Backend);
+    const b = std.meta.fields(config.RendererBackend);
+    try std.testing.expectEqual(a.len, b.len);
+    inline for (a, b) |fa, fb| {
         try std.testing.expectEqualStrings(fa.name, fb.name);
     }
 }
