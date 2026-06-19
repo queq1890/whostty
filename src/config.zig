@@ -8,6 +8,7 @@
 //! the apprt/renderer actually consume today (colors, font, cursor). More
 //! options are added lazily as the layers that need them land. See PORTING.md.
 const std = @import("std");
+const shaper = @import("font/shaper.zig");
 
 /// An RGB color. Ported from ghostty `Config.Color` — the `#RRGGBB` grammar
 /// (leading `#` optional, 3- or 6-digit hex) plus a small set of named colors.
@@ -78,6 +79,11 @@ pub const Color = struct {
 /// The shape the cursor is drawn as.
 pub const CursorStyle = enum { block, bar, underline };
 
+/// Which renderer backend draws the terminal. `opengl` (WGL) is the bring-up
+/// path and the default; `direct3d` is the long-term native Windows target
+/// (#15) and is selected here but not yet implemented — see `src/renderer.zig`.
+pub const RendererBackend = enum { opengl, direct3d };
+
 /// A parsed `key = value` pair from a config file line.
 pub const KeyValue = struct {
     key: []const u8,
@@ -140,11 +146,17 @@ pub const Config = struct {
     background: Color = .{ .r = 0, .g = 0, .b = 0 },
     foreground: Color = .{ .r = 0xff, .g = 0xff, .b = 0xff },
     cursor_style: CursorStyle = .block,
+    renderer: RendererBackend = .opengl,
 
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
     /// `palette = <index>=<color>` lines (ghostty syntax).
     palette: [256]?Color = .{null} ** 256,
+
+    /// OpenType font features to apply during shaping (#13). Accumulated from
+    /// repeated `font-feature = <tag>` lines (e.g. `-liga`, `ss01=2`). Owned by
+    /// the arena.
+    font_features: std.ArrayList(shaper.Feature) = .empty,
 
     /// Non-fatal problems encountered while loading (unknown keys, bad values).
     /// Owned by the arena. Loading never fails on these; it collects and
@@ -193,10 +205,15 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, key, "cursor-style")) {
             self.cursor_style = std.meta.stringToEnum(CursorStyle, value) orelse
                 return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "renderer")) {
+            self.renderer = std.meta.stringToEnum(RendererBackend, value) orelse
+                return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "palette")) {
             const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidValue;
             const idx = try std.fmt.parseInt(u8, std.mem.trim(u8, value[0..eq], " \t"), 10);
             self.palette[idx] = try Color.parse(std.mem.trim(u8, value[eq + 1 ..], " \t"));
+        } else if (std.mem.eql(u8, key, "font-feature")) {
+            try self.font_features.append(alloc, try shaper.Feature.parse(value));
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -293,6 +310,20 @@ test "config: parse sets fields" {
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
 }
 
+test "config: renderer backend selection" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "renderer = direct3d\n");
+    defer cfg.deinit();
+    try testing.expectEqual(RendererBackend.direct3d, cfg.renderer);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+
+    // Default is opengl; a bad value is a diagnostic and leaves the default.
+    var bad = try Config.parse(testing.allocator, "renderer = vulkan\n");
+    defer bad.deinit();
+    try testing.expectEqual(RendererBackend.opengl, bad.renderer);
+    try testing.expectEqual(@as(usize, 1), bad.diagnostics.items.len);
+}
+
 test "config: defaults survive an empty load" {
     const testing = std.testing;
     var cfg = try Config.parse(testing.allocator, "\n# just a comment\n");
@@ -316,6 +347,30 @@ test "config: palette overrides accumulate by index" {
     // Untouched indices stay null (fall back to the vt default).
     try testing.expectEqual(@as(?Color, null), cfg.palette[2]);
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: font-feature accumulates parsed features" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\font-feature = -liga
+        \\font-feature = ss01=2
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 2), cfg.font_features.items.len);
+    try testing.expectEqualSlices(u8, "liga", &cfg.font_features.items[0].tag);
+    try testing.expectEqual(@as(u32, 0), cfg.font_features.items[0].value);
+    try testing.expectEqualSlices(u8, "ss01", &cfg.font_features.items[1].tag);
+    try testing.expectEqual(@as(u32, 2), cfg.font_features.items[1].value);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: a bad font-feature is a diagnostic, not a failure" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "font-feature = waytoolong\n");
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 0), cfg.font_features.items.len);
+    try testing.expectEqual(@as(usize, 1), cfg.diagnostics.items.len);
 }
 
 test "config: out-of-range palette index is a diagnostic" {

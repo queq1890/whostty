@@ -116,6 +116,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer cfg.deinit();
     const theme: Theme = .fromConfig(&cfg);
 
+    // Direct3D (#15) is selectable in config but not implemented yet; OpenGL is
+    // the only backend, so warn and fall back rather than failing to start.
+    if (cfg.renderer == .direct3d) {
+        log.warn("renderer = direct3d is not implemented yet; using OpenGL", .{});
+    }
+
     // --- Glyph atlas + cell metrics ---
     var atlas = try Atlas.init(alloc, 512);
     defer atlas.deinit(alloc);

@@ -55,12 +55,16 @@ The `Tests` column below tracks this per layer.
 | PTY | `src/pty.zig` | `src/pty.zig` (ConPTY) | template | done | fresh tests |
 | Terminal IO | `src/termio.zig`, `src/termio/` | `src/termio.zig` | port | done + viewport scroll (#16) | done (host) |
 | Scrollback scroll | `src/Surface.zig` (scroll); storage in VT core | `src/scroll.zig` (wheel→rows) + `termio` scroll, viewport in `ghostty-vt` `PageList` | port + dependency | wheel scroll + scroll-to-bottom (#16) | done (host: wheel accum) |
+| Renderer registry | `src/renderer.zig` | `src/renderer.zig` | template | backend abstraction + `renderer` config selector; Direct3D backend pending a Windows host (#15) | done (host: enum guard) |
 | Renderer (OpenGL) | `src/renderer/OpenGL.zig` | `src/renderer/OpenGL.zig` (WGL/GL 3.3) | port | SGR fg/bg + decorations (#12) | done (host: geometry, solid quads) |
 | SGR color/attrs | `src/terminal/sgr.zig`, `src/terminal/style.zig` | resolved via `ghostty-vt` (`Style.fg`/`bg`, palette) in `apprt/win32/App.zig` | dependency | fg/bg/inverse/underline/strike/overline (#12) | upstream (resolution) |
 | Glyph atlas | `src/font/Atlas.zig` | `src/font/Atlas.zig` | port | done | done (host) |
 | Font (Freetype) | `src/font/main.zig` | `src/font/main.zig` | port | opt-in (`-Dfreetype`); synthetic bold/italic deferred (#13/#14) | host (needs font + network) |
+| Font discovery | `src/font/discovery.zig` (Descriptor + backend) | `src/font/discovery.zig` (DirectWrite) | template | Descriptor + family resolution/fallback + DW weight/style mapping (#14); DirectWrite COM enumeration pending a Windows host | done (host: core); COM untested |
+| Text shaping | `src/font/shaper/run.zig`, `shaper/harfbuzz.zig` | `src/font/shaper.zig` | port | run segmentation + `font-feature` parsing (#13); Harfbuzz shaping seamed pending the dependency + a compiler | done (host: run iterator, features) |
 | Input (app-side) | `src/input.zig` | `src/input.zig` | port | done | done (host) |
 | Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + initial options (#17) | done (host) |
+| Surface mgmt (tabs/splits) | `src/apprt/gtk/` (Split/Notebook) | `src/apprt/win32/SplitTree.zig` | template | split tree (split/close/resize/equalize/layout/focus-nav) + tab list model (#18) | fresh (host) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
