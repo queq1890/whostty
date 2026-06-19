@@ -159,6 +159,10 @@ pub const Config = struct {
     /// do. Ported from ghostty's `bold-is-bright`.
     bold_is_bright: bool = false,
 
+    /// Maximum scrollback retained, in bytes (ghostty's `scrollback-limit`).
+    /// Defaults to 10 MB. The VT core (libghostty-vt) enforces the limit.
+    scrollback_limit: usize = 10_000_000,
+
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
     /// `palette = <index>=<color>` lines (ghostty syntax).
@@ -240,6 +244,8 @@ pub const Config = struct {
             self.selection_foreground = try Color.parse(value);
         } else if (std.mem.eql(u8, key, "bold-is-bright")) {
             self.bold_is_bright = try parseBool(value);
+        } else if (std.mem.eql(u8, key, "scrollback-limit")) {
+            self.scrollback_limit = try std.fmt.parseInt(usize, value, 10);
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -363,6 +369,17 @@ test "config: optional color overrides and bold-is-bright" {
     try testing.expectEqual(Color{ .r = 0xff, .g = 0xff, .b = 0xff }, cfg.selection_foreground.?);
     try testing.expect(cfg.bold_is_bright);
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: scrollback-limit parses; default otherwise" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "scrollback-limit = 5000000\n");
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 5_000_000), cfg.scrollback_limit);
+
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expectEqual(@as(usize, 10_000_000), def.scrollback_limit);
 }
 
 test "config: color overrides default to null; bool flag form is true" {
