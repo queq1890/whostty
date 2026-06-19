@@ -48,6 +48,19 @@ pub const Descriptor = struct {
     pub fn dwriteStyle(self: Descriptor) u32 {
         return if (self.italic) 2 else 0;
     }
+
+    /// Build a descriptor for one face variant of a configured font. The app
+    /// requests up to four variants (regular/bold/italic/bold-italic) from the
+    /// same family at the same size; this maps a `Style` onto the bold/italic
+    /// flags so each can be discovered (or synthesized) independently.
+    pub fn forStyle(family: ?[]const u8, size: f32, s: Style) Descriptor {
+        return .{
+            .family = family,
+            .size = size,
+            .bold = s == .bold or s == .bold_italic,
+            .italic = s == .italic or s == .bold_italic,
+        };
+    }
 };
 
 /// A resolved face: the family that was actually chosen and the file path to
@@ -133,6 +146,20 @@ test "discovery: style derivation" {
     try testing.expectEqual(Style.bold, (Descriptor{ .bold = true }).style());
     try testing.expectEqual(Style.italic, (Descriptor{ .italic = true }).style());
     try testing.expectEqual(Style.bold_italic, (Descriptor{ .bold = true, .italic = true }).style());
+}
+
+test "discovery: forStyle maps a Style onto bold/italic flags" {
+    const reg = Descriptor.forStyle("Consolas", 13, .regular);
+    try testing.expectEqualStrings("Consolas", reg.family.?);
+    try testing.expectEqual(@as(f32, 13), reg.size);
+    try testing.expect(!reg.bold and !reg.italic);
+
+    const bi = Descriptor.forStyle("Consolas", 13, .bold_italic);
+    try testing.expect(bi.bold and bi.italic);
+    try testing.expectEqual(Style.bold_italic, bi.style());
+
+    try testing.expect(Descriptor.forStyle(null, 12, .bold).bold);
+    try testing.expect(Descriptor.forStyle(null, 12, .italic).italic);
 }
 
 test "discovery: DirectWrite weight/style mapping" {
