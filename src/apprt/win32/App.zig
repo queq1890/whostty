@@ -22,6 +22,7 @@ const w = @import("../../os/windows.zig");
 
 const font = if (build_options.freetype) @import("../../font/main.zig") else struct {};
 const vt = @import("ghostty-vt");
+const config = @import("../../config.zig");
 
 const log = std.log.scoped(.app);
 
@@ -35,11 +36,31 @@ const GlyphInfo = struct {
 const first_glyph = 32;
 const last_glyph = 126;
 
-/// Default terminal colors for cells that don't set an explicit SGR color.
-/// The framebuffer is cleared to `default_bg`, so only non-default backgrounds
-/// emit a fill. (Configurable colors are later work; see #17.)
-const default_fg: vt.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
-const default_bg: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+/// The resolved color theme the renderer uses: default fg/bg for cells with no
+/// explicit SGR color, plus the effective 256-color palette (vt defaults with
+/// any config `palette` overrides applied). Built once from the config.
+const Theme = struct {
+    fg: vt.color.RGB,
+    bg: vt.color.RGB,
+    palette: vt.color.Palette,
+
+    fn fromConfig(cfg: *const config.Config) Theme {
+        var palette: vt.color.Palette = vt.color.default;
+        for (cfg.palette, 0..) |override, i| {
+            if (override) |c| palette[i] = toVtRgb(c);
+        }
+        return .{
+            .fg = toVtRgb(cfg.foreground),
+            .bg = toVtRgb(cfg.background),
+            .palette = palette,
+        };
+    }
+};
+
+/// Convert a config color to a libghostty-vt RGB (both are 8-bit per channel).
+fn toVtRgb(c: config.Color) vt.color.RGB {
+    return .{ .r = c.r, .g = c.g, .b = c.b };
+}
 
 /// Convert a libghostty-vt RGB (0..255 per channel) to the renderer's 0..1.
 fn rgbf(c: vt.color.RGB) [3]f32 {
@@ -51,13 +72,30 @@ fn rgbf(c: vt.color.RGB) [3]f32 {
 }
 
 /// Resolve a style color (the underline color in particular) against the
-/// palette. `none` falls back to the default foreground.
-fn resolveColor(c: vt.Style.Color, palette: *const vt.color.Palette) vt.color.RGB {
+/// palette. `none` falls back to `fallback` (the cell's foreground).
+fn resolveColor(c: vt.Style.Color, palette: *const vt.color.Palette, fallback: vt.color.RGB) vt.color.RGB {
     return switch (c) {
-        .none => default_fg,
+        .none => fallback,
         .palette => |idx| palette[idx],
         .rgb => |rgb| rgb,
     };
+}
+
+/// Load the user config from `%APPDATA%\whostty\config`, falling back to
+/// defaults if it is missing or unreadable. font-family discovery is deferred
+/// to #14, so only size/colors take effect today.
+fn loadConfig(alloc: std.mem.Allocator) config.Config {
+    return loadConfigFile(alloc) catch config.Config.init(alloc);
+}
+
+fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
+    const appdata = try std.process.getEnvVarOwned(alloc, "APPDATA");
+    defer alloc.free(appdata);
+    const path = try std.fs.path.join(alloc, &.{ appdata, "whostty", "config" });
+    defer alloc.free(path);
+    const data = try std.fs.cwd().readFileAlloc(alloc, path, 1 << 20);
+    defer alloc.free(data);
+    return try config.Config.parse(alloc, data);
 }
 
 /// The full slice-0 terminal. Run on the main thread.
@@ -72,6 +110,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var renderer = try gl.Renderer.init(alloc, w.wglGetProcAddress);
     defer renderer.deinit();
 
+    // --- Config (colors, font size, palette overrides) ---
+    var cfg = loadConfig(alloc);
+    defer cfg.deinit();
+    const theme: Theme = .fromConfig(&cfg);
+
     // --- Glyph atlas + cell metrics ---
     var atlas = try Atlas.init(alloc, 512);
     defer atlas.deinit(alloc);
@@ -81,7 +124,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var ascent: u32 = 12;
 
     if (build_options.freetype) {
-        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent);
+        const px: u32 = @intFromFloat(@max(1, @round(cfg.font_size)));
+        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px);
     }
     renderer.setAtlas(atlas.data, atlas.size);
 
@@ -133,8 +177,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         if (closed) break;
 
         const sz = win.clientSize();
-        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent);
-        try renderer.draw(quads.items, sz.width, sz.height);
+        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme);
+        try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
         win.swapBuffers();
     }
 }
@@ -175,12 +219,14 @@ fn buildAtlas(
     cell_w: *u32,
     cell_h: *u32,
     ascent: *u32,
+    px: u32,
 ) !void {
     var lib = try font.Library.init();
     defer lib.deinit();
 
-    // A reasonable default monospace font on Windows.
-    var face = try font.Face.init(lib, "C:\\Windows\\Fonts\\consola.ttf", 16);
+    // A reasonable default monospace font on Windows. font-family selection is
+    // deferred to DirectWrite discovery (#14); the configured size applies now.
+    var face = try font.Face.init(lib, "C:\\Windows\\Fonts\\consola.ttf", px);
     defer face.deinit();
 
     const m = face.metrics();
@@ -223,6 +269,7 @@ fn buildQuads(
     cell_w: u32,
     cell_h: u32,
     ascent: u32,
+    theme: *const Theme,
 ) !void {
     quads.clearRetainingCapacity();
 
@@ -231,7 +278,7 @@ fn buildQuads(
 
     const term = &io.terminal;
     const screen = term.screens.active;
-    const palette = &vt.color.default;
+    const palette = &theme.palette;
     const rows: u32 = term.rows;
     const cols: u32 = term.cols;
     const line_h: u32 = @max(1, cell_h / 16);
@@ -248,12 +295,14 @@ fn buildQuads(
             const cell = gc.cell;
             const style = gc.style();
 
-            // Resolve fg/bg, then apply inverse video by swapping them.
-            var fg = rgbf(style.fg(.{ .default = default_fg, .palette = palette }));
+            // Resolve fg/bg against the configured theme, then apply inverse
+            // video by swapping them.
+            const fg_rgb = style.fg(.{ .default = theme.fg, .palette = palette });
+            var fg = rgbf(fg_rgb);
             var bg: ?[3]f32 = if (style.bg(cell, palette)) |c| rgbf(c) else null;
             if (style.flags.inverse) {
                 const old_fg = fg;
-                fg = bg orelse rgbf(default_bg);
+                fg = bg orelse rgbf(theme.bg);
                 bg = old_fg;
             }
 
@@ -296,7 +345,7 @@ fn buildQuads(
             // color when set; strikethrough/overline use the foreground.
             if (style.flags.underline != .none) {
                 const uc = if (style.underline_color != .none)
-                    rgbf(resolveColor(style.underline_color, palette))
+                    rgbf(resolveColor(style.underline_color, palette, fg_rgb))
                 else
                     fg;
                 try quads.append(alloc, .{ .solid = .{

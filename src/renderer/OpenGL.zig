@@ -354,12 +354,13 @@ pub const Renderer = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
-    /// Clear and draw all quads in order. `screen_w/h` are the framebuffer
-    /// pixels. Quads are emitted in slice order so the caller controls
-    /// layering (background solids before glyphs, decoration solids after).
-    pub fn draw(self: *Renderer, quads: []const Quad, screen_w: u32, screen_h: u32) !void {
+    /// Clear and draw all quads in order. `clear` is the background fill (the
+    /// default cell background), `screen_w/h` are the framebuffer pixels. Quads
+    /// are emitted in slice order so the caller controls layering (background
+    /// solids before glyphs, decoration solids after).
+    pub fn draw(self: *Renderer, quads: []const Quad, clear: [3]f32, screen_w: u32, screen_h: u32) !void {
         glViewport(0, 0, @intCast(screen_w), @intCast(screen_h));
-        glClearColor(0.0, 0.0, 0.0, 1.0);
+        glClearColor(clear[0], clear[1], clear[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
 
         self.verts.clearRetainingCapacity();
