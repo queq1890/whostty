@@ -332,7 +332,15 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
             .mouse_capture_lost => sfc.endDrag(),
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
-            .focus => |f| focused = f,
+            .focus => |f| {
+                // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
+                // can't emit a duplicate report.
+                if (focused != f) {
+                    focused = f;
+                    // Report the change to apps that asked for it (mode 1004).
+                    if (io.focusReport(f)) |r| _ = pty.write(r) catch {};
+                }
+            },
             .close => closed = true,
         };
         if (closed) break;
