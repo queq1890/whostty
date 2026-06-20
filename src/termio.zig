@@ -214,6 +214,20 @@ pub const Termio = struct {
         try self.stream.nextSlice(bytes);
     }
 
+    /// Key-encoding options derived from the current terminal state: cursor-key
+    /// application mode (DECCKM), keypad mode, modify-other-keys, and the
+    /// alt-esc prefix. Kitty keyboard output is forced **off**: the Win32 layer
+    /// still emits raw UTF-8 for printable keys via WM_CHAR, so routing special
+    /// keys through the kitty encoder would be inconsistent. Full kitty output
+    /// and the `CSI ? u` reply are deferred (#82). Thread-safe.
+    pub fn keyEncodeOptions(self: *Termio) vt.input.KeyEncodeOptions {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var opts = vt.input.KeyEncodeOptions.fromTerminal(&self.terminal);
+        opts.kitty_flags = .disabled;
+        return opts;
+    }
+
     /// Resize the terminal grid. Thread-safe.
     pub fn resize(self: *Termio, cols: u16, rows: u16) !void {
         self.mutex.lock();
