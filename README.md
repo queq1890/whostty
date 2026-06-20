@@ -42,6 +42,24 @@ On a non-Windows host the binary runs a libghostty-vt wiring demo; the actual
 terminal (`apprt/win32`) is produced by the Windows target. `-Dfreetype` fetches
 freetype source, so it needs network access.
 
+### Running from the command line
+
+The build produces `zig-out\bin\whostty.exe`. To launch it by name like
+`ghostty`, put it on your `PATH` (copy it into a directory already on `PATH`,
+e.g. `%LOCALAPPDATA%\Microsoft\WindowsApps`, or add its folder via
+`setx PATH "%PATH%;C:\path\to\whostty"`). Then:
+
+```sh
+whostty                       # open the terminal (default shell: cmd.exe)
+whostty -e pwsh -NoLogo       # run a specific program instead of the shell
+whostty --font-size=16 --background=#101010   # config options as flags
+whostty --help                # usage; --version for the version
+```
+
+`--<key>=<value>` (or `--<key> <value>`) accepts any config-file key and is
+applied on top of `%APPDATA%\whostty\config`. Full `+action` subcommands
+(`+list-fonts`, …) are a follow-up.
+
 ### Interaction
 
 `Ctrl+Shift+C` / `Ctrl+Shift+V` copy/paste; left-drag selects text (`Shift`

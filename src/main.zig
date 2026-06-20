@@ -7,14 +7,67 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
+const cli = @import("cli.zig");
+
+const version_string = "whostty 0.0.0 (ghostty v1.3.1, libghostty-vt)";
 
 pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    // argsAlloc returns [][:0]u8; re-view it as []const []const u8 for the parser.
+    const argv = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, argv);
+    const args = try alloc.alloc([]const u8, argv.len);
+    defer alloc.free(args);
+    for (argv, 0..) |a, i| args[i] = a;
+
+    var opts = try cli.parse(alloc, args[1..]);
+    defer opts.deinit();
+
+    switch (opts.action) {
+        .help => return printHelp(),
+        .version => return printVersion(),
+        .run => {},
+    }
+
     if (comptime builtin.os.tag == .windows) {
-        var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-        defer _ = gpa.deinit();
-        return @import("apprt/win32/App.zig").run(gpa.allocator());
+        return @import("apprt/win32/App.zig").run(alloc, opts);
     }
     return runVtDemo();
+}
+
+fn printVersion() !void {
+    var buf: [256]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    const out = &stdout.interface;
+    try out.print("{s}\n", .{version_string});
+    try out.flush();
+}
+
+fn printHelp() !void {
+    const help =
+        \\Usage: whostty [options] [-e command [args...]]
+        \\
+        \\Launch the whostty terminal.
+        \\
+        \\Options:
+        \\  -e <command...>    Run <command> instead of the default shell.
+        \\  --<key>=<value>    Set a config option (same keys as the config file,
+        \\                     e.g. --font-size=14 --background=#101010). May also
+        \\                     be written as --<key> <value>.
+        \\  --help, -h         Show this help.
+        \\  --version, -V      Show the version.
+        \\
+        \\Config file: %APPDATA%\whostty\config
+        \\
+    ;
+    var buf: [1024]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    const out = &stdout.interface;
+    try out.writeAll(help);
+    try out.flush();
 }
 
 /// Non-Windows host: prove the libghostty-vt wiring by feeding bytes and
@@ -56,6 +109,7 @@ test {
     _ = @import("apprt/win32/keymap.zig");
     _ = @import("os/windows.zig");
     _ = @import("mouse.zig");
+    _ = @import("cli.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 

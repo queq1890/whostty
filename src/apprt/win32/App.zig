@@ -27,6 +27,7 @@ const scroll = @import("../../scroll.zig");
 const binding = @import("../../input/Binding.zig");
 const keymap = @import("keymap.zig");
 const mouse = @import("../../mouse.zig");
+const cli = @import("../../cli.zig");
 
 const log = std.log.scoped(.app);
 
@@ -96,8 +97,12 @@ fn resolveColor(c: vt.Style.Color, palette: *const vt.color.Palette, fallback: v
 /// Load the user config from `%APPDATA%\whostty\config`, falling back to
 /// defaults if it is missing or unreadable. font-family discovery is deferred
 /// to #14, so only size/colors take effect today.
-fn loadConfig(alloc: std.mem.Allocator) config.Config {
-    return loadConfigFile(alloc) catch config.Config.init(alloc);
+fn loadConfig(alloc: std.mem.Allocator, override_text: []const u8) config.Config {
+    var cfg = loadConfigFile(alloc) catch config.Config.init(alloc);
+    // CLI `--key value` flags arrive as `key = value` lines applied on top of
+    // the file config (same grammar), so the command line wins.
+    if (override_text.len > 0) cfg.loadString(override_text) catch {};
+    return cfg;
 }
 
 fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
@@ -111,7 +116,7 @@ fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
 }
 
 /// The full slice-0 terminal. Run on the main thread.
-pub fn run(alloc: std.mem.Allocator) !void {
+pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // --- Window + GL context (UI thread) ---
     const win = try alloc.create(Window);
     defer alloc.destroy(win);
@@ -123,7 +128,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer renderer.deinit();
 
     // --- Config (colors, font size, palette overrides) ---
-    var cfg = loadConfig(alloc);
+    var cfg = loadConfig(alloc, opts.config_text);
     defer cfg.deinit();
     const theme: Theme = .fromConfig(&cfg);
 
@@ -163,7 +168,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // --- ConPTY + shell ---
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
-    var child = try pty.spawn(alloc, shellCommandLine());
+    var child = try pty.spawn(alloc, opts.command orelse shellCommandLine());
     const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
 
     // --- Reader thread: pty -> libghostty-vt ---
