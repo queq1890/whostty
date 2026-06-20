@@ -165,6 +165,16 @@ pub const Config = struct {
     /// do. Ported from ghostty's `bold-is-bright`.
     bold_is_bright: bool = false,
 
+    /// Minimum WCAG contrast ratio between a glyph and its background. When the
+    /// resolved foreground falls below this against its cell background, the
+    /// glyph is forced to black or white (whichever contrasts more). `1` (the
+    /// default) disables the adjustment. Clamped to ghostty's 1..21 range.
+    minimum_contrast: f32 = 1,
+
+    /// Opacity applied to faint/dim (SGR 2) text. Ported from ghostty's
+    /// `faint-opacity`; clamped to 0..1.
+    faint_opacity: f32 = 0.5,
+
     /// Maximum scrollback retained, in bytes (ghostty's `scrollback-limit`).
     /// Defaults to 10 MB. The VT core (libghostty-vt) enforces the limit.
     scrollback_limit: usize = 10_000_000,
@@ -255,6 +265,10 @@ pub const Config = struct {
             self.selection_foreground = try Color.parse(value);
         } else if (std.mem.eql(u8, key, "bold-is-bright")) {
             self.bold_is_bright = try parseBool(value);
+        } else if (std.mem.eql(u8, key, "minimum-contrast")) {
+            self.minimum_contrast = std.math.clamp(try std.fmt.parseFloat(f32, value), 1, 21);
+        } else if (std.mem.eql(u8, key, "faint-opacity")) {
+            self.faint_opacity = std.math.clamp(try std.fmt.parseFloat(f32, value), 0, 1);
         } else if (std.mem.eql(u8, key, "scrollback-limit")) {
             self.scrollback_limit = try std.fmt.parseInt(usize, value, 10);
         } else {
@@ -403,6 +417,35 @@ test "config: cursor-text and cursor-opacity parse; opacity clamps to 0..1" {
     defer def.deinit();
     try testing.expectApproxEqAbs(@as(f32, 1.0), def.cursor_opacity, 0.0001);
     try testing.expect(def.cursor_text == null);
+}
+
+test "config: minimum-contrast and faint-opacity parse and clamp" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\minimum-contrast = 4.5
+        \\faint-opacity = 0.3
+    );
+    defer cfg.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 4.5), cfg.minimum_contrast, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), cfg.faint_opacity, 0.0001);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+
+    // minimum-contrast clamps to 1..21, faint-opacity to 0..1.
+    var lo = try Config.parse(testing.allocator, "minimum-contrast = 0.2\n");
+    defer lo.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), lo.minimum_contrast, 0.0001);
+    var hi = try Config.parse(testing.allocator, "minimum-contrast = 99\n");
+    defer hi.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 21.0), hi.minimum_contrast, 0.0001);
+    var fo = try Config.parse(testing.allocator, "faint-opacity = 2\n");
+    defer fo.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), fo.faint_opacity, 0.0001);
+
+    // Defaults.
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), def.minimum_contrast, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), def.faint_opacity, 0.0001);
 }
 
 test "config: scrollback-limit parses; default otherwise" {

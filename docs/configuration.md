@@ -33,6 +33,8 @@ which layer consumes it.
 | `selection-background` | color | (derived) | |
 | `selection-foreground` | color | (derived) | |
 | `bold-is-bright` | bool | `false` | Render bold text with the bright palette colors. |
+| `minimum-contrast` | number `1`–`21` | `1` | Min WCAG contrast of a glyph vs. its background; `1` disables. Forces black/white below the ratio (#70). |
+| `faint-opacity` | number `0`–`1` | `0.5` | Opacity of faint/dim (SGR 2) text (#70). |
 | `renderer` | `opengl` \| `direct3d` | `opengl` | `direct3d` is reserved (#15); falls back to OpenGL today. |
 | `palette` | `<index>=<color>` | (VT defaults) | Repeatable; overrides one of the 256 palette entries. |
 | `font-feature` | `<feature>` | (none) | Repeatable; see below. |

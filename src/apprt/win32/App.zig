@@ -16,6 +16,7 @@ const Termio = @import("../../termio.zig").Termio;
 const Window = @import("Window.zig").Window;
 const gl = @import("../../renderer/OpenGL.zig");
 const rcursor = @import("../../renderer/cursor.zig");
+const rcolor = @import("../../renderer/color.zig");
 const input = @import("../../input.zig");
 const surface = @import("../../Surface.zig");
 const Atlas = @import("../../font/Atlas.zig");
@@ -53,6 +54,10 @@ const Theme = struct {
     /// cell's fg becomes the selection bg and vice versa) when unconfigured.
     sel_bg: [3]f32,
     sel_fg: [3]f32,
+    /// Minimum WCAG contrast for glyphs vs. their background (1 = disabled).
+    min_contrast: f32,
+    /// Opacity applied to faint/dim (SGR 2) glyphs.
+    faint_opacity: f32,
 
     fn fromConfig(cfg: *const config.Config) Theme {
         var palette: vt.color.Palette = vt.color.default;
@@ -67,6 +72,8 @@ const Theme = struct {
             .palette = palette,
             .sel_bg = rgbf(if (cfg.selection_background) |c| toVtRgb(c) else fg),
             .sel_fg = rgbf(if (cfg.selection_foreground) |c| toVtRgb(c) else bg),
+            .min_contrast = cfg.minimum_contrast,
+            .faint_opacity = cfg.faint_opacity,
         };
     }
 };
@@ -548,6 +555,21 @@ fn buildQuads(
                 bg = old_fg;
             }
 
+            // Minimum-contrast: lift the foreground to black/white if it falls
+            // below the configured ratio against its (resolved) background. A
+            // ratio of 1 is a no-op. The decorations below intentionally reuse
+            // this adjusted `fg`: in ghostty they are sprite glyphs drawn through
+            // the same cell-text pipeline that applies `contrasted_color`, so a
+            // strikethrough matches the (possibly re-colored) text rather than
+            // diverging from it. Applied before the selection override, whose
+            // fg/bg are configured directly. ghostty also exempts graphics
+            // glyphs (box-drawing / blocks / Powerline) via `noMinContrast`;
+            // whostty's atlas is ASCII-only today (none of those codepoints), so
+            // that exemption is deferred with the sprite work (#66/#71).
+            if (theme.min_contrast > 1) {
+                fg = rcolor.contrastedColor(fg, bg orelse rgbf(theme.bg), theme.min_contrast);
+            }
+
             // Selection highlight overrides the cell colors (reverse-video by
             // default). Per-cell containment is fine for whostty's already
             // per-cell loop; only queried when a selection exists.
@@ -575,11 +597,13 @@ fn buildQuads(
                 .b = c[2],
             } });
 
-            // Foreground glyph (invisible attribute suppresses it).
+            // Foreground glyph (invisible attribute suppresses it). Faint/dim
+            // (SGR 2) text is drawn at reduced opacity via the per-quad alpha.
             if (!style.flags.invisible) {
                 const cp = cell.codepoint();
                 if (cp >= first_glyph and cp <= last_glyph) {
                     if (glyphs[cp - first_glyph]) |gi| {
+                        const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
                         try quads.append(alloc, .{ .glyph = .{
                             .px = cell_x + gi.bearing_x,
                             .py = cell_y + ascent_i - gi.bearing_y,
@@ -590,6 +614,7 @@ fn buildQuads(
                             .r = fg[0],
                             .g = fg[1],
                             .b = fg[2],
+                            .a = glyph_alpha,
                         } });
                     }
                 }
