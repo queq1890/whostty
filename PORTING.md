@@ -70,9 +70,44 @@ The `Tests` column below tracks this per layer.
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
 
-## Explicitly excluded (for now)
+## Completeness invariant
 
-These ghostty paths are out of scope and intentionally not mirrored yet:
-`cli/` (full CLI arg parsing — only the config line format is ported, see the
-Config row), `inspector/`, `crash/`, `benchmark/`, `synthetic/`,
-`shell-integration/`, `terminfo/`, plus the macOS/GTK-specific apprt layers.
+The goal is **full parity** (see CONTEXT.md): every ghostty `src/` path not
+delegated to libghostty-vt is eventually ported. This table is therefore the
+**completeness ledger** — it must enumerate the *whole* in-scope ghostty `src/`
+tree, not only the rows ported so far. Completeness is checkable mechanically:
+
+    ghostty v1.3.1 src/ tree − (delegated ∪ rows in this file) = unfiled gap
+
+An item counts as "filed" only when it is a not-done row **with a linked issue**.
+The rows above cover slice-0 + early flesh-out; the areas below are the known
+**deferred** remainder and still need ledger rows + issues. (The full row-by-row
+enumeration against the v1.3.1 tree is itself tracked work — #59.)
+
+## Deferred (tracked, not excluded)
+
+Previously listed as "excluded (for now)". Under the full-parity goal these are
+**not** out of scope — they are deferred and filed. Rough sequencing by
+daily-driver criticality (tracked under the roadmap epic #47):
+
+- **Tier 0 — host-gate** (#48): secure a Windows dev host + code-signing so
+  unsigned builds can launch; unblocks render proof (#46), on-device
+  verification, and every native backend (#43). Single root dependency; signing
+  is reused for distribution.
+- **Tier 1 — usable terminal**: app-side wiring on top of the delegated VT cores
+  — clipboard/copy (#50), text selection hit-test + render (#51), and
+  `surface_mouse.zig` pointer/mouse routing (#52). The VT-level selection /
+  mouse / paste / OSC 8 *encoding* is delegated to libghostty-vt; only the wiring
+  is whostty's.
+- **Tier 2 — quality / parity**: the native backends still pending a Windows host
+  (Harfbuzz, DirectWrite COM, Direct3D 11, multi-surface runtime, scrollbar
+  drawing — see the rows above and #43), and the **full `config/` system** (#49):
+  the Config row ports the file format + options, but ghostty's `config/`
+  (formatter, conditional, theme, ~14.5K LOC) and themes are not yet ported.
+- **Tier 3 — ecosystem**: `cli/` full arg parsing/actions (#53), `terminfo/`
+  (#54), `shell-integration/` (#55), `inspector/` (#56), `crash/` (#57), and
+  packaging/installer/auto-update (#58, shares signing with the host-gate).
+
+Permanently out of scope (tooling, not the GUI terminal, so excluded from the
+completeness invariant): `benchmark/`, `synthetic/`, `build/`, the alternate
+`main_*.zig` targets (wasm/bench/c/gen), and the macOS/GTK-specific apprt layers.
