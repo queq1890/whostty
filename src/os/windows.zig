@@ -37,6 +37,12 @@ pub const HPCON = HANDLE;
 /// dwCreationFlags: use lpStartupInfo as a STARTUPINFOEXW.
 pub const EXTENDED_STARTUPINFO_PRESENT: DWORD = 0x00080000;
 
+/// STARTUPINFO.dwFlags: honor the hStdInput/hStdOutput/hStdError fields. With a
+/// pseudoconsole, these are left null and the ConPTY supplies the child's std
+/// handles — but the flag must be set (and bInheritHandles TRUE) for the child
+/// to pick up the pseudoconsole instead of the parent's console/handles.
+pub const STARTF_USESTDHANDLES: DWORD = 0x00000100;
+
 /// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute id.
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
 

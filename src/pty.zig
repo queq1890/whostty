@@ -173,6 +173,11 @@ const WindowsPty = struct {
 
         var si: w.STARTUPINFOEXW = std.mem.zeroes(w.STARTUPINFOEXW);
         si.StartupInfo.cb = @sizeOf(w.STARTUPINFOEXW);
+        // STARTF_USESTDHANDLES with NULL std handles: the pseudoconsole attribute
+        // then supplies the child's stdin/stdout/stderr (matching ghostty's
+        // Command.zig). Without this the child keeps the parent's console/handles
+        // and its output bypasses the ConPTY.
+        si.StartupInfo.dwFlags = w.STARTF_USESTDHANDLES;
         si.lpAttributeList = attr_list;
 
         // CreateProcessW may mutate the command line buffer, so it must be a
@@ -187,7 +192,7 @@ const WindowsPty = struct {
             cmd_w.ptr,
             null,
             null,
-            w.FALSE, // pty ends are passed via the attribute list, not inherited
+            w.TRUE, // required for the child to pick up the pseudoconsole handles
             w.EXTENDED_STARTUPINFO_PRESENT,
             null,
             null,
