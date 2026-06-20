@@ -310,7 +310,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                 };
                 if (handleKeybind(k, ctx)) continue;
                 io.scrollToBottom();
-                writeKey(&pty, k.vk);
+                writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), io.keyEncodeOptions());
             },
             .scroll => |raw| {
                 const delta = wheel.feed(raw);
@@ -393,11 +393,11 @@ fn writeChar(pty: *Pty, cp: u21) void {
     _ = pty.write(buf[0..n]) catch {};
 }
 
-fn writeKey(pty: *Pty, code: u32) void {
+fn writeKey(pty: *Pty, code: u32, key_mods: input.Mods, opts: input.Options) void {
     const key = input.keyFromVk(code);
     if (key == .unidentified) return; // printable keys arrive via WM_CHAR
-    var buf: [16]u8 = undefined;
-    const out = input.encode(&buf, .{ .key = key }, .{}) catch return;
+    var buf: [32]u8 = undefined;
+    const out = input.encode(&buf, .{ .key = key, .mods = key_mods }, opts) catch return;
     if (out.len > 0) _ = pty.write(out) catch {};
 }
 

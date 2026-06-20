@@ -7,6 +7,7 @@
 //! message pump that surfaces input/resize/close events. See PORTING.md.
 const std = @import("std");
 const w = @import("../../os/windows.zig");
+const input = @import("../../input.zig");
 
 const log = std.log.scoped(.window);
 
@@ -298,6 +299,19 @@ pub const Window = struct {
             w.WM_KEYDOWN => {
                 if (self) |s| s.push(.{ .key = .{ .vk = @truncate(wparam), .mods = currentMods() } });
                 return 0;
+            },
+            w.WM_SYSKEYDOWN => {
+                // Alt is held, so Windows routes the key here instead of
+                // WM_KEYDOWN and would otherwise consume it (menu/beep). Forward
+                // the nav/arrow/function keys we encode to the shell; leave
+                // Alt+F4 (close), Alt+Space (system menu), Alt+letter, etc. to
+                // Windows' default handling.
+                const vk: u32 = @truncate(wparam);
+                if (self) |s| if (input.altSpecialToShell(vk)) {
+                    s.push(.{ .key = .{ .vk = vk, .mods = currentMods() } });
+                    return 0;
+                };
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
             },
             w.WM_MOUSEWHEEL => {
                 if (self) |s| {

@@ -241,6 +241,8 @@ pub const WM_SETFOCUS: UINT = 0x0007;
 pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_CHAR: UINT = 0x0102;
+/// Posted instead of WM_KEYDOWN when a key is pressed while ALT is held.
+pub const WM_SYSKEYDOWN: UINT = 0x0104;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_CREATE: UINT = 0x0001;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
