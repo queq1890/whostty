@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
+const w = @import("os/windows.zig");
 
 const version_string = "whostty 0.0.0 (ghostty v1.3.1, libghostty-vt)";
 
@@ -27,8 +28,8 @@ pub fn main() !void {
     defer opts.deinit();
 
     switch (opts.action) {
-        .help => return printHelp(),
-        .version => return printVersion(),
+        .help => return cliPrint(help_text),
+        .version => return cliPrint(version_string ++ "\n"),
         .run => {},
     }
 
@@ -38,36 +39,39 @@ pub fn main() !void {
     return runVtDemo();
 }
 
-fn printVersion() !void {
-    var buf: [256]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    const out = &stdout.interface;
-    try out.print("{s}\n", .{version_string});
-    try out.flush();
-}
+const help_text =
+    \\Usage: whostty [options] [-e command [args...]]
+    \\
+    \\Launch the whostty terminal.
+    \\
+    \\Options:
+    \\  -e <command...>    Run <command> instead of the default shell.
+    \\  --<key>=<value>    Set a config option (same keys as the config file,
+    \\                     e.g. --font-size=14 --background=#101010). May also
+    \\                     be written as --<key> <value>.
+    \\  --help, -h         Show this help.
+    \\  --version, -V      Show the version.
+    \\
+    \\Config file: %APPDATA%\whostty\config
+    \\
+;
 
-fn printHelp() !void {
-    const help =
-        \\Usage: whostty [options] [-e command [args...]]
-        \\
-        \\Launch the whostty terminal.
-        \\
-        \\Options:
-        \\  -e <command...>    Run <command> instead of the default shell.
-        \\  --<key>=<value>    Set a config option (same keys as the config file,
-        \\                     e.g. --font-size=14 --background=#101010). May also
-        \\                     be written as --<key> <value>.
-        \\  --help, -h         Show this help.
-        \\  --version, -V      Show the version.
-        \\
-        \\Config file: %APPDATA%\whostty\config
-        \\
-    ;
-    var buf: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    const out = &stdout.interface;
-    try out.writeAll(help);
-    try out.flush();
+/// Print CLI output. whostty is a GUI-subsystem app on Windows (so the spawned
+/// shell can't grab its console), which means it has no console of its own; we
+/// attach to the launching shell's console and write there. Elsewhere, normal
+/// stdout.
+fn cliPrint(bytes: []const u8) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = w.AttachConsole(w.ATTACH_PARENT_PROCESS);
+        const h = w.GetStdHandle(w.STD_OUTPUT_HANDLE);
+        var written: w.DWORD = 0;
+        _ = w.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null);
+    } else {
+        var buf: [128]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        stdout.interface.writeAll(bytes) catch {};
+        stdout.interface.flush() catch {};
+    }
 }
 
 /// Non-Windows host: prove the libghostty-vt wiring by feeding bytes and
