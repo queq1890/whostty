@@ -26,6 +26,7 @@ const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
 const binding = @import("../../input/Binding.zig");
 const keymap = @import("keymap.zig");
+const mouse = @import("../../mouse.zig");
 
 const log = std.log.scoped(.app);
 
@@ -239,9 +240,20 @@ pub fn run(alloc: std.mem.Allocator) !void {
                 const delta = wheel.feed(raw);
                 if (delta != 0) io.scrollViewport(delta);
             },
-            .mouse_down => |m| sfc.mouseDown(m.x, m.y),
+            .mouse_button => |m| {
+                const btn: mouse.Button = switch (m.button) {
+                    .left => .left,
+                    .middle => .middle,
+                    .right => .right,
+                };
+                sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
+                    .shift = m.mods.shift,
+                    .alt = m.mods.alt,
+                    .ctrl = m.mods.ctrl,
+                });
+            },
             .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
-            .mouse_up => |_| sfc.mouseUp(),
+            .mouse_capture_lost => sfc.endDrag(),
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
             .close => closed = true,
         };

@@ -55,6 +55,7 @@ test {
     _ = @import("input/Binding.zig");
     _ = @import("apprt/win32/keymap.zig");
     _ = @import("os/windows.zig");
+    _ = @import("mouse.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
 }
 

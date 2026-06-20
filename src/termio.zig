@@ -7,6 +7,7 @@
 //! See PORTING.md.
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const mouse = @import("mouse.zig");
 
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
@@ -148,6 +149,26 @@ pub const Termio = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.terminal.screens.active.clearSelection();
+    }
+
+    /// Encode a mouse event as a VT report into `buf` if the terminal currently
+    /// requests mouse tracking, else null. Reads the mode/format under the lock.
+    /// The MouseEvents/MouseFormat enums share integer values with mouse.zig's.
+    pub fn encodeMouseReport(
+        self: *Termio,
+        buf: []u8,
+        col: u16,
+        row: u16,
+        button: mouse.Button,
+        action: mouse.Action,
+        mods: mouse.Mods,
+    ) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ev: mouse.Event = @enumFromInt(@intFromEnum(self.terminal.flags.mouse_event));
+        if (ev == .none) return null;
+        const fmt: mouse.Format = @enumFromInt(@intFromEnum(self.terminal.flags.mouse_format));
+        return mouse.encode(buf, ev, fmt, button, action, mods, col, row);
     }
 
     /// The current selection as UTF-8 (NUL-terminated), or null if none. Caller

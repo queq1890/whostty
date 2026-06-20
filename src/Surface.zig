@@ -8,6 +8,7 @@
 const std = @import("std");
 const Pty = @import("pty.zig").Pty;
 const Termio = @import("termio.zig").Termio;
+const mouse = @import("mouse.zig");
 
 pub const GridSize = struct { cols: u16, rows: u16 };
 
@@ -63,25 +64,49 @@ pub const Surface = struct {
         try self.termio.resize(g.cols, g.rows);
     }
 
-    /// Left button pressed: anchor a new selection at the clicked cell.
-    pub fn mouseDown(self: *Surface, px_x: i32, px_y: i32) void {
+    /// A mouse button was pressed/released. When an application has enabled
+    /// mouse tracking the event is encoded and written to the pty (unless Shift
+    /// is held, which forces local selection like xterm); otherwise the left
+    /// button drives text selection.
+    pub fn mouseButton(self: *Surface, button: mouse.Button, action: mouse.Action, px_x: i32, px_y: i32, mods: mouse.Mods) void {
         const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
-        self.termio.selectStart(cell.x, cell.y);
-        self.mouse_left_down = true;
+
+        if (!mods.shift) {
+            var buf: [32]u8 = undefined;
+            if (self.termio.encodeMouseReport(&buf, cell.x, cell.y, button, action, mods)) |bytes| {
+                _ = self.pty.write(bytes) catch {};
+                return;
+            }
+        }
+
+        if (button == .left) switch (action) {
+            .press => {
+                self.termio.selectStart(cell.x, cell.y);
+                self.mouse_left_down = true;
+            },
+            .release => {
+                self.mouse_left_down = false;
+                self.termio.selectEnd();
+            },
+            .motion => {},
+        };
     }
 
     /// Mouse moved during a left-drag: extend the selection to the current cell.
+    /// (Motion mouse-reporting for button/any modes is a follow-up.)
     pub fn mouseDrag(self: *Surface, px_x: i32, px_y: i32) void {
         if (!self.mouse_left_down) return;
         const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
         self.termio.selectExtend(cell.x, cell.y);
     }
 
-    /// Left button released (or capture lost): end the drag. The selection stays
-    /// set; the anchor pin is released inside Termio.
-    pub fn mouseUp(self: *Surface) void {
-        self.mouse_left_down = false;
-        self.termio.selectEnd();
+    /// End an in-progress selection drag (button release already handled, or
+    /// capture was lost). Releases the anchor; keeps the selection.
+    pub fn endDrag(self: *Surface) void {
+        if (self.mouse_left_down) {
+            self.mouse_left_down = false;
+            self.termio.selectEnd();
+        }
     }
 
     /// The current selection as UTF-8, or null if nothing is selected. Caller

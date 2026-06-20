@@ -29,12 +29,20 @@ pub const Event = union(enum) {
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
     /// WHEEL_DELTA), positive when rolled away from the user.
     scroll: i32,
-    /// Left mouse button pressed at client pixel (x, y).
-    mouse_down: struct { x: i32, y: i32 },
-    /// Left mouse button released at client pixel (x, y).
-    mouse_up: struct { x: i32, y: i32 },
+    /// A mouse button was pressed (down = true) or released at client pixel
+    /// (x, y), with the modifiers held.
+    mouse_button: struct {
+        button: enum { left, middle, right },
+        down: bool,
+        x: i32,
+        y: i32,
+        mods: Mods,
+    },
     /// Mouse moved to client pixel (x, y).
     mouse_move: struct { x: i32, y: i32 },
+    /// Mouse capture was lost (e.g. alt-tab mid-drag) — end any local drag
+    /// without synthesizing a reportable button event.
+    mouse_capture_lost,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
     /// The user requested the window close.
@@ -291,10 +299,10 @@ pub const Window = struct {
             w.WM_LBUTTONDOWN => {
                 if (self) |s| {
                     const p = mouseXY(lparam);
-                    // Capture so a drag that leaves the window still delivers
-                    // moves/up to this window.
+                    // Capture so a left-drag that leaves the window still
+                    // delivers moves/up to this window.
                     _ = w.SetCapture(hwnd);
-                    s.push(.{ .mouse_down = .{ .x = p.x, .y = p.y } });
+                    s.push(.{ .mouse_button = .{ .button = .left, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
                 }
                 return 0;
             },
@@ -302,15 +310,43 @@ pub const Window = struct {
                 if (self) |s| {
                     const p = mouseXY(lparam);
                     _ = w.ReleaseCapture();
-                    s.push(.{ .mouse_up = .{ .x = p.x, .y = p.y } });
+                    s.push(.{ .mouse_button = .{ .button = .left, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_RBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .right, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_RBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .right, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_MBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .middle, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_MBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .middle, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
                 }
                 return 0;
             },
             w.WM_CAPTURECHANGED => {
                 // Capture was revoked without an LBUTTONUP (alt-tab / modal /
-                // Win+L mid-drag). Synthesize a release so the surface ends the
-                // drag and frees its anchor pin rather than wedging.
-                if (self) |s| s.push(.{ .mouse_up = .{ .x = 0, .y = 0 } });
+                // Win+L mid-drag). End the drag (free the anchor pin) without
+                // emitting a reportable button event.
+                if (self) |s| s.push(.mouse_capture_lost);
                 return 0;
             },
             w.WM_MOUSEMOVE => {
