@@ -76,12 +76,43 @@ pub const Face = struct {
         return self.inner.getCharIndex(codepoint);
     }
 
-    /// Rasterize a single Unicode codepoint to an 8-bit alpha bitmap.
-    pub fn rasterize(self: Face, alloc: std.mem.Allocator, codepoint: u32) !Glyph {
+    /// Synthetic styling applied to a rasterized glyph when a dedicated styled
+    /// face isn't available — whostty loads a single face, so bold/italic are
+    /// synthesized by transforming the regular outline (matching ghostty's
+    /// fallback). Per-style families (`font-family-bold` etc.) are deferred.
+    pub const Style = struct {
+        bold: bool = false,
+        italic: bool = false,
+    };
+
+    /// Rasterize a single Unicode codepoint to an 8-bit alpha bitmap, optionally
+    /// synthesizing bold (embolden the outline) and/or italic (shear the
+    /// outline) before rendering.
+    pub fn rasterize(self: Face, alloc: std.mem.Allocator, codepoint: u32, style: Style) !Glyph {
         const idx = self.inner.getCharIndex(codepoint) orelse 0;
-        try self.inner.loadGlyph(idx, .{ .render = true });
+        // Load the outline WITHOUT rendering so synthetic styling can transform
+        // it; then render. (`render = true` would rasterize the plain glyph.)
+        try self.inner.loadGlyph(idx, .{});
 
         const slot = self.inner.handle.*.glyph;
+        // Only outline glyphs can be transformed; bitmap (color/emoji) faces are
+        // rendered as-is. Apply italic shear before embolden so the slant uses
+        // the original stroke weight.
+        if ((style.italic or style.bold) and slot.*.format == c.FT_GLYPH_FORMAT_OUTLINE) {
+            if (style.italic) {
+                // 16.16 shear matrix: x' = x + 0.2*y -> ~11.3° rightward slant.
+                var m: c.FT_Matrix = .{ .xx = 0x10000, .xy = 0x3333, .yx = 0, .yy = 0x10000 };
+                c.FT_Outline_Transform(&slot.*.outline, &m);
+            }
+            if (style.bold) {
+                // Embolden ~ px/24 px (26.6 units); proportional so it reads at
+                // any size. Ignore the error: failure leaves the regular outline.
+                const strength: c.FT_Pos = @divTrunc(@as(c.FT_Pos, @intCast(self.px)) * 64, 24);
+                _ = c.FT_Outline_Embolden(&slot.*.outline, strength);
+            }
+        }
+        try self.inner.renderGlyph(.normal);
+
         const bm = slot.*.bitmap;
         const width: u32 = bm.width;
         const height: u32 = bm.rows;
@@ -133,7 +164,7 @@ test "font: rasterize an ASCII glyph to a non-empty bitmap" {
     try std.testing.expect(m.cell_width > 0);
     try std.testing.expect(m.cell_height > 0);
 
-    var g = try face.rasterize(std.testing.allocator, 'A');
+    var g = try face.rasterize(std.testing.allocator, 'A', .{});
     defer g.deinit(std.testing.allocator);
 
     try std.testing.expect(g.width > 0 and g.height > 0);
@@ -161,10 +192,41 @@ test "font: space glyph has zero-area bitmap but positive advance" {
     // Regression: a space has an empty bitmap whose `buffer` is null.
     // rasterize must not @ptrCast that null pointer (which panics in safe
     // builds); it returns a zero-area glyph with no pixels.
-    var g = try face.rasterize(std.testing.allocator, ' ');
+    var g = try face.rasterize(std.testing.allocator, ' ', .{});
     defer g.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0), g.width);
     try std.testing.expectEqual(@as(u32, 0), g.height);
     try std.testing.expectEqual(@as(usize, 0), g.pixels.len);
     try std.testing.expect(g.advance > 0);
+}
+
+fn inkSum(g: Glyph) u64 {
+    var s: u64 = 0;
+    for (g.pixels) |p| s += p;
+    return s;
+}
+
+test "font: synthetic bold adds ink; italic shears the glyph" {
+    const path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+    std.fs.accessAbsolute(path, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+    var face = try Face.init(lib, path, 32);
+    defer face.deinit();
+
+    var reg = try face.rasterize(alloc, 'H', .{});
+    defer reg.deinit(alloc);
+    var bold = try face.rasterize(alloc, 'H', .{ .bold = true });
+    defer bold.deinit(alloc);
+    var ital = try face.rasterize(alloc, 'H', .{ .italic = true });
+    defer ital.deinit(alloc);
+
+    // Embolden thickens strokes -> strictly more total coverage than regular.
+    try std.testing.expect(inkSum(bold) > inkSum(reg));
+    // Shearing leans the glyph: it widens it (top shifts right of the bottom).
+    try std.testing.expect(ital.width > reg.width);
+    // All three still produce a real (non-empty) bitmap.
+    try std.testing.expect(reg.width > 0 and bold.width > 0 and ital.width > 0);
 }

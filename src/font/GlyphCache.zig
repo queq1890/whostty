@@ -17,16 +17,24 @@ const font = @import("main.zig");
 const GlyphCache = @This();
 const log = std.log.scoped(.font);
 
+/// Cache key: a codepoint plus its synthetic style. The same codepoint in
+/// regular / bold / italic / bold-italic packs four distinct atlas entries.
+pub const Key = struct {
+    cp: u21,
+    bold: bool = false,
+    italic: bool = false,
+};
+
 alloc: std.mem.Allocator,
 lib: font.Library,
 /// null when the configured face could not be opened (missing font / bring-up):
 /// every lookup then misses and the renderer draws blank glyphs, as before.
 face: ?font.Face,
 atlas: Atlas,
-/// codepoint -> placement, or a cached null meaning "draw nothing" (a blank
-/// glyph such as space, a codepoint the face lacks, or the atlas being full) so
-/// we don't re-attempt it every frame.
-map: std.AutoHashMapUnmanaged(u21, ?Atlas.Placement),
+/// (codepoint, style) -> placement, or a cached null meaning "draw nothing" (a
+/// blank glyph such as space, a codepoint the face lacks, or the atlas being
+/// full) so we don't re-attempt it every frame.
+map: std.AutoHashMapUnmanaged(Key, ?Atlas.Placement),
 cell_w: u32,
 cell_h: u32,
 ascent: u32,
@@ -80,30 +88,32 @@ pub fn deinit(self: *GlyphCache) void {
     self.* = undefined;
 }
 
-/// The atlas placement for `cp`, rasterizing and packing it on first sight.
-/// A null result means "draw no glyph" (blank/space, a missing glyph, or the
-/// atlas being full). Packing a new glyph marks the atlas dirty.
-pub fn get(self: *GlyphCache, cp: u21) ?Atlas.Placement {
-    if (self.map.get(cp)) |cached| return cached;
+/// The atlas placement for `cp` in the given synthetic style, rasterizing and
+/// packing it on first sight. A null result means "draw no glyph" (blank/space,
+/// a missing glyph, or the atlas being full). Packing a new glyph marks the
+/// atlas dirty.
+pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placement {
+    const key: Key = .{ .cp = cp, .bold = bold, .italic = italic };
+    if (self.map.get(key)) |cached| return cached;
     // Secure the map slot BEFORE packing, so a glyph we rasterize can always be
     // cached. Otherwise an out-of-memory `put` would drop the entry and the next
-    // frame would re-rasterize the same codepoint into a *fresh* atlas region —
+    // frame would re-rasterize the same key into a *fresh* atlas region —
     // leaking atlas space and re-uploading every frame. On OOM here we touch
     // neither the atlas nor the map and just draw blank this frame (cheap retry
     // next frame).
     self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
-    const placed = self.rasterizeAndPack(cp);
-    self.map.putAssumeCapacity(cp, placed);
+    const placed = self.rasterizeAndPack(key);
+    self.map.putAssumeCapacity(key, placed);
     if (placed != null) self.dirty = true;
     return placed;
 }
 
-fn rasterizeAndPack(self: *GlyphCache, cp: u21) ?Atlas.Placement {
+fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
     const face = self.face orelse return null;
     // Draw nothing for codepoints the face lacks (blank, not the .notdef box) —
     // per-codepoint fallback to another face is #75.
-    if (face.glyphIndex(cp) == null) return null;
-    var g = face.rasterize(self.alloc, cp) catch return null;
+    if (face.glyphIndex(key.cp) == null) return null;
+    var g = face.rasterize(self.alloc, key.cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
     defer g.deinit(self.alloc);
     // A zero-area bitmap (space, control) has no quad.
     if (g.width == 0 or g.height == 0) return null;
@@ -131,21 +141,44 @@ test "glyphcache: rasterizes ASCII + non-ASCII on demand and caches" {
     try std.testing.expect(cache.cell_w > 0 and cache.cell_h > 0);
 
     // ASCII 'A' packs and dirties the atlas.
-    const a = cache.get('A') orelse return error.NoGlyph;
+    const a = cache.get('A', false, false) orelse return error.NoGlyph;
     try std.testing.expect(a.region.width > 0 and a.region.height > 0);
     try std.testing.expect(cache.takeDirty()); // was dirtied
     try std.testing.expect(!cache.takeDirty()); // and cleared
 
     // Same codepoint returns the cached placement without re-dirtying.
-    const a2 = cache.get('A') orelse return error.NoGlyph;
+    const a2 = cache.get('A', false, false) orelse return error.NoGlyph;
     try std.testing.expectEqual(a.region.x, a2.region.x);
     try std.testing.expect(!cache.takeDirty());
 
     // Non-ASCII the face supports: U+2500 BOX DRAWINGS LIGHT HORIZONTAL and
     // U+00E9 LATIN SMALL LETTER E WITH ACUTE both rasterize (the whole point).
-    try std.testing.expect(cache.get(0x2500) != null);
-    try std.testing.expect(cache.get(0x00E9) != null);
+    try std.testing.expect(cache.get(0x2500, false, false) != null);
+    try std.testing.expect(cache.get(0x00E9, false, false) != null);
     try std.testing.expect(cache.takeDirty());
+}
+
+test "glyphcache: regular/bold/italic are distinct, cached entries" {
+    std.fs.accessAbsolute(test_font, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, test_font, 32, 512);
+    defer cache.deinit();
+
+    const reg = cache.get('H', false, false) orelse return error.NoGlyph;
+    const bold = cache.get('H', true, false) orelse return error.NoGlyph;
+    const ital = cache.get('H', false, true) orelse return error.NoGlyph;
+
+    // Each style packs its own atlas region, so the cache keys them apart.
+    try std.testing.expect(bold.region.x != reg.region.x or bold.region.y != reg.region.y);
+    try std.testing.expect(ital.region.x != reg.region.x or ital.region.y != reg.region.y);
+    try std.testing.expect(bold.region.x != ital.region.x or bold.region.y != ital.region.y);
+
+    // A repeat styled lookup hits the cache (same region, no re-pack/dirty).
+    _ = cache.takeDirty();
+    const bold2 = cache.get('H', true, false) orelse return error.NoGlyph;
+    try std.testing.expectEqual(bold.region.x, bold2.region.x);
+    try std.testing.expectEqual(bold.region.y, bold2.region.y);
+    try std.testing.expect(!cache.takeDirty());
 }
 
 test "glyphcache: blank glyphs and atlas-full cache a null without crashing" {
@@ -155,10 +188,10 @@ test "glyphcache: blank glyphs and atlas-full cache a null without crashing" {
     defer cache.deinit();
 
     // A space has a zero-area bitmap -> null, cached, no dirty.
-    try std.testing.expect(cache.get(' ') == null);
+    try std.testing.expect(cache.get(' ', false, false) == null);
     try std.testing.expect(!cache.takeDirty());
     // Cached: still null on the second call.
-    try std.testing.expect(cache.get(' ') == null);
+    try std.testing.expect(cache.get(' ', false, false) == null);
 }
 
 test "glyphcache: a missing face is not fatal; every lookup misses" {
@@ -166,7 +199,7 @@ test "glyphcache: a missing face is not fatal; every lookup misses" {
     var cache = try GlyphCache.init(alloc, "Z:\\does\\not\\exist.ttf", 16, 64);
     defer cache.deinit();
     try std.testing.expect(cache.face == null);
-    try std.testing.expect(cache.get('A') == null);
+    try std.testing.expect(cache.get('A', false, false) == null);
     try std.testing.expect(!cache.takeDirty());
     // Default metrics are still positive so the grid math is well-defined.
     try std.testing.expect(cache.cell_w > 0 and cache.cell_h > 0);
@@ -178,6 +211,6 @@ test "glyphcache: a codepoint the face lacks draws nothing (no .notdef box)" {
     var cache = try GlyphCache.init(alloc, test_font, 16, 256);
     defer cache.deinit();
     // DejaVuSansMono has no CJK; U+4E00 (一) must render as blank, not a box.
-    try std.testing.expect(cache.get(0x4E00) == null);
+    try std.testing.expect(cache.get(0x4E00, false, false) == null);
     try std.testing.expect(!cache.takeDirty());
 }

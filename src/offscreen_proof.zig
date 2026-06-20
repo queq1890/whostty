@@ -218,7 +218,7 @@ pub fn main() !void {
     var ink_atlas: usize = 0; // total inked atlas texels of the drawn glyphs
 
     for (text, 0..) |ch, i| {
-        var glyph = try face.rasterize(alloc, ch);
+        var glyph = try face.rasterize(alloc, ch, .{});
         defer glyph.deinit(alloc);
         if (glyph.width == 0 or glyph.height == 0) continue;
         for (glyph.pixels) |p| {
@@ -445,8 +445,8 @@ pub fn main() !void {
         var cache = try GlyphCache.init(alloc, font_path, 32, 512);
         defer cache.deinit();
 
-        if (cache.get('A') == null) return error.NoAsciiGlyph;
-        const box = cache.get(0x2500) orelse return error.NoBoxGlyph;
+        if (cache.get('A', false, false) == null) return error.NoAsciiGlyph;
+        const box = cache.get(0x2500, false, false) orelse return error.NoBoxGlyph;
         if (!cache.takeDirty()) return error.CacheNotDirty;
         out.print("[proof] glyphcache: 'A' + U+2500 packed on demand (atlas {d})\n", .{cache.atlas.size});
 
@@ -525,5 +525,59 @@ pub fn main() !void {
             return error.OscBgNotRendered;
         }
         out.print("[proof] PASS: OSC 11 dynamic background reached the clear color (green framebuffer)\n", .{});
+    }
+
+    // --- Synthetic bold proof (#77): bold adds ink through the real path ----
+    // The GlyphCache must synthesize a heavier 'H' from the regular face (no
+    // bold font file), and that extra ink must survive the atlas + shader path
+    // to the framebuffer — proving synthetic styling, not just a cache key.
+    {
+        var cache = try GlyphCache.init(alloc, font_path, 32, 512);
+        defer cache.deinit();
+        const reg = cache.get('H', false, false) orelse return error.NoRegularH;
+        const bold = cache.get('H', true, false) orelse return error.NoBoldH;
+
+        // Upload the atlas once (now holds both the regular and bold 'H').
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
+
+        var counts: [2]usize = .{ 0, 0 };
+        for ([_]Atlas.Placement{ reg, bold }, 0..) |place, pass| {
+            var gv: std.ArrayList(gl.Vertex) = .empty;
+            defer gv.deinit(alloc);
+            try gl.pushQuad(&gv, alloc, .{
+                .px = 10,
+                .py = 10,
+                .sx = place.region.x,
+                .sy = place.region.y,
+                .sw = place.region.width,
+                .sh = place.region.height,
+                .r = 1,
+                .g = 1,
+                .b = 1,
+            }, screen_w, screen_h, cache.atlas.size);
+            g.clearColor(clear[0], clear[1], clear[2], 1.0);
+            g.clear(GL_COLOR_BUFFER_BIT);
+            g.bufferData(GL_ARRAY_BUFFER, @intCast(gv.items.len * @sizeOf(gl.Vertex)), gv.items.ptr, GL_DYNAMIC_DRAW);
+            g.drawArrays(GL_TRIANGLES, 0, @intCast(gv.items.len));
+            g.finish();
+            g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+            var plit: usize = 0;
+            var qq: usize = 0;
+            while (qq < n) : (qq += 1) {
+                const r: i16 = buf[qq * 4];
+                const gg: i16 = buf[qq * 4 + 1];
+                const b: i16 = buf[qq * 4 + 2];
+                if (@abs(r - cr) > 2 or @abs(gg - cg) > 2 or @abs(b - cb) > 2) plit += 1;
+            }
+            counts[pass] = plit;
+        }
+        out.print("[proof] synthetic-bold: regular 'H' lit={d}, bold 'H' lit={d}\n", .{ counts[0], counts[1] });
+        if (counts[0] == 0 or counts[1] <= counts[0]) {
+            out.print("[proof] FAIL: synthetic bold did not add ink over regular\n", .{});
+            return error.BoldNotBolder;
+        }
+        out.print("[proof] PASS: synthetic bold rasterized through the atlas/shader with more ink than regular\n", .{});
     }
 }
