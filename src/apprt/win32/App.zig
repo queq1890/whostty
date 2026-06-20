@@ -336,6 +336,18 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         };
         if (closed) break;
 
+        // Drain VT replies the terminal owes the pty (DSR/DA/DECRQM), generated
+        // on the reader thread as it parses queries. Writing them here keeps
+        // every pty write on this thread, so responses never interleave with
+        // keyboard input mid-sequence. The loop handles a reply set larger than
+        // the buffer; in practice each is well under 256 bytes.
+        var resp_buf: [256]u8 = undefined;
+        while (true) {
+            const n = io.takeResponse(&resp_buf);
+            if (n == 0) break;
+            _ = pty.write(resp_buf[0..n]) catch {};
+        }
+
         const sz = win.clientSize();
         const blink_visible = blk: {
             if (blink_timer) |*t| break :blk (t.read() / blink_interval_ns) % 2 == 0;

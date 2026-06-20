@@ -9,6 +9,124 @@ const std = @import("std");
 const vt = @import("ghostty-vt");
 const mouse = @import("mouse.zig");
 
+/// Module alias for use inside `ResponseHandler`, whose required `vt` method
+/// name shadows the `vt` module import within the struct's scope.
+const gvt = vt;
+
+/// The stream handler. libghostty-vt's `ReadonlyStream` applies every
+/// state-modifying action to the terminal but deliberately drops the queries
+/// that require a reply (DSR / DA / DECRQM / ENQ) — it is meant for replay
+/// tooling that has no pty to answer to. We wrap that readonly handler and add
+/// only the reverse path: replies are appended to `response`, which the app
+/// drains and writes back to the pty. State-modifying actions are delegated to
+/// the inner handler unchanged, so none of that logic is duplicated here.
+///
+/// Reference: ghostty `src/termio/stream_handler.zig`
+/// (`deviceAttributes`/`deviceStatusReport`/`requestMode`). See ADR 0006.
+const ResponseHandler = struct {
+    /// Applies state-modifying actions to the terminal (the upstream handler).
+    inner: gvt.ReadonlyHandler,
+    /// Pending reply bytes owed to the pty; points into the owning `Termio`.
+    response: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+
+    fn init(
+        terminal: *gvt.Terminal,
+        response: *std.ArrayListUnmanaged(u8),
+        alloc: std.mem.Allocator,
+    ) ResponseHandler {
+        return .{
+            .inner = gvt.ReadonlyHandler.init(terminal),
+            .response = response,
+            .alloc = alloc,
+        };
+    }
+
+    pub fn deinit(self: *ResponseHandler) void {
+        self.inner.deinit();
+    }
+
+    /// Stream action dispatch. Query actions that owe a reply are handled here;
+    /// every other action is delegated to the readonly handler unchanged.
+    pub fn vt(
+        self: *ResponseHandler,
+        comptime action: gvt.StreamAction.Tag,
+        value: gvt.StreamAction.Value(action),
+    ) !void {
+        switch (action) {
+            .device_attributes => try self.deviceAttributes(value),
+            .device_status => try self.deviceStatus(value),
+            .request_mode => try self.requestMode(value.mode),
+            .request_mode_unknown => try self.requestModeUnknown(value),
+
+            // ENQ falls through: ghostty's default `enquiry-response` is the
+            // empty string, so replying with nothing (the readonly handler's
+            // no-op) is the faithful default. xtversion / size-report /
+            // kitty-keyboard-query replies belong to later sub-issues (#82).
+            else => try self.inner.vt(action, value),
+        }
+    }
+
+    fn reply(self: *ResponseHandler, bytes: []const u8) !void {
+        try self.response.appendSlice(self.alloc, bytes);
+    }
+
+    /// DA — CSI c / CSI > c. We quack as a VT220 like ghostty, but omit the
+    /// `52` clipboard flag from the primary reply: OSC 52 write-back isn't
+    /// wired yet (#85), and advertising it would invite queries we can't
+    /// answer. The `52` is added when OSC 52 lands.
+    fn deviceAttributes(self: *ResponseHandler, req: gvt.DeviceAttributeReq) !void {
+        switch (req) {
+            // 62 = VT220 (level 2 conformance); 22 = color text.
+            .primary => try self.reply("\x1b[?62;22c"),
+            .secondary => try self.reply("\x1b[>1;10;0c"),
+            else => {}, // tertiary: unimplemented, matching ghostty
+        }
+    }
+
+    /// DSR — CSI 5n / CSI 6n. The cursor-position report honors origin mode,
+    /// reporting cursor coordinates relative to the scrolling region.
+    fn deviceStatus(self: *ResponseHandler, ds: gvt.StreamAction.Value(.device_status)) !void {
+        switch (ds.request) {
+            .operating_status => try self.reply("\x1b[0n"),
+            .cursor_position => {
+                const t = self.inner.terminal;
+                const cur = t.screens.active.cursor;
+                const origin = t.modes.get(.origin);
+                const x = if (origin) cur.x -| t.scrolling_region.left else cur.x;
+                const y = if (origin) cur.y -| t.scrolling_region.top else cur.y;
+                var buf: [32]u8 = undefined;
+                try self.reply(try std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{ y + 1, x + 1 }));
+            },
+            // Light/dark reporting needs an OS appearance signal whostty does
+            // not track yet; deferred with the OSC color work (#83).
+            .color_scheme => {},
+        }
+    }
+
+    /// DECRQM for a mode libghostty-vt recognizes — CSI ? Pd $ p / CSI Pd $ p.
+    /// Reply code 1 = set, 2 = reset. DEC private modes carry the `?` prefix.
+    fn requestMode(self: *ResponseHandler, mode: gvt.Mode) !void {
+        const tag: gvt.modes.ModeTag = @bitCast(@intFromEnum(mode));
+        const code: u8 = if (self.inner.terminal.modes.get(mode)) 1 else 2;
+        var buf: [32]u8 = undefined;
+        try self.reply(try std.fmt.bufPrint(&buf, "\x1b[{s}{d};{d}$y", .{
+            if (tag.ansi) "" else "?",
+            tag.value,
+            code,
+        }));
+    }
+
+    /// DECRQM for an unrecognized mode. Reply code 0 = mode not recognized.
+    fn requestModeUnknown(self: *ResponseHandler, raw: gvt.StreamAction.Value(.request_mode_unknown)) !void {
+        var buf: [32]u8 = undefined;
+        try self.reply(try std.fmt.bufPrint(&buf, "\x1b[{s}{d};0$y", .{
+            if (raw.ansi) "" else "?",
+            raw.mode,
+        }));
+    }
+};
+
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
 pub const Termio = struct {
@@ -18,7 +136,12 @@ pub const Termio = struct {
     const ActiveScreen = @FieldType(@FieldType(vt.Terminal, "screens"), "active");
 
     terminal: vt.Terminal,
-    stream: vt.ReadonlyStream,
+    stream: vt.Stream(ResponseHandler),
+    /// Reply bytes the terminal owes the pty (DSR/DA/DECRQM), filled by the
+    /// handler during `process` and drained by `takeResponse`. Guarded by
+    /// `mutex` since `process` (reader thread) and `takeResponse` (UI thread)
+    /// touch it from different threads.
+    response: std.ArrayListUnmanaged(u8),
     /// Guards `terminal`: the reader thread mutates it via `process`, the
     /// renderer reads it. Lock with `lock`/`unlock` around grid access.
     mutex: std.Thread.Mutex,
@@ -37,6 +160,7 @@ pub const Termio = struct {
 
         self.alloc = alloc;
         self.mutex = .{};
+        self.response = .empty;
         self.sel_anchor = null;
         self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
@@ -46,17 +170,40 @@ pub const Termio = struct {
         });
         errdefer self.terminal.deinit(alloc);
 
-        // The handler holds &self.terminal, which is stable because `self` is
-        // heap-allocated and never moved.
-        self.stream = vt.ReadonlyStream.initAlloc(alloc, .init(&self.terminal));
+        // The handler holds &self.terminal and &self.response, both stable
+        // because `self` is heap-allocated and never moved.
+        self.stream = vt.Stream(ResponseHandler).initAlloc(
+            alloc,
+            ResponseHandler.init(&self.terminal, &self.response, alloc),
+        );
         return self;
     }
 
     pub fn destroy(self: *Termio) void {
         const alloc = self.alloc;
         self.stream.deinit();
+        self.response.deinit(alloc);
         self.terminal.deinit(alloc);
         alloc.destroy(self);
+    }
+
+    /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
+    /// of bytes written; the caller writes them to the pty. If the queue
+    /// exceeds `buf`, the remainder stays queued for the next call (drain in a
+    /// loop). Thread-safe with respect to `process`.
+    pub fn takeResponse(self: *Termio, buf: []u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = @min(buf.len, self.response.items.len);
+        if (n == 0) return 0;
+        @memcpy(buf[0..n], self.response.items[0..n]);
+        if (n == self.response.items.len) {
+            self.response.clearRetainingCapacity();
+        } else {
+            std.mem.copyForwards(u8, self.response.items, self.response.items[n..]);
+            self.response.shrinkRetainingCapacity(self.response.items.len - n);
+        }
+        return n;
     }
 
     /// Feed raw PTY output bytes (text + escape sequences) into the terminal,
@@ -254,4 +401,91 @@ test "termio: resize changes dimensions" {
     try io.resize(40, 10);
     try std.testing.expectEqual(@as(usize, 40), io.terminal.cols);
     try std.testing.expectEqual(@as(usize, 10), io.terminal.rows);
+}
+
+// --- VT response write-back (DSR/DA/DECRQM) -----------------------------------
+
+/// Feed `bytes`, then return the queued reply as a slice of `buf`.
+fn replyTo(io: *Termio, bytes: []const u8, buf: []u8) ![]const u8 {
+    try io.process(bytes);
+    return buf[0..io.takeResponse(buf)];
+}
+
+test "termio: no reply for plain output" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("", try replyTo(io, "hello", &buf));
+}
+
+test "termio: DSR operating status reports OK" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[0n", try replyTo(io, "\x1b[5n", &buf));
+}
+
+test "termio: DSR cursor position report is 1-based row;col" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 5, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    // Move to row 3, col 5 (1-based), then query position.
+    try std.testing.expectEqualStrings("\x1b[3;5R", try replyTo(io, "\x1b[3;5H\x1b[6n", &buf));
+}
+
+test "termio: primary device attributes quack as VT220" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[?62;22c", try replyTo(io, "\x1b[c", &buf));
+}
+
+test "termio: secondary device attributes" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[>1;10;0c", try replyTo(io, "\x1b[>c", &buf));
+}
+
+test "termio: DECRQM reports a known mode's state" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    // Wraparound (DEC private mode 7) is on by default -> set (1).
+    try std.testing.expectEqualStrings("\x1b[?7;1$y", try replyTo(io, "\x1b[?7$p", &buf));
+    // Disable it, then re-query -> reset (2).
+    try std.testing.expectEqualStrings("\x1b[?7;2$y", try replyTo(io, "\x1b[?7l\x1b[?7$p", &buf));
+}
+
+test "termio: DECRQM reports an unknown mode as not recognized" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[?9999;0$y", try replyTo(io, "\x1b[?9999$p", &buf));
+}
+
+test "termio: takeResponse drains and clears the queue" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("\x1b[5n");
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(io.takeResponse(&buf) > 0);
+    // Second drain on the now-empty queue yields nothing.
+    try std.testing.expectEqual(@as(usize, 0), io.takeResponse(&buf));
 }
