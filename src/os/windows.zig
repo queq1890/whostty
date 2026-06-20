@@ -231,6 +231,7 @@ pub const WM_CREATE: UINT = 0x0001;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP: UINT = 0x0202;
+pub const WM_CAPTURECHANGED: UINT = 0x0215;
 
 pub const PM_REMOVE: UINT = 0x0001;
 
@@ -301,6 +302,16 @@ pub extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
 pub extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, hglrc: ?HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+/// wglGetProcAddress, rejecting the non-null sentinels (1, 2, 3, -1) it returns
+/// for unsupported entry points on some drivers (notably the GDI generic ICD).
+/// Returns null for both the null and sentinel cases so callers can fall back.
+pub fn wglProcChecked(name: [*:0]const u8) ?*const anyopaque {
+    const p = wglGetProcAddress(name) orelse return null;
+    const a = @intFromPtr(p);
+    if (a <= 3 or a == std.math.maxInt(usize)) return null;
+    return p;
+}
 
 // --- Clipboard (CF_UNICODETEXT) --------------------------------------------
 

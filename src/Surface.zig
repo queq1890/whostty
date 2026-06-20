@@ -45,12 +45,10 @@ pub const Surface = struct {
     cols: u16,
     rows: u16,
 
-    /// Mouse-drag selection state. The selected region itself lives in the
-    /// libghostty-vt core (`screen.selection`); the Surface only owns the drag
-    /// interaction: whether the left button is down and a *tracked* anchor pin
-    /// (stable across scroll/reflow) for the drag origin.
+    /// Whether the left mouse button is held (a drag is in progress). The
+    /// selected region and the drag anchor live in the libghostty-vt core,
+    /// managed by Termio's selectStart/Extend/End under its lock.
     mouse_left_down: bool = false,
-    sel_anchor: ?*Termio.Pin = null,
 
     /// Handle a window resize (client pixels). Recomputes the grid and, if it
     /// changed, resizes the pseudo console and the terminal grid so reflow
@@ -67,33 +65,23 @@ pub const Surface = struct {
 
     /// Left button pressed: anchor a new selection at the clicked cell.
     pub fn mouseDown(self: *Surface, px_x: i32, px_y: i32) void {
-        self.releaseAnchor();
-        self.termio.clearSelection();
         const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
-        self.sel_anchor = self.termio.pinViewportTracked(cell.x, cell.y);
+        self.termio.selectStart(cell.x, cell.y);
         self.mouse_left_down = true;
     }
 
     /// Mouse moved during a left-drag: extend the selection to the current cell.
     pub fn mouseDrag(self: *Surface, px_x: i32, px_y: i32) void {
         if (!self.mouse_left_down) return;
-        const anchor = self.sel_anchor orelse return;
         const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
-        self.termio.selectTo(anchor, cell.x, cell.y);
+        self.termio.selectExtend(cell.x, cell.y);
     }
 
-    /// Left button released: end the drag (the selection stays set, owning its
-    /// own tracked pins, so the anchor can be released).
+    /// Left button released (or capture lost): end the drag. The selection stays
+    /// set; the anchor pin is released inside Termio.
     pub fn mouseUp(self: *Surface) void {
         self.mouse_left_down = false;
-        self.releaseAnchor();
-    }
-
-    fn releaseAnchor(self: *Surface) void {
-        if (self.sel_anchor) |a| {
-            self.termio.untrackPin(a);
-            self.sel_anchor = null;
-        }
+        self.termio.selectEnd();
     }
 
     /// The current selection as UTF-8, or null if nothing is selected. Caller

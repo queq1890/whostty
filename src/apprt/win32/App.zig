@@ -208,14 +208,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
             // Typing snaps back to the bottom, matching common terminals.
-            .char => |cp| {
+            .char => |c| {
                 // Enter/Tab/Backspace/Escape are delivered (correctly VT-encoded,
                 // e.g. Backspace -> DEL) via the WM_KEYDOWN path; Windows also
                 // posts their control char as WM_CHAR. Drop that duplicate so a
-                // single keypress isn't sent twice (Enter submitting twice, etc.).
-                if (isDuplicateControlChar(cp)) continue;
+                // single keypress isn't sent twice — but only when Ctrl is up.
+                // Ctrl+[ / Ctrl+M / Ctrl+I / Ctrl+H / Ctrl+J produce the same
+                // control codepoints (0x1B/0x0D/0x09/0x08/0x0A) and must pass
+                // through (they have no WM_KEYDOWN VT-encode path).
+                if (!c.mods.ctrl and isDuplicateControlChar(c.cp)) continue;
                 io.scrollToBottom();
-                writeChar(&pty, cp);
+                writeChar(&pty, c.cp);
             },
             .key => |k| {
                 // A bound chord is consumed as an action; otherwise it's a

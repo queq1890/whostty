@@ -11,6 +11,11 @@ const vt = @import("ghostty-vt");
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
 pub const Termio = struct {
+    pub const Pin = vt.Pin;
+    /// The type of `terminal.screens.active` (`*Screen`), derived without relying
+    /// on libghostty-vt re-exporting the Screen type.
+    const ActiveScreen = @FieldType(@FieldType(vt.Terminal, "screens"), "active");
+
     terminal: vt.Terminal,
     stream: vt.ReadonlyStream,
     /// Guards `terminal`: the reader thread mutates it via `process`, the
@@ -18,12 +23,21 @@ pub const Termio = struct {
     mutex: std.Thread.Mutex,
     alloc: std.mem.Allocator,
 
+    /// Mouse-drag selection anchor: a tracked pin plus the exact screen it was
+    /// created on. Binding the drag to that screen prevents building a
+    /// cross-PageList selection if an app switches to the alternate screen
+    /// (`\e[?1049h`) mid-drag.
+    sel_anchor: ?*Pin = null,
+    sel_anchor_screen: ?ActiveScreen = null,
+
     pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16, max_scrollback: usize) !*Termio {
         const self = try alloc.create(Termio);
         errdefer alloc.destroy(self);
 
         self.alloc = alloc;
         self.mutex = .{};
+        self.sel_anchor = null;
+        self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
@@ -85,34 +99,49 @@ pub const Termio = struct {
     }
 
     // --- Selection (mouse drag -> screen.selection) ------------------------
-    // All locked internally; the selected region lives in the VT core. Pins are
-    // tracked so they survive the reader thread's mutations / scroll / reflow.
+    // All locked internally; the selected region lives in the VT core. The drag
+    // anchor is a tracked pin (survives the reader thread's mutation / scroll /
+    // reflow) bound to the screen it was created on.
 
-    pub const Pin = vt.Pin;
-
-    /// Pin a viewport cell and return a *tracked* pin (stable across mutation),
-    /// or null. Pair every non-null result with `untrackPin`.
-    pub fn pinViewportTracked(self: *Termio, x: u16, y: u16) ?*Pin {
+    /// Begin a drag selection anchored at the given viewport cell.
+    pub fn selectStart(self: *Termio, x: u16, y: u16) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.releaseAnchorLocked();
         const screen = self.terminal.screens.active;
-        const p = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return null;
-        return screen.pages.trackPin(p) catch null;
+        screen.clearSelection();
+        const p = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
+        self.sel_anchor = screen.pages.trackPin(p) catch return;
+        self.sel_anchor_screen = screen;
     }
 
-    pub fn untrackPin(self: *Termio, p: *Pin) void {
+    /// Extend the active drag selection to the given viewport cell.
+    pub fn selectExtend(self: *Termio, x: u16, y: u16) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.terminal.screens.active.pages.untrackPin(p);
-    }
-
-    /// Set the active selection to span from `anchor` to the given viewport cell.
-    pub fn selectTo(self: *Termio, anchor: *Pin, x: u16, y: u16) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const screen = self.terminal.screens.active;
+        const anchor = self.sel_anchor orelse return;
+        const screen = self.sel_anchor_screen orelse return;
+        // If the active screen changed since the drag started (alternate-screen
+        // switch), the anchor belongs to a different PageList — don't cross pools.
+        if (screen != self.terminal.screens.active) return;
         const cur = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
         screen.select(vt.Selection.init(anchor.*, cur, false)) catch {};
+    }
+
+    /// End the drag (the selection stays set, owning its own tracked pins). The
+    /// anchor is untracked on the screen it was created on.
+    pub fn selectEnd(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.releaseAnchorLocked();
+    }
+
+    fn releaseAnchorLocked(self: *Termio) void {
+        if (self.sel_anchor) |a| {
+            if (self.sel_anchor_screen) |s| s.pages.untrackPin(a);
+            self.sel_anchor = null;
+            self.sel_anchor_screen = null;
+        }
     }
 
     pub fn clearSelection(self: *Termio) void {
@@ -177,15 +206,15 @@ test "termio: selection over written cells yields the selected text" {
     // No selection initially.
     try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
 
-    // Select viewport cells (0,0)..(4,0) -> "hello".
-    const anchor = io.pinViewportTracked(0, 0) orelse return error.NoPin;
-    defer io.untrackPin(anchor);
-    io.selectTo(anchor, 4, 0);
+    // Drag-select viewport cells (0,0)..(4,0) -> "hello".
+    io.selectStart(0, 0);
+    io.selectExtend(4, 0);
 
     const text = (try io.selectionStringAlloc(alloc)) orelse return error.NoSelection;
     defer alloc.free(text);
     try std.testing.expectEqualStrings("hello", text);
 
+    io.selectEnd();
     io.clearSelection();
     try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
 }

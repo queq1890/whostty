@@ -20,8 +20,10 @@ pub const Mods = struct {
 
 /// Events surfaced from the window message loop.
 pub const Event = union(enum) {
-    /// A character was typed (WM_CHAR), as a Unicode codepoint.
-    char: u21,
+    /// A character was typed (WM_CHAR): a Unicode codepoint plus the modifiers
+    /// held, so the app can tell a real control key (Enter/Tab/…) from a
+    /// Ctrl+<char> combo that produces the same control codepoint.
+    char: struct { cp: u21, mods: Mods },
     /// A virtual key was pressed (WM_KEYDOWN), with the modifiers held.
     key: struct { vk: u32, mods: Mods },
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
@@ -143,7 +145,7 @@ pub const Window = struct {
             return error.ContextFailed;
         }
 
-        if (@as(?w.CreateContextAttribsFn, @ptrCast(w.wglGetProcAddress("wglCreateContextAttribsARB")))) |createAttribs| {
+        if (@as(?w.CreateContextAttribsFn, @ptrCast(w.wglProcChecked("wglCreateContextAttribsARB")))) |createAttribs| {
             const attribs = [_:0]w.INT{
                 w.WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
                 w.WGL_CONTEXT_MINOR_VERSION_ARB, 3,
@@ -271,7 +273,7 @@ pub const Window = struct {
                 return 0;
             },
             w.WM_CHAR => {
-                if (self) |s| s.push(.{ .char = @truncate(wparam) });
+                if (self) |s| s.push(.{ .char = .{ .cp = @truncate(wparam), .mods = currentMods() } });
                 return 0;
             },
             w.WM_KEYDOWN => {
@@ -302,6 +304,13 @@ pub const Window = struct {
                     _ = w.ReleaseCapture();
                     s.push(.{ .mouse_up = .{ .x = p.x, .y = p.y } });
                 }
+                return 0;
+            },
+            w.WM_CAPTURECHANGED => {
+                // Capture was revoked without an LBUTTONUP (alt-tab / modal /
+                // Win+L mid-drag). Synthesize a release so the surface ends the
+                // drag and frees its anchor pin rather than wedging.
+                if (self) |s| s.push(.{ .mouse_up = .{ .x = 0, .y = 0 } });
                 return 0;
             },
             w.WM_MOUSEMOVE => {
