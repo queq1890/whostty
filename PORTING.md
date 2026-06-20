@@ -70,6 +70,7 @@ The `Tests` column below tracks this per layer.
 | Clipboard | `src/apprt/gtk/Surface.zig` (clipboard); `src/input/paste.zig` | `src/os/windows.zig` (CF_UNICODETEXT) + `vt.input.encodePaste` | template + dependency | copy/paste; bracketed-paste + unsafe-strip delegated to libghostty-vt (#50) | done (host: UTF-16↔8) |
 | Selection | `src/Surface.zig` (mouse select); `src/terminal/Selection.zig` | `src/Surface.zig` + `src/termio.zig` (drag → `screen.select`) | port + dependency | left-drag select + highlight via tracked pins; range/text by `ghostty-vt` (#51); word/line + threshold pending | done (host: hit-test, select round-trip) |
 | Mouse report | `src/Surface.zig` `mouseReport` | `src/mouse.zig` + `apprt/win32` wiring | template | SGR 1006 + X10 button press/release encode (not exposed by libghostty-vt); motion/wheel/other formats pending (#52) | done (host: encoder) |
+| CLI | `src/cli/args.zig`, `src/cli/Action.zig` | `src/cli.zig` | port | `-e command`, `--key[=value]` config flags, `--help`/`--version`; `+action` subcommands pending (#53) | done (host: parser) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
