@@ -14,6 +14,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const log = std.log.scoped(.opengl);
+
 /// A drawable glyph: a glyph region in the atlas placed at a pixel position,
 /// tinted by a foreground color.
 pub const Cell = struct {
@@ -162,7 +164,9 @@ const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
 const GL_TEXTURE_WRAP_T: GLenum = 0x2803;
 const GL_LINEAR: GLint = 0x2601;
+const GL_NEAREST: GLint = 0x2600;
 const GL_CLAMP_TO_EDGE: GLint = 0x812F;
+const GL_RGBA: GLenum = 0x1908;
 const GL_BLEND: GLenum = 0x0BE2;
 const GL_SRC_ALPHA: GLenum = 0x0302;
 const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
@@ -186,6 +190,8 @@ extern "opengl32" fn glTexParameteri(target: GLenum, pname: GLenum, param: GLint
 extern "opengl32" fn glTexImage2D(target: GLenum, level: GLint, internalFormat: GLint, w: GLsizei, h: GLsizei, border: GLint, format: GLenum, type: GLenum, pixels: ?*const anyopaque) callconv(.winapi) void;
 extern "opengl32" fn glPixelStorei(pname: GLenum, param: GLint) callconv(.winapi) void;
 extern "opengl32" fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) callconv(.winapi) void;
+extern "opengl32" fn glReadPixels(x: GLint, y: GLint, w: GLsizei, h: GLsizei, format: GLenum, type: GLenum, pixels: ?*anyopaque) callconv(.winapi) void;
+extern "opengl32" fn glFinish() callconv(.winapi) void;
 
 /// Proc loader: maps a GL function name to its address (wglGetProcAddress).
 pub const GetProcFn = *const fn ([*:0]const u8) callconv(.winapi) ?*const anyopaque;
@@ -212,39 +218,55 @@ const GlExt = struct {
     getUniformLocation: *const fn (GLuint, [*:0]const GLchar) callconv(.winapi) GLint,
     uniform1i: *const fn (GLint, GLint) callconv(.winapi) void,
     activeTexture: *const fn (GLenum) callconv(.winapi) void,
+    getShaderInfoLog: *const fn (GLuint, GLsizei, ?*GLsizei, [*]GLchar) callconv(.winapi) void,
+    getProgramInfoLog: *const fn (GLuint, GLsizei, ?*GLsizei, [*]GLchar) callconv(.winapi) void,
 
-    fn load(get: GetProcFn) GlExt {
+    fn load(get: GetProcFn) !GlExt {
         const L = struct {
-            fn p(g: GetProcFn, comptime T: type, name: [*:0]const u8) T {
-                return @ptrCast(g(name) orelse @panic("GL function not found"));
+            fn p(g: GetProcFn, comptime T: type, name: [*:0]const u8) !T {
+                // wglGetProcAddress returns null for unsupported names, and
+                // (famously) the sentinels 1, 2, 3 or -1 on some drivers — guard
+                // both so we never call through a bogus pointer.
+                const addr = g(name) orelse {
+                    log.err("GL function unavailable (null): {s}", .{name});
+                    return error.GlFunctionMissing;
+                };
+                const a = @intFromPtr(addr);
+                if (a <= 3 or a == std.math.maxInt(usize)) {
+                    log.err("GL function unavailable (sentinel {d}): {s}", .{ a, name });
+                    return error.GlFunctionMissing;
+                }
+                return @ptrCast(addr);
             }
         };
         return .{
-            .createShader = L.p(get, *const fn (GLenum) callconv(.winapi) GLuint, "glCreateShader"),
-            .shaderSource = L.p(get, @TypeOf(@as(GlExt, undefined).shaderSource), "glShaderSource"),
-            .compileShader = L.p(get, @TypeOf(@as(GlExt, undefined).compileShader), "glCompileShader"),
-            .getShaderiv = L.p(get, @TypeOf(@as(GlExt, undefined).getShaderiv), "glGetShaderiv"),
-            .createProgram = L.p(get, @TypeOf(@as(GlExt, undefined).createProgram), "glCreateProgram"),
-            .attachShader = L.p(get, @TypeOf(@as(GlExt, undefined).attachShader), "glAttachShader"),
-            .linkProgram = L.p(get, @TypeOf(@as(GlExt, undefined).linkProgram), "glLinkProgram"),
-            .getProgramiv = L.p(get, @TypeOf(@as(GlExt, undefined).getProgramiv), "glGetProgramiv"),
-            .useProgram = L.p(get, @TypeOf(@as(GlExt, undefined).useProgram), "glUseProgram"),
-            .deleteShader = L.p(get, @TypeOf(@as(GlExt, undefined).deleteShader), "glDeleteShader"),
-            .genBuffers = L.p(get, @TypeOf(@as(GlExt, undefined).genBuffers), "glGenBuffers"),
-            .bindBuffer = L.p(get, @TypeOf(@as(GlExt, undefined).bindBuffer), "glBindBuffer"),
-            .bufferData = L.p(get, @TypeOf(@as(GlExt, undefined).bufferData), "glBufferData"),
-            .genVertexArrays = L.p(get, @TypeOf(@as(GlExt, undefined).genVertexArrays), "glGenVertexArrays"),
-            .bindVertexArray = L.p(get, @TypeOf(@as(GlExt, undefined).bindVertexArray), "glBindVertexArray"),
-            .vertexAttribPointer = L.p(get, @TypeOf(@as(GlExt, undefined).vertexAttribPointer), "glVertexAttribPointer"),
-            .enableVertexAttribArray = L.p(get, @TypeOf(@as(GlExt, undefined).enableVertexAttribArray), "glEnableVertexAttribArray"),
-            .getUniformLocation = L.p(get, @TypeOf(@as(GlExt, undefined).getUniformLocation), "glGetUniformLocation"),
-            .uniform1i = L.p(get, @TypeOf(@as(GlExt, undefined).uniform1i), "glUniform1i"),
-            .activeTexture = L.p(get, @TypeOf(@as(GlExt, undefined).activeTexture), "glActiveTexture"),
+            .createShader = try L.p(get, *const fn (GLenum) callconv(.winapi) GLuint, "glCreateShader"),
+            .shaderSource = try L.p(get, @TypeOf(@as(GlExt, undefined).shaderSource), "glShaderSource"),
+            .compileShader = try L.p(get, @TypeOf(@as(GlExt, undefined).compileShader), "glCompileShader"),
+            .getShaderiv = try L.p(get, @TypeOf(@as(GlExt, undefined).getShaderiv), "glGetShaderiv"),
+            .createProgram = try L.p(get, @TypeOf(@as(GlExt, undefined).createProgram), "glCreateProgram"),
+            .attachShader = try L.p(get, @TypeOf(@as(GlExt, undefined).attachShader), "glAttachShader"),
+            .linkProgram = try L.p(get, @TypeOf(@as(GlExt, undefined).linkProgram), "glLinkProgram"),
+            .getProgramiv = try L.p(get, @TypeOf(@as(GlExt, undefined).getProgramiv), "glGetProgramiv"),
+            .useProgram = try L.p(get, @TypeOf(@as(GlExt, undefined).useProgram), "glUseProgram"),
+            .deleteShader = try L.p(get, @TypeOf(@as(GlExt, undefined).deleteShader), "glDeleteShader"),
+            .genBuffers = try L.p(get, @TypeOf(@as(GlExt, undefined).genBuffers), "glGenBuffers"),
+            .bindBuffer = try L.p(get, @TypeOf(@as(GlExt, undefined).bindBuffer), "glBindBuffer"),
+            .bufferData = try L.p(get, @TypeOf(@as(GlExt, undefined).bufferData), "glBufferData"),
+            .genVertexArrays = try L.p(get, @TypeOf(@as(GlExt, undefined).genVertexArrays), "glGenVertexArrays"),
+            .bindVertexArray = try L.p(get, @TypeOf(@as(GlExt, undefined).bindVertexArray), "glBindVertexArray"),
+            .vertexAttribPointer = try L.p(get, @TypeOf(@as(GlExt, undefined).vertexAttribPointer), "glVertexAttribPointer"),
+            .enableVertexAttribArray = try L.p(get, @TypeOf(@as(GlExt, undefined).enableVertexAttribArray), "glEnableVertexAttribArray"),
+            .getUniformLocation = try L.p(get, @TypeOf(@as(GlExt, undefined).getUniformLocation), "glGetUniformLocation"),
+            .uniform1i = try L.p(get, @TypeOf(@as(GlExt, undefined).uniform1i), "glUniform1i"),
+            .activeTexture = try L.p(get, @TypeOf(@as(GlExt, undefined).activeTexture), "glActiveTexture"),
+            .getShaderInfoLog = try L.p(get, @TypeOf(@as(GlExt, undefined).getShaderInfoLog), "glGetShaderInfoLog"),
+            .getProgramInfoLog = try L.p(get, @TypeOf(@as(GlExt, undefined).getProgramInfoLog), "glGetProgramInfoLog"),
         };
     }
 };
 
-const vertex_shader_src: [:0]const u8 =
+pub const vertex_shader_src: [:0]const u8 =
     \\#version 330 core
     \\layout (location = 0) in vec2 a_pos;
     \\layout (location = 1) in vec2 a_uv;
@@ -261,7 +283,7 @@ const vertex_shader_src: [:0]const u8 =
     \\}
 ;
 
-const fragment_shader_src: [:0]const u8 =
+pub const fragment_shader_src: [:0]const u8 =
     \\#version 330 core
     \\in vec2 v_uv;
     \\in vec3 v_color;
@@ -288,7 +310,7 @@ pub const Renderer = struct {
     alloc: std.mem.Allocator,
 
     pub fn init(alloc: std.mem.Allocator, get: GetProcFn) !Renderer {
-        const gl = GlExt.load(get);
+        const gl = try GlExt.load(get);
 
         const vs = try compile(gl, GL_VERTEX_SHADER, vertex_shader_src);
         const fs = try compile(gl, GL_FRAGMENT_SHADER, fragment_shader_src);
@@ -298,7 +320,13 @@ pub const Renderer = struct {
         gl.linkProgram(program);
         var ok: GLint = 0;
         gl.getProgramiv(program, GL_LINK_STATUS, &ok);
-        if (ok == 0) return error.LinkFailed;
+        if (ok == 0) {
+            var buf: [1024]GLchar = undefined;
+            var n: GLsizei = 0;
+            gl.getProgramInfoLog(program, buf.len, &n, &buf);
+            log.err("program link failed: {s}", .{buf[0..@intCast(@max(0, n))]});
+            return error.LinkFailed;
+        }
         gl.deleteShader(vs);
         gl.deleteShader(fs);
 
@@ -348,8 +376,10 @@ pub const Renderer = struct {
         glBindTexture(GL_TEXTURE_2D, self.atlas_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_R8), @intCast(size), @intCast(size), 0, GL_RED, GL_UNSIGNED_BYTE, data.ptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // Nearest filtering (matching ghostty) avoids sampling neighbouring
+        // glyphs' coverage at atlas-rect edges under the 1px padding.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
@@ -394,8 +424,46 @@ pub const Renderer = struct {
         gl.compileShader(sh);
         var ok: GLint = 0;
         gl.getShaderiv(sh, GL_COMPILE_STATUS, &ok);
-        if (ok == 0) return error.ShaderCompileFailed;
+        if (ok == 0) {
+            var buf: [1024]GLchar = undefined;
+            var n: GLsizei = 0;
+            gl.getShaderInfoLog(sh, buf.len, &n, &buf);
+            log.err("shader compile failed ({s}): {s}", .{
+                if (kind == GL_VERTEX_SHADER) "vertex" else "fragment",
+                buf[0..@intCast(@max(0, n))],
+            });
+            return error.ShaderCompileFailed;
+        }
         return sh;
+    }
+
+    /// Debug-only render self-check: read the back buffer and count pixels that
+    /// differ from the clear colour, logging the tally to stderr. Lets a build
+    /// that can't be screenshotted (WDAC, no capture) confirm glyphs reached
+    /// pixels. Gated by the caller (WHOSTTY_RENDER_DEBUG=1); allocates w*h*4.
+    /// Call after `draw` and before `swapBuffers` (reads the back buffer).
+    pub fn debugCountLitPixels(self: *Renderer, clear: [3]f32, screen_w: u32, screen_h: u32) void {
+        glFinish();
+        const n = @as(usize, screen_w) * @as(usize, screen_h);
+        if (n == 0) return;
+        const buf = self.alloc.alloc(u8, n * 4) catch return;
+        defer self.alloc.free(buf);
+        glReadPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+        const cr: i16 = @intFromFloat(@round(clear[0] * 255.0));
+        const cg: i16 = @intFromFloat(@round(clear[1] * 255.0));
+        const cb: i16 = @intFromFloat(@round(clear[2] * 255.0));
+        var lit: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const r: i16 = buf[i * 4 + 0];
+            const g: i16 = buf[i * 4 + 1];
+            const b: i16 = buf[i * 4 + 2];
+            if (@abs(r - cr) > 2 or @abs(g - cg) > 2 or @abs(b - cb) > 2) lit += 1;
+        }
+        log.info("[render-debug] {d}x{d} verts={d} lit_pixels={d}/{d} ({d:.3}%)", .{
+            screen_w, screen_h, self.verts.items.len, lit, n,
+            @as(f64, @floatFromInt(lit)) * 100.0 / @as(f64, @floatFromInt(n)),
+        });
     }
 };
 

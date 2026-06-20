@@ -126,8 +126,38 @@ pub const Window = struct {
         if (fmt == 0) return error.PixelFormatFailed;
         if (w.SetPixelFormat(self.hdc, fmt, &pfd) == w.FALSE) return error.PixelFormatFailed;
 
-        self.hglrc = w.wglCreateContext(self.hdc) orelse return error.ContextFailed;
-        if (w.wglMakeCurrent(self.hdc, self.hglrc) == w.FALSE) return error.ContextFailed;
+        // Bootstrap a legacy context so wglCreateContextAttribsARB can be
+        // resolved, then upgrade to a 3.3 core context. The renderer hard-requires
+        // GL >= 3.3 (`#version 330 core` shaders, VAOs, sized R8 textures); a bare
+        // wglCreateContext can hand back GL 1.1 (Microsoft GDI generic), which
+        // makes shader compilation / VAO loading fail at startup.
+        const legacy = w.wglCreateContext(self.hdc) orelse return error.ContextFailed;
+        if (w.wglMakeCurrent(self.hdc, legacy) == w.FALSE) {
+            _ = w.wglDeleteContext(legacy);
+            return error.ContextFailed;
+        }
+
+        if (@as(?w.CreateContextAttribsFn, @ptrCast(w.wglGetProcAddress("wglCreateContextAttribsARB")))) |createAttribs| {
+            const attribs = [_:0]w.INT{
+                w.WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+                w.WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+                w.WGL_CONTEXT_PROFILE_MASK_ARB,  w.WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            };
+            if (createAttribs(self.hdc, null, &attribs)) |core| {
+                _ = w.wglMakeCurrent(null, null);
+                _ = w.wglDeleteContext(legacy);
+                self.hglrc = core;
+                if (w.wglMakeCurrent(self.hdc, self.hglrc) == w.FALSE) return error.ContextFailed;
+                return;
+            }
+            log.warn("wglCreateContextAttribsARB failed; falling back to the legacy GL context", .{});
+        } else {
+            log.warn("wglCreateContextAttribsARB unavailable; falling back to the legacy GL context", .{});
+        }
+
+        // Fallback: keep the legacy context (a real ICD often still reports a
+        // >= 3.3 compatibility profile, which the renderer can use).
+        self.hglrc = legacy;
     }
 
     pub fn deinit(self: *Window) void {

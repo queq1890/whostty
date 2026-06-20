@@ -295,3 +295,17 @@ pub extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
 pub extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, hglrc: ?HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+// WGL_ARB_create_context: request a specific GL version/profile. Resolved at
+// runtime via wglGetProcAddress (it has no opengl32 import-library export). The
+// renderer requires GL >= 3.3, which a bare wglCreateContext does not guarantee.
+pub const WGL_CONTEXT_MAJOR_VERSION_ARB: INT = 0x2091;
+pub const WGL_CONTEXT_MINOR_VERSION_ARB: INT = 0x2092;
+pub const WGL_CONTEXT_FLAGS_ARB: INT = 0x2094;
+pub const WGL_CONTEXT_PROFILE_MASK_ARB: INT = 0x9126;
+pub const WGL_CONTEXT_CORE_PROFILE_BIT_ARB: INT = 0x00000001;
+pub const WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB: INT = 0x00000002;
+
+/// Signature of wglCreateContextAttribsARB. `attribs` is an INT key/value list
+/// terminated by 0.
+pub const CreateContextAttribsFn = *const fn (HDC, ?HGLRC, [*:0]const INT) callconv(.winapi) ?HGLRC;

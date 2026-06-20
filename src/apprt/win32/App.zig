@@ -140,7 +140,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     if (build_options.freetype) {
         const px: u32 = @intFromFloat(@max(1, @round(cfg.font_size)));
-        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px);
+        // A missing/unreadable font must not abort launch: fall back to the
+        // empty atlas (blank glyphs) exactly like the non-freetype build.
+        buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px) catch |err| {
+            log.warn("glyph atlas build failed ({s}); rendering with blank glyphs", .{@errorName(err)});
+        };
     }
     renderer.setAtlas(atlas.data, atlas.size);
 
@@ -182,11 +186,26 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer quads.deinit(alloc);
     var wheel: scroll.WheelAccumulator = .{};
 
+    // One-shot render self-verification (WHOSTTY_RENDER_DEBUG=1) — counts lit
+    // pixels a few frames in so a build that can't be screenshotted can confirm
+    // glyphs reached the framebuffer. See Renderer.debugCountLitPixels.
+    var frame: u32 = 0;
+    const render_debug = blk: {
+        const v = std.process.getEnvVarOwned(alloc, "WHOSTTY_RENDER_DEBUG") catch break :blk false;
+        defer alloc.free(v);
+        break :blk std.mem.eql(u8, v, "1");
+    };
+
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
             // Typing snaps back to the bottom, matching common terminals.
             .char => |cp| {
+                // Enter/Tab/Backspace/Escape are delivered (correctly VT-encoded,
+                // e.g. Backspace -> DEL) via the WM_KEYDOWN path; Windows also
+                // posts their control char as WM_CHAR. Drop that duplicate so a
+                // single keypress isn't sent twice (Enter submitting twice, etc.).
+                if (isDuplicateControlChar(cp)) continue;
                 io.scrollToBottom();
                 writeChar(&pty, cp);
             },
@@ -209,6 +228,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
         const sz = win.clientSize();
         try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme);
         try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
+
+        frame += 1;
+        if (render_debug and frame == 10) renderer.debugCountLitPixels(rgbf(theme.bg), sz.width, sz.height);
+
         win.swapBuffers();
     }
 }
@@ -230,6 +253,18 @@ fn writeChar(pty: *Pty, cp: u21) void {
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(cp, &buf) catch return;
     _ = pty.write(buf[0..n]) catch {};
+}
+
+/// True for the control codepoints that WM_CHAR posts as duplicates of keys
+/// already handled (VT-encoded) on the WM_KEYDOWN path: Backspace (0x08),
+/// Tab (0x09), LF/CR (0x0A/0x0D) and Escape (0x1B). Dropping these from the
+/// WM_CHAR stream prevents double-sending. Ctrl+letter combos that aren't one
+/// of these (e.g. Ctrl+C -> 0x03) are unaffected and still pass through.
+fn isDuplicateControlChar(cp: u21) bool {
+    return switch (cp) {
+        0x08, 0x09, 0x0A, 0x0D, 0x1B => true,
+        else => false,
+    };
 }
 
 fn writeKey(pty: *Pty, code: u32) void {
