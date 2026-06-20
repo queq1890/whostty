@@ -205,23 +205,35 @@ pub fn run(alloc: std.mem.Allocator) !void {
         break :blk std.mem.eql(u8, v, "1");
     };
 
+    // Enter/Tab/Backspace/Escape are VT-encoded on their WM_KEYDOWN; Windows also
+    // posts a WM_CHAR control char for them. This one-shot flag, set when such a
+    // key is seen, drops that trailing WM_CHAR so the key isn't sent twice — while
+    // still letting Ctrl+[ / Ctrl+M / etc. (which have no WM_KEYDOWN path) pass.
+    var suppress_next_char = false;
+
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
             // Typing snaps back to the bottom, matching common terminals.
-            .char => |c| {
-                // Enter/Tab/Backspace/Escape are delivered (correctly VT-encoded,
-                // e.g. Backspace -> DEL) via the WM_KEYDOWN path; Windows also
-                // posts their control char as WM_CHAR. Drop that duplicate so a
-                // single keypress isn't sent twice — but only when Ctrl is up.
-                // Ctrl+[ / Ctrl+M / Ctrl+I / Ctrl+H / Ctrl+J produce the same
-                // control codepoints (0x1B/0x0D/0x09/0x08/0x0A) and must pass
-                // through (they have no WM_KEYDOWN VT-encode path).
-                if (!c.mods.ctrl and isDuplicateControlChar(c.cp)) continue;
+            .char => |cp| {
+                // Drop the WM_CHAR that trails a handled Enter/Tab/Backspace/
+                // Escape WM_KEYDOWN (flagged below) so the key isn't sent twice.
+                if (suppress_next_char) {
+                    suppress_next_char = false;
+                    continue;
+                }
                 io.scrollToBottom();
-                writeChar(&pty, c.cp);
+                writeChar(&pty, cp);
             },
             .key => |k| {
+                // These keys are VT-encoded here and ALSO post a WM_CHAR; mark the
+                // trailing WM_CHAR for suppression whether the key is sent to the
+                // shell or consumed as a keybind. Other keys clear the flag.
+                suppress_next_char = switch (k.vk) {
+                    input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
+                    else => false,
+                };
+
                 // A bound chord is consumed as an action; otherwise it's a
                 // normal key written to the shell.
                 const ctx: KeybindCtx = .{
@@ -287,18 +299,6 @@ fn writeChar(pty: *Pty, cp: u21) void {
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(cp, &buf) catch return;
     _ = pty.write(buf[0..n]) catch {};
-}
-
-/// True for the control codepoints that WM_CHAR posts as duplicates of keys
-/// already handled (VT-encoded) on the WM_KEYDOWN path: Backspace (0x08),
-/// Tab (0x09), LF/CR (0x0A/0x0D) and Escape (0x1B). Dropping these from the
-/// WM_CHAR stream prevents double-sending. Ctrl+letter combos that aren't one
-/// of these (e.g. Ctrl+C -> 0x03) are unaffected and still pass through.
-fn isDuplicateControlChar(cp: u21) bool {
-    return switch (cp) {
-        0x08, 0x09, 0x0A, 0x0D, 0x1B => true,
-        else => false,
-    };
 }
 
 fn writeKey(pty: *Pty, code: u32) void {

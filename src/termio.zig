@@ -139,7 +139,13 @@ pub const Termio = struct {
 
     fn releaseAnchorLocked(self: *Termio) void {
         if (self.sel_anchor) |a| {
-            if (self.sel_anchor_screen) |s| s.pages.untrackPin(a);
+            // Only untrack if the anchor's screen is still the active one. If the
+            // app switched away from (or, via RIS, *freed*) that screen, the pin
+            // was freed with it — dereferencing the stored pointer would be a
+            // use-after-free. Just drop the fields in that case.
+            if (self.sel_anchor_screen) |s| {
+                if (s == self.terminal.screens.active) s.pages.untrackPin(a);
+            }
             self.sel_anchor = null;
             self.sel_anchor_screen = null;
         }

@@ -20,10 +20,10 @@ pub const Mods = struct {
 
 /// Events surfaced from the window message loop.
 pub const Event = union(enum) {
-    /// A character was typed (WM_CHAR): a Unicode codepoint plus the modifiers
-    /// held, so the app can tell a real control key (Enter/Tab/…) from a
-    /// Ctrl+<char> combo that produces the same control codepoint.
-    char: struct { cp: u21, mods: Mods },
+    /// A character was typed (WM_CHAR), as a Unicode codepoint. The app drops the
+    /// WM_CHAR that follows a handled Enter/Tab/Backspace/Escape WM_KEYDOWN (see
+    /// the suppress-next-char logic) so those keys aren't sent twice.
+    char: u21,
     /// A virtual key was pressed (WM_KEYDOWN), with the modifiers held.
     key: struct { vk: u32, mods: Mods },
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
@@ -281,7 +281,7 @@ pub const Window = struct {
                 return 0;
             },
             w.WM_CHAR => {
-                if (self) |s| s.push(.{ .char = .{ .cp = @truncate(wparam), .mods = currentMods() } });
+                if (self) |s| s.push(.{ .char = @truncate(wparam) });
                 return 0;
             },
             w.WM_KEYDOWN => {
