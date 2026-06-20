@@ -66,6 +66,10 @@ The `Tests` column below tracks this per layer.
 | Keybindings | `src/input/Binding.zig` | `src/input/Binding.zig` + apprt dispatch | port | chord/action grammar + Set + defaults + `keybind` config, and Win32 event→trigger→action dispatch (scroll actions live; split/tab await multi-surface) (#18/#16) | done (host); dispatch link-checked |
 | Config | `src/config/Config.zig`, `src/cli/args.zig` (LineIterator) | `src/config.zig` | port | file format + options: colors/font/cursor/palette/renderer/font-feature/keybind/cursor+selection colors/bold-is-bright/scrollback-limit (#17) | done (host) |
 | Surface mgmt (tabs/splits) | `src/apprt/gtk/` (Split/Notebook) | `src/apprt/win32/SplitTree.zig` | template | split tree (split/close/resize/equalize/layout/focus-nav/hit-test) + tab list model (#18) | fresh (host) |
+| GL context | `src/renderer/opengl/` (context) | `src/apprt/win32/Window.zig` (WGL) | template | 3.3-core context via `wglCreateContextAttribsARB` + sentinel-guarded loader; verified headless via `offscreen-proof` (#46) | host (EGL/Mesa proof) |
+| Clipboard | `src/apprt/gtk/Surface.zig` (clipboard); `src/input/paste.zig` | `src/os/windows.zig` (CF_UNICODETEXT) + `vt.input.encodePaste` | template + dependency | copy/paste; bracketed-paste + unsafe-strip delegated to libghostty-vt (#50) | done (host: UTF-16↔8) |
+| Selection | `src/Surface.zig` (mouse select); `src/terminal/Selection.zig` | `src/Surface.zig` + `src/termio.zig` (drag → `screen.select`) | port + dependency | left-drag select + highlight via tracked pins; range/text by `ghostty-vt` (#51); word/line + threshold pending | done (host: hit-test, select round-trip) |
+| Mouse report | `src/Surface.zig` `mouseReport` | `src/mouse.zig` + `apprt/win32` wiring | template | SGR 1006 + X10 button press/release encode (not exposed by libghostty-vt); motion/wheel/other formats pending (#52) | done (host: encoder) |
 
 Rows are added lazily as layers are ported. "scaffolded" = stub exists with a
 reference header; "done" = ported and building.
@@ -94,11 +98,12 @@ daily-driver criticality (tracked under the roadmap epic #47):
   unsigned builds can launch; unblocks render proof (#46), on-device
   verification, and every native backend (#43). Single root dependency; signing
   is reused for distribution.
-- **Tier 1 — usable terminal**: app-side wiring on top of the delegated VT cores
-  — clipboard/copy (#50), text selection hit-test + render (#51), and
-  `surface_mouse.zig` pointer/mouse routing (#52). The VT-level selection /
-  mouse / paste / OSC 8 *encoding* is delegated to libghostty-vt; only the wiring
-  is whostty's.
+- **Tier 1 — usable terminal**: first cut **landed** — clipboard copy/paste
+  (#50), mouse-drag selection + highlight (#51), and SGR/X10 mouse reporting
+  (#52). Follow-ups: word/line (double/triple-click) + sub-cell-threshold
+  selection, mouse motion/wheel reporting + utf8/urxvt/sgr_pixels formats. (VT
+  selection / paste / OSC 8 *encoding* is delegated to libghostty-vt; mouse
+  *encoding* is not exposed, so it is ported in `src/mouse.zig`.)
 - **Tier 2 — quality / parity**: the native backends still pending a Windows host
   (Harfbuzz, DirectWrite COM, Direct3D 11, multi-surface runtime, scrollbar
   drawing — see the rows above and #43), and the **full `config/` system** (#49):

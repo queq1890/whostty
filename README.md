@@ -5,11 +5,14 @@ philosophy. whostty faithfully mirrors ghostty's `src/` layout but does **not**
 reimplement the VT core — it depends on
 [libghostty-vt](https://github.com/ghostty-org/ghostty/pull/8840) instead.
 
-> Status: **slice-0 wired.** The end-to-end vertical slice is implemented — a
-> Win32 window + WGL/OpenGL renderer, a ConPTY-backed shell, a reader thread
-> feeding libghostty-vt, keyboard input, and resize. It cross-compiles and links
-> for `x86_64-windows`. Running it on screen (and the Freetype glyph atlas via
-> `-Dfreetype`) requires a Windows host with a GPU/display.
+> Status: **usable terminal.** On top of slice-0 (Win32 window + WGL/OpenGL
+> renderer, ConPTY shell, libghostty-vt, keyboard, resize) the daily-driver
+> basics are in: a real **GL 3.3 core context** (so glyphs actually rasterize —
+> proven headlessly, see *Verifying the renderer*), **clipboard** copy/paste,
+> mouse-drag **text selection** with highlight, and **mouse reporting** (SGR/X10)
+> for TUIs. It cross-compiles and links for `x86_64-windows` and passes host unit
+> tests. Running the GUI needs a Windows host where the build can launch (an
+> enforced WDAC/Device-Guard policy blocks unsigned exes — see issue #48).
 
 ## Architecture
 
@@ -30,7 +33,7 @@ Requires **Zig 0.15.2** (pinned in `.zigversion` and `build.zig.zon`'s
 
 ```sh
 zig build                          # build (host)
-zig build test                     # host unit tests (termio, input, atlas, sizing, …)
+zig build test                     # host unit tests (termio, input, atlas, mouse, …)
 zig build -Dtarget=x86_64-windows  # the real target: Win32 terminal
 zig build -Dfreetype               # also build the Freetype glyph rasterizer
 ```
@@ -38,6 +41,27 @@ zig build -Dfreetype               # also build the Freetype glyph rasterizer
 On a non-Windows host the binary runs a libghostty-vt wiring demo; the actual
 terminal (`apprt/win32`) is produced by the Windows target. `-Dfreetype` fetches
 freetype source, so it needs network access.
+
+### Interaction
+
+`Ctrl+Shift+C` / `Ctrl+Shift+V` copy/paste; left-drag selects text (`Shift`
+forces local selection even when an app has mouse reporting on); `Shift+PageUp` /
+`Shift+PageDown` and the mouse wheel scroll the scrollback. Keybindings are
+configurable (see *Configuration*).
+
+### Verifying the renderer
+
+The Win32 GUI can't be screenshotted under some lockdown policies, so two checks
+stand in for an on-screen look:
+
+```sh
+zig build offscreen-proof -Dfreetype   # headless: runs the REAL shaders + atlas +
+                                        # Freetype path on an EGL/Mesa GL 3.3 core
+                                        # context and asserts glyphs reach pixels
+```
+
+When running the Windows build, set `WHOSTTY_RENDER_DEBUG=1` to print a lit-pixel
+count a few frames in (`lit_pixels > 0` ⇒ the GPU is drawing glyphs).
 
 ## Configuration
 
