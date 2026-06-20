@@ -492,6 +492,26 @@ test "termio: DECRQM reports an unknown mode as not recognized" {
     try std.testing.expectEqualStrings("\x1b[?9999;0$y", try replyTo(io, "\x1b[?9999$p", &buf));
 }
 
+test "termio: keyEncodeOptions reflects DECCKM and forces kitty output off" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Default: cursor-key application mode off.
+    try std.testing.expect(!io.keyEncodeOptions().cursor_key_application);
+
+    // App enables DECCKM (cursor keys) -> reflected in the encode options.
+    try io.process("\x1b[?1h");
+    try std.testing.expect(io.keyEncodeOptions().cursor_key_application);
+
+    // App pushes kitty keyboard flags: the terminal records them...
+    try io.process("\x1b[>1u");
+    try std.testing.expect(io.terminal.screens.active.kitty_keyboard.current().int() != 0);
+    // ...but key-encode options force kitty output off (the WM_CHAR text path is
+    // still legacy; full kitty output is deferred).
+    try std.testing.expectEqual(@as(u5, 0), io.keyEncodeOptions().kitty_flags.int());
+}
+
 test "termio: takeResponse drains and clears the queue" {
     const alloc = std.testing.allocator;
     const io = try Termio.create(alloc, 20, 3, 1 << 20);
