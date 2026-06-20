@@ -22,7 +22,11 @@ const surface = @import("../../Surface.zig");
 const Atlas = @import("../../font/Atlas.zig");
 const w = @import("../../os/windows.zig");
 
-const font = if (build_options.freetype) @import("../../font/main.zig") else struct {};
+/// Whether the Freetype-backed glyph cache is compiled in. When false (the
+/// bring-up / link-check build) the renderer draws solids only — no glyphs —
+/// exactly as before.
+const ft = build_options.freetype;
+const GlyphCache = if (ft) @import("../../font/GlyphCache.zig") else void;
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
@@ -33,15 +37,18 @@ const cli = @import("../../cli.zig");
 
 const log = std.log.scoped(.app);
 
-/// Per-printable-ASCII glyph placement in the atlas.
-const GlyphInfo = struct {
-    region: Atlas.Region,
-    bearing_x: i32,
-    bearing_y: i32,
-};
+/// Lowest codepoint we attempt to draw. Below this are the empty-cell sentinel
+/// (0), control chars, and space (0x20) — all of which draw nothing — so we skip
+/// the cache lookup for them.
+const first_drawable: u21 = 0x21;
 
-const first_glyph = 32;
-const last_glyph = 126;
+/// The default monospace font on Windows. font-family selection via DirectWrite
+/// discovery is #74; the configured size applies now.
+const default_font_path = "C:\\Windows\\Fonts\\consola.ttf";
+
+/// Atlas dimension (square, texels). Holds a few hundred packed glyphs; atlas
+/// growth/eviction when it fills is follow-up work.
+const atlas_size: u32 = 512;
 
 /// The resolved color theme the renderer uses: default fg/bg for cells with no
 /// explicit SGR color, plus the effective 256-color palette (vt defaults with
@@ -173,23 +180,29 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     binding.addDefaults(&binds, alloc) catch {};
     for (cfg.keybinds.list.items) |b| binds.put(alloc, b) catch {};
 
-    // --- Glyph atlas + cell metrics ---
-    var atlas = try Atlas.init(alloc, 512);
-    defer atlas.deinit(alloc);
-    var glyphs = [_]?GlyphInfo{null} ** (last_glyph - first_glyph + 1);
+    // --- Glyph cache + cell metrics ---
+    // Glyphs are rasterized on demand from the cache (any codepoint the face
+    // supports, not just ASCII) and packed into the atlas, which is re-uploaded
+    // to GL whenever it gains a new glyph. The non-freetype build keeps `void`
+    // here and draws solids only. The cache is constructed in the declaration so
+    // there is never an `undefined` window the cleanup defer could act on: a
+    // failed init returns before the defer is registered.
+    var cache: GlyphCache = if (ft)
+        try GlyphCache.init(alloc, default_font_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
+    else {};
+    defer if (ft) cache.deinit();
+
     var cell_w: u32 = 8;
     var cell_h: u32 = 16;
     var ascent: u32 = 12;
-
-    if (build_options.freetype) {
-        const px: u32 = @intFromFloat(@max(1, @round(cfg.font_size)));
-        // A missing/unreadable font must not abort launch: fall back to the
-        // empty atlas (blank glyphs) exactly like the non-freetype build.
-        buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px) catch |err| {
-            log.warn("glyph atlas build failed ({s}); rendering with blank glyphs", .{@errorName(err)});
-        };
+    if (ft) {
+        cell_w = cache.cell_w;
+        cell_h = cache.cell_h;
+        ascent = cache.ascent;
+        // Upload the (empty) atlas once so the glyph texture + its sampling
+        // params are configured before the first draw; new glyphs re-upload.
+        renderer.setAtlas(cache.atlas.data, cache.atlas.size);
     }
-    renderer.setAtlas(atlas.data, atlas.size);
 
     // --- Initial grid from the client size ---
     const size0 = win.clientSize();
@@ -336,7 +349,10 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             .opacity = cfg.cursor_opacity,
             .thickness = cursor_thickness,
         };
-        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme, cursor_render);
+        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, &theme, cursor_render);
+        // buildQuads may have packed new glyphs into the atlas; re-upload before
+        // drawing so the texture has them.
+        if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
         try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
 
         frame += 1;
@@ -457,45 +473,6 @@ fn copyToClipboard(ctx: KeybindCtx) void {
     w.clipboardWrite(ctx.alloc, ctx.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
 }
 
-/// Build the per-glyph atlas for printable ASCII via Freetype. Only compiled
-/// when `-Dfreetype` is set.
-fn buildAtlas(
-    alloc: std.mem.Allocator,
-    atlas: *Atlas,
-    glyphs: *[last_glyph - first_glyph + 1]?GlyphInfo,
-    cell_w: *u32,
-    cell_h: *u32,
-    ascent: *u32,
-    px: u32,
-) !void {
-    var lib = try font.Library.init();
-    defer lib.deinit();
-
-    // A reasonable default monospace font on Windows. font-family selection is
-    // deferred to DirectWrite discovery (#14); the configured size applies now.
-    var face = try font.Face.init(lib, "C:\\Windows\\Fonts\\consola.ttf", px);
-    defer face.deinit();
-
-    const m = face.metrics();
-    cell_w.* = m.cell_width;
-    cell_h.* = m.cell_height;
-    ascent.* = m.ascent;
-
-    var cp: u32 = first_glyph;
-    while (cp <= last_glyph) : (cp += 1) {
-        var g = try face.rasterize(alloc, cp);
-        defer g.deinit(alloc);
-        if (g.width == 0 or g.height == 0) continue;
-        const region = atlas.reserve(g.width, g.height) catch continue;
-        atlas.set(region, g.pixels);
-        glyphs[cp - first_glyph] = .{
-            .region = region,
-            .bearing_x = g.bearing_x,
-            .bearing_y = g.bearing_y,
-        };
-    }
-}
-
 /// Translate the terminal viewport into renderable quads, honoring SGR colors
 /// and attributes (#12): per-cell foreground/background colors (default, 256
 /// palette, or truecolor), inverse video, and the underline / strikethrough /
@@ -512,7 +489,7 @@ fn buildQuads(
     alloc: std.mem.Allocator,
     quads: *std.ArrayList(gl.Quad),
     io: *Termio,
-    glyphs: *const [last_glyph - first_glyph + 1]?GlyphInfo,
+    cache: anytype,
     cell_w: u32,
     cell_h: u32,
     ascent: u32,
@@ -597,12 +574,14 @@ fn buildQuads(
                 .b = c[2],
             } });
 
-            // Foreground glyph (invisible attribute suppresses it). Faint/dim
-            // (SGR 2) text is drawn at reduced opacity via the per-quad alpha.
-            if (!style.flags.invisible) {
+            // Foreground glyph (invisible attribute suppresses it). The glyph is
+            // rasterized on demand and packed into the atlas the first time its
+            // codepoint is seen. Faint/dim (SGR 2) text is drawn at reduced
+            // opacity via the per-quad alpha.
+            if (ft and !style.flags.invisible) {
                 const cp = cell.codepoint();
-                if (cp >= first_glyph and cp <= last_glyph) {
-                    if (glyphs[cp - first_glyph]) |gi| {
+                if (cp >= first_drawable) {
+                    if (cache.get(cp)) |gi| {
                         const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
                         try quads.append(alloc, .{ .glyph = .{
                             .px = cell_x + gi.bearing_x,
@@ -685,19 +664,12 @@ fn buildQuads(
         const ccx: i32 = @intCast(cx * cell_w);
         const ccy: i32 = @intCast(cy * cell_h);
 
-        // Default cursor fill = the cell's foreground; default block text = its
-        // background, so a block cursor inverts the cell beneath it.
+        // Default cursor fill = the cell's foreground.
         var cur_fg = theme.fg;
-        var cur_bg = theme.bg;
-        var cur_cp: u21 = 0;
         if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
-            const cell_style = gc.style();
-            cur_fg = cell_style.fg(.{ .default = theme.fg, .palette = palette });
-            if (cell_style.bg(gc.cell, palette)) |c| cur_bg = c;
-            cur_cp = gc.cell.codepoint();
+            cur_fg = gc.style().fg(.{ .default = theme.fg, .palette = palette });
         }
         const fill = cursor_render.color orelse rgbf(cur_fg);
-        const text_color = cursor_render.text orelse rgbf(cur_bg);
 
         try rcursor.shapeQuads(quads, alloc, cs, .{
             .px = ccx,
@@ -707,21 +679,30 @@ fn buildQuads(
             .thickness = cursor_render.thickness,
         }, fill, cursor_render.opacity);
 
-        // A solid block hides the glyph beneath it; re-draw that glyph in the
-        // cursor text color so it stays legible.
-        if (cs == .block and cur_cp >= first_glyph and cur_cp <= last_glyph) {
-            if (glyphs[cur_cp - first_glyph]) |gi| {
-                try quads.append(alloc, .{ .glyph = .{
-                    .px = ccx + gi.bearing_x,
-                    .py = ccy + ascent_i - gi.bearing_y,
-                    .sx = gi.region.x,
-                    .sy = gi.region.y,
-                    .sw = gi.region.width,
-                    .sh = gi.region.height,
-                    .r = text_color[0],
-                    .g = text_color[1],
-                    .b = text_color[2],
-                } });
+        // A solid block hides the glyph beneath it; re-draw it in the cursor
+        // text color (default: the cell's background, so the cell inverts).
+        if (ft) {
+            if (cs == .block) {
+                if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
+                    const cp = gc.cell.codepoint();
+                    if (cp >= first_drawable) {
+                        if (cache.get(cp)) |gi| {
+                            const cur_bg = if (gc.style().bg(gc.cell, palette)) |c| c else theme.bg;
+                            const text_color = cursor_render.text orelse rgbf(cur_bg);
+                            try quads.append(alloc, .{ .glyph = .{
+                                .px = ccx + gi.bearing_x,
+                                .py = ccy + ascent_i - gi.bearing_y,
+                                .sx = gi.region.x,
+                                .sy = gi.region.y,
+                                .sw = gi.region.width,
+                                .sh = gi.region.height,
+                                .r = text_color[0],
+                                .g = text_color[1],
+                                .b = text_color[2],
+                            } });
+                        }
+                    }
+                }
             }
         }
     }

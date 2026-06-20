@@ -13,6 +13,7 @@
 const std = @import("std");
 const gl = @import("renderer/OpenGL.zig");
 const cursor = @import("renderer/cursor.zig");
+const GlyphCache = @import("font/GlyphCache.zig");
 const font = @import("font/main.zig");
 const Atlas = @import("font/Atlas.zig");
 
@@ -431,5 +432,61 @@ pub fn main() !void {
             return error.AlphaBlendWrong;
         }
         out.print("[proof] PASS: per-quad alpha 0.5 blended correctly (faint / cursor-opacity path)\n", .{});
+    }
+
+    // --- Glyph cache proof (#66): non-ASCII rasterized on demand ----------
+    // The real `font/GlyphCache.zig` must rasterize and pack an arbitrary
+    // codepoint (here U+2500 BOX DRAWINGS LIGHT HORIZONTAL) on demand, and that
+    // glyph must reach lit pixels through the real shader/atlas path. Proves the
+    // renderer is no longer ASCII-only, independent of the Win32 wrapper.
+    {
+        var cache = try GlyphCache.init(alloc, font_path, 32, 512);
+        defer cache.deinit();
+
+        if (cache.get('A') == null) return error.NoAsciiGlyph;
+        const box = cache.get(0x2500) orelse return error.NoBoxGlyph;
+        if (!cache.takeDirty()) return error.CacheNotDirty;
+        out.print("[proof] glyphcache: 'A' + U+2500 packed on demand (atlas {d})\n", .{cache.atlas.size});
+
+        // Upload the cache's atlas and render the box-drawing glyph.
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
+
+        var gverts: std.ArrayList(gl.Vertex) = .empty;
+        defer gverts.deinit(alloc);
+        try gl.pushQuad(&gverts, alloc, .{
+            .px = 10,
+            .py = 10,
+            .sx = box.region.x,
+            .sy = box.region.y,
+            .sw = box.region.width,
+            .sh = box.region.height,
+            .r = 1,
+            .g = 1,
+            .b = 1,
+        }, screen_w, screen_h, cache.atlas.size);
+
+        g.clearColor(clear[0], clear[1], clear[2], 1.0);
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.bufferData(GL_ARRAY_BUFFER, @intCast(gverts.items.len * @sizeOf(gl.Vertex)), gverts.items.ptr, GL_DYNAMIC_DRAW);
+        g.drawArrays(GL_TRIANGLES, 0, @intCast(gverts.items.len));
+        g.finish();
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+
+        var glit: usize = 0;
+        var q: usize = 0;
+        while (q < n) : (q += 1) {
+            const r: i16 = buf[q * 4];
+            const gg: i16 = buf[q * 4 + 1];
+            const b: i16 = buf[q * 4 + 2];
+            if (@abs(r - cr) > 2 or @abs(gg - cg) > 2 or @abs(b - cb) > 2) glit += 1;
+        }
+        out.print("[proof] glyphcache: U+2500 lit pixels = {d}\n", .{glit});
+        if (glit == 0) {
+            out.print("[proof] FAIL: non-ASCII glyph rendered blank\n", .{});
+            return error.NonAsciiGlyphBlank;
+        }
+        out.print("[proof] PASS: non-ASCII glyph U+2500 rasterized on demand to {d} lit pixels\n", .{glit});
     }
 }

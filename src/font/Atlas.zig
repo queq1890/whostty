@@ -14,6 +14,15 @@ pub const Region = struct {
     height: u32,
 };
 
+/// A rasterized glyph's place in the atlas plus its pen-origin bearings. This is
+/// the unit the renderer needs to emit a glyph quad; it carries no Freetype
+/// dependency so both the font-enabled and bring-up builds can name the type.
+pub const Placement = struct {
+    region: Region,
+    bearing_x: i32 = 0,
+    bearing_y: i32 = 0,
+};
+
 pub const Error = error{AtlasFull};
 
 /// Square, single-channel pixel store (row-major, 1 byte per texel).
