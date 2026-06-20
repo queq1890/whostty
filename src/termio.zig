@@ -28,16 +28,21 @@ const ResponseHandler = struct {
     inner: gvt.ReadonlyHandler,
     /// Pending reply bytes owed to the pty; points into the owning `Termio`.
     response: *std.ArrayListUnmanaged(u8),
+    /// Pending OSC 52 clipboard write (decoded, owned); points into `Termio`.
+    /// The UI thread drains it because clipboard access needs the window.
+    clipboard_write: *?[]u8,
     alloc: std.mem.Allocator,
 
     fn init(
         terminal: *gvt.Terminal,
         response: *std.ArrayListUnmanaged(u8),
+        clipboard_write: *?[]u8,
         alloc: std.mem.Allocator,
     ) ResponseHandler {
         return .{
             .inner = gvt.ReadonlyHandler.init(terminal),
             .response = response,
+            .clipboard_write = clipboard_write,
             .alloc = alloc,
         };
     }
@@ -59,6 +64,7 @@ const ResponseHandler = struct {
             .request_mode => try self.requestMode(value.mode),
             .request_mode_unknown => try self.requestModeUnknown(value),
             .color_operation => try self.colorOperation(value),
+            .clipboard_contents => self.clipboardContents(value),
 
             // ENQ falls through: ghostty's default `enquiry-response` is the
             // empty string, so replying with nothing (the readonly handler's
@@ -177,6 +183,39 @@ const ResponseHandler = struct {
             try self.reply(body);
         }
     }
+
+    /// OSC 52 — clipboard set/get.
+    ///
+    /// - A **read** request (`data == "?"`) is **denied** for privacy: answering
+    ///   it would let any program exfiltrate the clipboard.
+    /// - A **write** decodes the base64 payload and queues the text for the UI
+    ///   thread, which owns clipboard access; the latest write wins. An **empty**
+    ///   payload decodes to an empty string, which is the spec's "clear the
+    ///   clipboard" form (ghostty does the same). Bad base64 or OOM drops the
+    ///   write (best-effort, never fatal).
+    ///
+    /// The write direction is currently **always allowed** — whostty has no
+    /// clipboard-write access policy (allow/ask/deny) yet; both that and a config
+    /// to permit reads are deferred (#50). The `kind` (clipboard selection) is
+    /// ignored — we always use the standard clipboard, matching ghostty.
+    fn clipboardContents(self: *ResponseHandler, cc: gvt.StreamAction.Value(.clipboard_contents)) void {
+        if (cc.data.len == 1 and cc.data[0] == '?') return; // read denied
+        const dec = std.base64.standard.Decoder;
+        const n = dec.calcSizeForSlice(cc.data) catch return;
+        const buf = self.alloc.alloc(u8, n) catch return;
+        dec.decode(buf, cc.data) catch |err| switch (err) {
+            // Non-canonical trailing bits: the decoded prefix is valid and fully
+            // written, so keep it — matching ghostty, which accepts this because
+            // some encoders emit it for otherwise-fine data.
+            error.InvalidPadding => {},
+            else => {
+                self.alloc.free(buf);
+                return;
+            },
+        };
+        if (self.clipboard_write.*) |old| self.alloc.free(old);
+        self.clipboard_write.* = buf;
+    }
 };
 
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
@@ -194,6 +233,10 @@ pub const Termio = struct {
     /// `mutex` since `process` (reader thread) and `takeResponse` (UI thread)
     /// touch it from different threads.
     response: std.ArrayListUnmanaged(u8),
+    /// Pending OSC 52 clipboard write (decoded text, owned by `alloc`), filled
+    /// by the handler and drained by `takeClipboardWrite` on the UI thread.
+    /// Latest write wins. Guarded by `mutex`.
+    clipboard_write: ?[]u8,
     /// Guards `terminal`: the reader thread mutates it via `process`, the
     /// renderer reads it. Lock with `lock`/`unlock` around grid access.
     mutex: std.Thread.Mutex,
@@ -213,6 +256,7 @@ pub const Termio = struct {
         self.alloc = alloc;
         self.mutex = .{};
         self.response = .empty;
+        self.clipboard_write = null;
         self.sel_anchor = null;
         self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
@@ -222,11 +266,11 @@ pub const Termio = struct {
         });
         errdefer self.terminal.deinit(alloc);
 
-        // The handler holds &self.terminal and &self.response, both stable
-        // because `self` is heap-allocated and never moved.
+        // The handler holds pointers into `self` (terminal, response,
+        // clipboard_write), all stable because `self` is heap-allocated.
         self.stream = vt.Stream(ResponseHandler).initAlloc(
             alloc,
-            ResponseHandler.init(&self.terminal, &self.response, alloc),
+            ResponseHandler.init(&self.terminal, &self.response, &self.clipboard_write, alloc),
         );
         return self;
     }
@@ -235,8 +279,20 @@ pub const Termio = struct {
         const alloc = self.alloc;
         self.stream.deinit();
         self.response.deinit(alloc);
+        if (self.clipboard_write) |c| alloc.free(c);
         self.terminal.deinit(alloc);
         alloc.destroy(self);
+    }
+
+    /// Take the pending OSC 52 clipboard write, if any; ownership transfers to
+    /// the caller (free with the same allocator). The caller writes it to the
+    /// system clipboard (a UI-thread operation). Thread-safe.
+    pub fn takeClipboardWrite(self: *Termio) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const c = self.clipboard_write;
+        self.clipboard_write = null;
+        return c;
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -683,6 +739,76 @@ test "termio: OSC 12 cursor query reports seed then OSC override" {
         "\x1b]12;rgb:eeee/dddd/cccc\x07",
         try replyTo(io, "\x1b]12;?\x07", &buf),
     );
+}
+
+test "termio: OSC 52 write decodes base64 and queues it for the UI thread" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // "aGVsbG8=" is base64 for "hello".
+    try io.process("\x1b]52;c;aGVsbG8=\x07");
+    const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("hello", got);
+    // Draining clears it.
+    try std.testing.expect(io.takeClipboardWrite() == null);
+}
+
+test "termio: OSC 52 latest write wins" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("\x1b]52;c;Zmlyc3Q=\x07"); // "first"
+    try io.process("\x1b]52;c;c2Vjb25k\x07"); // "second"
+    const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("second", got);
+}
+
+test "termio: OSC 52 read is denied (no reply, no clipboard op)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("", try replyTo(io, "\x1b]52;c;?\x07", &buf));
+    try std.testing.expect(io.takeClipboardWrite() == null);
+}
+
+test "termio: OSC 52 invalid base64 is dropped" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("\x1b]52;c;!!!notbase64!!!\x07");
+    try std.testing.expect(io.takeClipboardWrite() == null);
+}
+
+test "termio: OSC 52 accepts non-canonical padding like ghostty" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // "aa==" has non-canonical trailing bits (InvalidPadding) but a valid
+    // leading byte (0x69 = 'i'); ghostty keeps it, so we do too.
+    try io.process("\x1b]52;c;aa==\x07");
+    const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("i", got);
+}
+
+test "termio: OSC 52 empty payload clears the clipboard" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Empty (non-"?") payload is the spec's clear form: a zero-length write.
+    try io.process("\x1b]52;c;\x07");
+    const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    defer alloc.free(got);
+    try std.testing.expectEqual(@as(usize, 0), got.len);
 }
 
 test "termio: focus reporting follows DEC mode 1004" {
