@@ -395,4 +395,41 @@ pub fn main() !void {
         }
         out.print("[proof] PASS: block cursor (shapeQuads -> pushSolid) rasterized {d} red pixels\n", .{red});
     }
+
+    // --- Translucency proof (#70 faint / cursor-opacity) ------------------
+    // A white solid at alpha 0.5 over the dark clear must blend to ~halfway:
+    // out = 0.5*1.0 + 0.5*clear. This validates the per-quad alpha blend that
+    // faint (dim) text and cursor-opacity depend on, end-to-end on real GL.
+    {
+        var tverts: std.ArrayList(gl.Vertex) = .empty;
+        defer tverts.deinit(alloc);
+        try gl.pushSolid(&tverts, alloc, .{ .px = 4, .py = 4, .w = 16, .h = 16, .r = 1, .g = 1, .b = 1, .a = 0.5 }, screen_w, screen_h);
+
+        g.clearColor(clear[0], clear[1], clear[2], 1.0);
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.bufferData(GL_ARRAY_BUFFER, @intCast(tverts.items.len * @sizeOf(gl.Vertex)), tverts.items.ptr, GL_DYNAMIC_DRAW);
+        g.drawArrays(GL_TRIANGLES, 0, @intCast(tverts.items.len));
+        g.finish();
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+
+        // Expected blended red channel = 0.5*255 + 0.5*(clear[0]*255).
+        const want: f64 = 0.5 * 255.0 + 0.5 * (@as(f64, clear[0]) * 255.0);
+        var found = false;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const r: f64 = @floatFromInt(buf[k * 4]);
+            // The blended fill is distinctly brighter than the clear but well
+            // below opaque white; assert a pixel near the predicted midpoint.
+            if (@abs(r - want) <= 8) {
+                found = true;
+                break;
+            }
+        }
+        out.print("[proof] translucency: want blended R~={d:.0}; matched={}\n", .{ want, found });
+        if (!found) {
+            out.print("[proof] FAIL: alpha 0.5 fill did not blend to the predicted midpoint\n", .{});
+            return error.AlphaBlendWrong;
+        }
+        out.print("[proof] PASS: per-quad alpha 0.5 blended correctly (faint / cursor-opacity path)\n", .{});
+    }
 }
