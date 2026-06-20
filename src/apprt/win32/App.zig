@@ -169,7 +169,6 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // --- ConPTY + shell ---
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
     var child = try pty.spawn(alloc, opts.command orelse shellCommandLine());
-    log.info("[diag] spawned shell; grid {d}x{d}", .{ grid0.cols, grid0.rows });
     const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
 
     // --- Reader thread: pty -> libghostty-vt ---
@@ -295,14 +294,8 @@ fn shellCommandLine() []const u8 {
 
 fn readerLoop(pty: *Pty, io: *Termio, stop: *std.atomic.Value(bool)) void {
     var buf: [4096]u8 = undefined;
-    var total: usize = 0;
     while (!stop.load(.monotonic)) {
-        const n = pty.read(&buf) catch |e| {
-            log.info("[diag] reader stopped: {s} (total={d} bytes)", .{ @errorName(e), total });
-            break;
-        };
-        if (total == 0) log.info("[diag] reader first read: {d} bytes", .{n});
-        total += n;
+        const n = pty.read(&buf) catch break;
         io.process(buf[0..n]) catch {};
     }
 }
