@@ -172,6 +172,11 @@ pub const Window = struct {
         _ = w.wglMakeCurrent(self.hdc, self.hglrc);
     }
 
+    /// The native window handle (for synchronous Win32 calls like the clipboard).
+    pub fn handle(self: *Window) w.HWND {
+        return self.hwnd;
+    }
+
     pub fn swapBuffers(self: *Window) void {
         _ = w.SwapBuffers(self.hdc);
     }

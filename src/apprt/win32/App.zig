@@ -212,7 +212,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
             .key => |k| {
                 // A bound chord is consumed as an action; otherwise it's a
                 // normal key written to the shell.
-                if (handleKeybind(k, &binds, io, sfc.rows)) continue;
+                const ctx: KeybindCtx = .{
+                    .binds = &binds,
+                    .io = io,
+                    .rows = sfc.rows,
+                    .alloc = alloc,
+                    .win = win,
+                    .pty = &pty,
+                };
+                if (handleKeybind(k, ctx)) continue;
                 io.scrollToBottom();
                 writeKey(&pty, k.vk);
             },
@@ -275,9 +283,20 @@ fn writeKey(pty: *Pty, code: u32) void {
     if (out.len > 0) _ = pty.write(out) catch {};
 }
 
+/// Context a keybind action needs: the binding set, the terminal io, and the
+/// window/pty/allocator that clipboard actions reach into.
+const KeybindCtx = struct {
+    binds: *const binding.Set,
+    io: *Termio,
+    rows: u16,
+    alloc: std.mem.Allocator,
+    win: *Window,
+    pty: *Pty,
+};
+
 /// Look up a key event in the binding set and run the bound action. Returns true
 /// if a binding matched and was handled (so the key is not also sent to the pty).
-fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) bool {
+fn handleKeybind(k: anytype, ctx: KeybindCtx) bool {
     const key = keymap.keyFromVk(k.vk) orelse return false;
     const trigger: binding.Trigger = .{ .key = key, .mods = .{
         .ctrl = k.mods.ctrl,
@@ -285,24 +304,67 @@ fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) 
         .alt = k.mods.alt,
         .super = k.mods.super,
     } };
-    const action = binds.get(trigger) orelse return false;
-    dispatchAction(action, io, rows);
+    const action = ctx.binds.get(trigger) orelse return false;
+    dispatchAction(action, ctx);
     return true;
 }
 
-/// Run a bound action. Scrollback actions act on the single current surface;
-/// split/tab actions are recognized but need multi-surface support (#18) before
-/// they can do anything, so they're logged for now.
-fn dispatchAction(action: binding.Action, io: *Termio, rows: u16) void {
+/// Run a bound action. Scrollback + clipboard actions act on the single current
+/// surface; split/tab actions are recognized but need multi-surface support
+/// (#18) before they can do anything, so they're logged for now.
+fn dispatchAction(action: binding.Action, ctx: KeybindCtx) void {
     switch (action) {
-        .scroll_page_up => io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(rows)))),
-        .scroll_page_down => io.scrollViewport(@as(isize, @intCast(scroll.pageRows(rows)))),
-        .scroll_to_bottom => io.scrollToBottom(),
-        .scroll_to_top => io.scrollViewport(-1_000_000), // clamps at the top of history
+        .scroll_page_up => ctx.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
+        .scroll_page_down => ctx.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
+        .scroll_to_bottom => ctx.io.scrollToBottom(),
+        .scroll_to_top => ctx.io.scrollViewport(-1_000_000), // clamps at the top of history
+        .copy_to_clipboard => copyToClipboard(ctx),
+        .paste_from_clipboard => pasteFromClipboard(ctx),
         .new_split, .goto_split, .new_tab, .close_surface, .next_tab, .previous_tab, .goto_tab => {
             log.debug("keybind action '{s}' needs multi-surface support (not yet wired)", .{@tagName(std.meta.activeTag(action))});
         },
     }
+}
+
+/// Paste the system clipboard into the shell. Reads CF_UNICODETEXT, encodes via
+/// libghostty-vt's paste encoder (strips unsafe bytes, applies bracketed-paste
+/// fenceposts when mode 2004 is on), and writes the result to the pty.
+fn pasteFromClipboard(ctx: KeybindCtx) void {
+    const text = (w.clipboardRead(ctx.alloc, ctx.win.handle()) catch return) orelse return;
+    defer ctx.alloc.free(text);
+    if (text.len == 0) return;
+
+    const bracketed = blk: {
+        ctx.io.lock();
+        defer ctx.io.unlock();
+        break :blk ctx.io.terminal.modes.get(.bracketed_paste);
+    };
+
+    ctx.io.scrollToBottom();
+
+    // encodePaste mutates the buffer in place (control-byte stripping / \n->\r),
+    // so pass a mutable copy to use the infallible []u8 overload.
+    const buf = ctx.alloc.dupe(u8, text) catch return;
+    defer ctx.alloc.free(buf);
+    const parts = vt.input.encodePaste(buf, .{ .bracketed = bracketed });
+    for (parts) |part| {
+        if (part.len > 0) _ = ctx.pty.write(part) catch {};
+    }
+}
+
+/// Copy the current selection to the system clipboard. A no-op when there is no
+/// selection (selection is set by mouse-drag, #51).
+fn copyToClipboard(ctx: KeybindCtx) void {
+    const text = blk: {
+        ctx.io.lock();
+        defer ctx.io.unlock();
+        const screen = ctx.io.terminal.screens.active; // *Screen
+        const sel = screen.selection orelse break :blk null;
+        break :blk screen.selectionString(ctx.alloc, .{ .sel = sel, .trim = true }) catch null;
+    } orelse return;
+    defer ctx.alloc.free(text);
+    if (text.len == 0) return;
+    w.clipboardWrite(ctx.alloc, ctx.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
 }
 
 /// Build the per-glyph atlas for printable ASCII via Freetype. Only compiled

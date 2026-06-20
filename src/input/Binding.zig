@@ -88,6 +88,8 @@ pub const Action = union(enum) {
     scroll_page_down,
     scroll_to_top,
     scroll_to_bottom,
+    copy_to_clipboard,
+    paste_from_clipboard,
 };
 
 /// A parsed `trigger = action` binding.
@@ -207,6 +209,8 @@ pub fn parseAction(input: []const u8) ParseError!Action {
     if (eqlIgnoreCase(name, "scroll_page_down")) return .scroll_page_down;
     if (eqlIgnoreCase(name, "scroll_to_top")) return .scroll_to_top;
     if (eqlIgnoreCase(name, "scroll_to_bottom")) return .scroll_to_bottom;
+    if (eqlIgnoreCase(name, "copy_to_clipboard")) return .copy_to_clipboard;
+    if (eqlIgnoreCase(name, "paste_from_clipboard")) return .paste_from_clipboard;
     return error.InvalidAction;
 }
 
@@ -279,6 +283,8 @@ pub fn addDefaults(set: *Set, alloc: std.mem.Allocator) !void {
         "alt+up=goto_split:up",
         "shift+pageup=scroll_page_up",
         "shift+pagedown=scroll_page_down",
+        "ctrl+shift+c=copy_to_clipboard",
+        "ctrl+shift+v=paste_from_clipboard",
     };
     for (lines) |line| try set.putLine(alloc, line);
 }
@@ -321,6 +327,8 @@ test "binding: parse actions with and without arguments" {
     try testing.expectEqual(Action.next_tab, try parseAction("next_tab"));
     try testing.expectEqual(Action{ .goto_tab = 3 }, try parseAction("goto_tab:3"));
     try testing.expectEqual(Action.scroll_to_bottom, try parseAction("scroll_to_bottom"));
+    try testing.expectEqual(Action.copy_to_clipboard, try parseAction("copy_to_clipboard"));
+    try testing.expectEqual(Action.paste_from_clipboard, try parseAction("paste_from_clipboard"));
 }
 
 test "binding: bad actions error" {

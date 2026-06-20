@@ -7,6 +7,7 @@
 //! to attach a child process to a pseudo console. Plain data types are reused
 //! from std.os.windows.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const windows = std.os.windows;
 
@@ -295,6 +296,96 @@ pub extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
 pub extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, hglrc: ?HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
 pub extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+// --- Clipboard (CF_UNICODETEXT) --------------------------------------------
+
+pub const CF_UNICODETEXT: UINT = 13;
+pub const GMEM_MOVEABLE: UINT = 0x0002;
+pub const HGLOBAL = HANDLE;
+
+pub extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+pub extern "user32" fn GetClipboardData(uFormat: UINT) callconv(.winapi) ?HANDLE;
+pub extern "user32" fn SetClipboardData(uFormat: UINT, hMem: HANDLE) callconv(.winapi) ?HANDLE;
+pub extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: SIZE_T) callconv(.winapi) ?HGLOBAL;
+pub extern "kernel32" fn GlobalFree(hMem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
+pub extern "kernel32" fn GlobalLock(hMem: HGLOBAL) callconv(.winapi) ?LPVOID;
+pub extern "kernel32" fn GlobalUnlock(hMem: HGLOBAL) callconv(.winapi) BOOL;
+
+pub const ClipboardError = error{ Unsupported, OpenFailed, AllocFailed, SetFailed, OutOfMemory };
+
+/// UTF-8 -> allocated NUL-terminated UTF-16LE. Pure (no Win32); host-testable.
+pub fn utf8ToUtf16AllocZ(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, s);
+}
+
+/// NUL-terminated UTF-16LE -> allocated UTF-8. Pure (no Win32); host-testable.
+pub fn utf16ZToUtf8Alloc(alloc: std.mem.Allocator, w: [*:0]const u16) ![]u8 {
+    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.sliceTo(w, 0));
+}
+
+/// Read CF_UNICODETEXT as UTF-8. Caller owns the result. Returns null when the
+/// clipboard holds no text (lets a paste keybind no-op cleanly). Win32-only;
+/// link-checked but only reached from the Windows apprt.
+pub fn clipboardRead(alloc: std.mem.Allocator, hwnd: HWND) ClipboardError!?[]u8 {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == FALSE) return null;
+    if (OpenClipboard(hwnd) == FALSE) return error.OpenFailed;
+    defer _ = CloseClipboard();
+    const h = GetClipboardData(CF_UNICODETEXT) orelse return null;
+    const ptr = GlobalLock(h) orelse return null;
+    defer _ = GlobalUnlock(h);
+    const wptr: [*:0]const u16 = @ptrCast(@alignCast(ptr));
+    // Conversion failure (malformed clipboard) is treated as "nothing to paste".
+    return utf16ZToUtf8Alloc(alloc, wptr) catch null;
+}
+
+/// Write UTF-8 to CF_UNICODETEXT. Allocates an HGLOBAL the OS takes ownership of
+/// on success (so it is not freed then). Win32-only.
+pub fn clipboardWrite(alloc: std.mem.Allocator, hwnd: HWND, utf8: []const u8) ClipboardError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const wide = utf8ToUtf16AllocZ(alloc, utf8) catch return error.OutOfMemory;
+    defer alloc.free(wide);
+
+    const bytes: SIZE_T = (wide.len + 1) * @sizeOf(u16);
+    const hmem = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse return error.AllocFailed;
+    {
+        const dst = GlobalLock(hmem) orelse {
+            _ = GlobalFree(hmem);
+            return error.AllocFailed;
+        };
+        const dst_u16: [*]u16 = @ptrCast(@alignCast(dst));
+        @memcpy(dst_u16[0..wide.len], wide[0..wide.len]);
+        dst_u16[wide.len] = 0;
+        _ = GlobalUnlock(hmem);
+    }
+
+    if (OpenClipboard(hwnd) == FALSE) {
+        _ = GlobalFree(hmem);
+        return error.OpenFailed;
+    }
+    defer _ = CloseClipboard();
+    _ = EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, hmem) == null) {
+        _ = GlobalFree(hmem); // still owned by us on failure
+        return error.SetFailed;
+    }
+    // Success: the clipboard now owns hmem; do NOT free it.
+}
+
+test "clipboard: utf8<->utf16 round-trips, including multibyte" {
+    const alloc = std.testing.allocator;
+    const samples = [_][]const u8{ "hello", "caf\xc3\xa9", "\xe6\x97\xa5\xe6\x9c\xac", "a\r\nb" };
+    for (samples) |s| {
+        const wide = try utf8ToUtf16AllocZ(alloc, s);
+        defer alloc.free(wide);
+        const back = try utf16ZToUtf8Alloc(alloc, wide.ptr);
+        defer alloc.free(back);
+        try std.testing.expectEqualStrings(s, back);
+    }
+}
 
 // WGL_ARB_create_context: request a specific GL version/profile. Resolved at
 // runtime via wglGetProcAddress (it has no opengl32 import-library export). The
