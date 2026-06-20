@@ -357,6 +357,13 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             _ = pty.write(resp_buf[0..n]) catch {};
         }
 
+        // Drain a pending OSC 52 clipboard write (decoded on the reader thread)
+        // to the system clipboard, which is a UI-thread operation.
+        if (io.takeClipboardWrite()) |text| {
+            defer alloc.free(text);
+            w.clipboardWrite(alloc, win.handle(), text) catch {};
+        }
+
         const sz = win.clientSize();
         const blink_visible = blk: {
             if (blink_timer) |*t| break :blk (t.read() / blink_interval_ns) % 2 == 0;
