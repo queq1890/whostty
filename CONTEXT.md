@@ -53,6 +53,30 @@ porting checklist. It derives the last-handled tag from existing
 `ghostty-release`-labeled issues and does not write to the repo.
 _Avoid_: cron, GitHub Actions (this project uses a Routine, not CI polling)
 
+**parity (the goal)**:
+"Operate this repo like ghostty" resolves to **full feature parity** with
+ghostty: every ghostty `src/` path not delegated to libghostty-vt is eventually
+ported. Nothing under `src/` is permanently out of scope — items previously
+called "excluded" are merely **deferred**. This is the north star, not a
+near-term milestone; work is sequenced by daily-driver criticality (host-gate →
+usable-terminal wiring → quality/native backends → ecosystem).
+_Avoid_: "operations posture only", "MVP" (both were rejected framings)
+
+**completeness ledger**:
+PORTING.md's role under the parity goal: the single source of truth for "what
+must exist." Completeness is mechanically checkable —
+`ghostty v1.3.1 src/ tree − (delegated ∪ ledger rows) = unfiled gap`. An item is
+"filed" only when it is a not-done ledger row **with a linked issue**.
+
+**host-gate**:
+The single root dependency blocking all on-device work (render proof, on-device
+verification, and the native D3D11 / DirectWrite / Harfbuzz backends): the lack
+of a reliable Windows dev host where a freshly-built **unsigned** exe can launch
+(Device Guard / WDAC blocks it). Code-signing resolves it and is reused as
+distribution signing.
+_Avoid_: treating render-proof, native backends, and signing as separate
+unrelated blockers — they share this one dependency.
+
 ## Relationships
 
 - **whostty** mirrors **ghostty**'s structure but depends on **libghostty-vt** and does not reimplement the VT core
@@ -64,3 +88,4 @@ _Avoid_: cron, GitHub Actions (this project uses a Routine, not CI polling)
 
 - "Same philosophy as the Bun Rust port" initially looked like a **language (Rust)** decision, but was resolved as a metaphor for the **development method** (fast, faithful porting via dynamic workflows + adversarial review). The implementation language stays **Zig**.
 - The tension between "mirror the directory structure completely" and "use libghostty-vt" was resolved with the **hybrid** approach (mirror structure; depend on the library only for the VT core).
+- "Operate this repo like ghostty" was ambiguous between matching ghostty's **operations posture** (CI + Release Routine + faithful-port flow) and full **feature parity**. Resolved as **parity** (north star): the whole in-scope ghostty `src/` surface is tracked via the **completeness ledger**, and PORTING.md's "excluded (for now)" list becomes **deferred-but-tracked** rows.
