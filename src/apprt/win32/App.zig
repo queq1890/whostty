@@ -121,8 +121,6 @@ fn cfgColor(c: ?config.Color) ?[3]f32 {
 const CursorRender = struct {
     focused: bool,
     blink_visible: bool,
-    /// Cursor fill color; null derives it from the cell's foreground.
-    color: ?[3]f32,
     /// Block-cursor text color; null derives it from the cell's background.
     text: ?[3]f32,
     opacity: f32,
@@ -212,6 +210,9 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
     var child = try pty.spawn(alloc, opts.command orelse shellCommandLine());
     const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
+    // Prime the terminal's dynamic colors with the configured defaults so OSC
+    // 10/11/12/4 changes and queries resolve against `terminal.colors` (#83).
+    io.seedColors(theme.fg, theme.bg, if (cfg.cursor_color) |c| toVtRgb(c) else null, &theme.palette);
 
     // --- Reader thread: pty -> libghostty-vt ---
     var stop = std.atomic.Value(bool).init(false);
@@ -267,10 +268,10 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // If no monotonic clock is available, the cursor is treated as always-on.
     const blink_interval_ns: u64 = 600 * std.time.ns_per_ms;
     var blink_timer: ?std.time.Timer = std.time.Timer.start() catch null;
-    // Configured cursor colors/opacity are constant for the run; focus + blink
-    // vary per frame. Thickness scales with the cell height.
+    // The cursor's fill color lives in `terminal.colors.cursor` (seeded from
+    // config, overridable by OSC 12), read per-frame in buildQuads. The text
+    // color and thickness are constant for the run; focus + blink vary per frame.
     const cursor_thickness: u32 = @max(1, cell_h / 10);
-    const cursor_color = cfgColor(cfg.cursor_color);
     const cursor_text = cfgColor(cfg.cursor_text);
 
     while (win.pump()) {
@@ -356,7 +357,6 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         const cursor_render: CursorRender = .{
             .focused = focused,
             .blink_visible = blink_visible,
-            .color = cursor_color,
             .text = cursor_text,
             .opacity = cfg.cursor_opacity,
             .thickness = cursor_thickness,
@@ -365,10 +365,13 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         // buildQuads may have packed new glyphs into the atlas; re-upload before
         // drawing so the texture has them.
         if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
-        try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
+        // Default-background cells show through the clear color, so it must track
+        // the OSC 11 background override (falling back to the configured bg).
+        const clear_bg = rgbf(io.backgroundColor(theme.bg));
+        try renderer.draw(quads.items, clear_bg, sz.width, sz.height);
 
         frame += 1;
-        if (render_debug and frame == 10) renderer.debugCountLitPixels(rgbf(theme.bg), sz.width, sz.height);
+        if (render_debug and frame == 10) renderer.debugCountLitPixels(clear_bg, sz.width, sz.height);
 
         win.swapBuffers();
     }
@@ -516,7 +519,12 @@ fn buildQuads(
     const term = &io.terminal;
     const screen = term.screens.active;
     const sel = screen.selection;
-    const palette = &theme.palette;
+    // Effective default colors come from `terminal.colors` (seeded from config,
+    // overridable at runtime via OSC 10/11/4), so dynamic-color changes render.
+    // `seedColors` primes these, so the `orelse` is only a defensive fallback.
+    const palette = &term.colors.palette.current;
+    const eff_fg = term.colors.foreground.get() orelse theme.fg;
+    const eff_bg = term.colors.background.get() orelse theme.bg;
     const rows: u32 = term.rows;
     const cols: u32 = term.cols;
     const line_h: u32 = @max(1, cell_h / 16);
@@ -535,12 +543,12 @@ fn buildQuads(
 
             // Resolve fg/bg against the configured theme, then apply inverse
             // video by swapping them.
-            const fg_rgb = style.fg(.{ .default = theme.fg, .palette = palette });
+            const fg_rgb = style.fg(.{ .default = eff_fg, .palette = palette });
             var fg = rgbf(fg_rgb);
             var bg: ?[3]f32 = if (style.bg(cell, palette)) |c| rgbf(c) else null;
             if (style.flags.inverse) {
                 const old_fg = fg;
-                fg = bg orelse rgbf(theme.bg);
+                fg = bg orelse rgbf(eff_bg);
                 bg = old_fg;
             }
 
@@ -556,7 +564,7 @@ fn buildQuads(
             // whostty's atlas is ASCII-only today (none of those codepoints), so
             // that exemption is deferred with the sprite work (#66/#71).
             if (theme.min_contrast > 1) {
-                fg = rcolor.contrastedColor(fg, bg orelse rgbf(theme.bg), theme.min_contrast);
+                fg = rcolor.contrastedColor(fg, bg orelse rgbf(eff_bg), theme.min_contrast);
             }
 
             // Selection highlight overrides the cell colors (reverse-video by
@@ -676,12 +684,13 @@ fn buildQuads(
         const ccx: i32 = @intCast(cx * cell_w);
         const ccy: i32 = @intCast(cy * cell_h);
 
-        // Default cursor fill = the cell's foreground.
-        var cur_fg = theme.fg;
+        // Cursor fill: the configured/OSC-12 cursor color if set (so OSC 12
+        // both answers queries and renders), else the cell's foreground.
+        var cur_fg = eff_fg;
         if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
-            cur_fg = gc.style().fg(.{ .default = theme.fg, .palette = palette });
+            cur_fg = gc.style().fg(.{ .default = eff_fg, .palette = palette });
         }
-        const fill = cursor_render.color orelse rgbf(cur_fg);
+        const fill = if (term.colors.cursor.get()) |c| rgbf(c) else rgbf(cur_fg);
 
         try rcursor.shapeQuads(quads, alloc, cs, .{
             .px = ccx,
@@ -699,7 +708,7 @@ fn buildQuads(
                     const cp = gc.cell.codepoint();
                     if (cp >= first_drawable) {
                         if (cache.get(cp)) |gi| {
-                            const cur_bg = if (gc.style().bg(gc.cell, palette)) |c| c else theme.bg;
+                            const cur_bg = if (gc.style().bg(gc.cell, palette)) |c| c else eff_bg;
                             const text_color = cursor_render.text orelse rgbf(cur_bg);
                             try quads.append(alloc, .{ .glyph = .{
                                 .px = ccx + gi.bearing_x,

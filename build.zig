@@ -85,6 +85,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     offscreen.root_module.link_libc = true;
+    // The proof drives a real `Termio` (VT parse -> terminal.colors) for the
+    // dynamic-color render check, so it needs the libghostty-vt module too.
+    offscreen.root_module.addImport("ghostty-vt", ghostty_vt);
     const off_step = b.step("offscreen-proof", "Headless GL render proof (Linux/EGL)");
     if (b.lazyDependency("freetype", .{ .target = native_target, .optimize = optimize })) |dep| {
         offscreen.root_module.addImport("freetype", dep.module("freetype"));
