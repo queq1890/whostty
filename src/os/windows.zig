@@ -228,6 +228,9 @@ pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_CHAR: UINT = 0x0102;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_CREATE: UINT = 0x0001;
+pub const WM_MOUSEMOVE: UINT = 0x0200;
+pub const WM_LBUTTONDOWN: UINT = 0x0201;
+pub const WM_LBUTTONUP: UINT = 0x0202;
 
 pub const PM_REMOVE: UINT = 0x0001;
 
@@ -280,6 +283,8 @@ pub extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;
 pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: INT, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.winapi) LONG_PTR;
+pub extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 
 pub const SHORT = i16;
 pub extern "user32" fn GetKeyState(nVirtKey: INT) callconv(.winapi) SHORT;

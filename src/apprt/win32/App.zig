@@ -46,16 +46,24 @@ const Theme = struct {
     fg: vt.color.RGB,
     bg: vt.color.RGB,
     palette: vt.color.Palette,
+    /// Selection highlight (renderer floats). Defaults to reverse video (the
+    /// cell's fg becomes the selection bg and vice versa) when unconfigured.
+    sel_bg: [3]f32,
+    sel_fg: [3]f32,
 
     fn fromConfig(cfg: *const config.Config) Theme {
         var palette: vt.color.Palette = vt.color.default;
         for (cfg.palette, 0..) |override, i| {
             if (override) |c| palette[i] = toVtRgb(c);
         }
+        const fg = toVtRgb(cfg.foreground);
+        const bg = toVtRgb(cfg.background);
         return .{
-            .fg = toVtRgb(cfg.foreground),
-            .bg = toVtRgb(cfg.background),
+            .fg = fg,
+            .bg = bg,
             .palette = palette,
+            .sel_bg = rgbf(if (cfg.selection_background) |c| toVtRgb(c) else fg),
+            .sel_fg = rgbf(if (cfg.selection_foreground) |c| toVtRgb(c) else bg),
         };
     }
 };
@@ -228,6 +236,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
                 const delta = wheel.feed(raw);
                 if (delta != 0) io.scrollViewport(delta);
             },
+            .mouse_down => |m| sfc.mouseDown(m.x, m.y),
+            .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
+            .mouse_up => |_| sfc.mouseUp(),
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
             .close => closed = true,
         };
@@ -435,6 +446,7 @@ fn buildQuads(
 
     const term = &io.terminal;
     const screen = term.screens.active;
+    const sel = screen.selection;
     const palette = &theme.palette;
     const rows: u32 = term.rows;
     const cols: u32 = term.cols;
@@ -461,6 +473,18 @@ fn buildQuads(
                 const old_fg = fg;
                 fg = bg orelse rgbf(theme.bg);
                 bg = old_fg;
+            }
+
+            // Selection highlight overrides the cell colors (reverse-video by
+            // default). Per-cell containment is fine for whostty's already
+            // per-cell loop; only queried when a selection exists.
+            if (sel) |s| {
+                if (screen.pages.pin(.{ .viewport = .{ .x = @intCast(col), .y = @intCast(row) } })) |p| {
+                    if (s.contains(screen, p)) {
+                        bg = theme.sel_bg;
+                        fg = theme.sel_fg;
+                    }
+                }
             }
 
             const cell_x: i32 = @intCast(col * cell_w);

@@ -84,6 +84,53 @@ pub const Termio = struct {
         self.mutex.unlock();
     }
 
+    // --- Selection (mouse drag -> screen.selection) ------------------------
+    // All locked internally; the selected region lives in the VT core. Pins are
+    // tracked so they survive the reader thread's mutations / scroll / reflow.
+
+    pub const Pin = vt.Pin;
+
+    /// Pin a viewport cell and return a *tracked* pin (stable across mutation),
+    /// or null. Pair every non-null result with `untrackPin`.
+    pub fn pinViewportTracked(self: *Termio, x: u16, y: u16) ?*Pin {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const p = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return null;
+        return screen.pages.trackPin(p) catch null;
+    }
+
+    pub fn untrackPin(self: *Termio, p: *Pin) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.terminal.screens.active.pages.untrackPin(p);
+    }
+
+    /// Set the active selection to span from `anchor` to the given viewport cell.
+    pub fn selectTo(self: *Termio, anchor: *Pin, x: u16, y: u16) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const cur = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
+        screen.select(vt.Selection.init(anchor.*, cur, false)) catch {};
+    }
+
+    pub fn clearSelection(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.terminal.screens.active.clearSelection();
+    }
+
+    /// The current selection as UTF-8 (NUL-terminated), or null if none. Caller
+    /// owns the returned slice.
+    pub fn selectionStringAlloc(self: *Termio, alloc: std.mem.Allocator) !?[:0]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const sel = screen.selection orelse return null;
+        return try screen.selectionString(alloc, .{ .sel = sel, .trim = false });
+    }
+
     /// Dump the active viewport as plain text (used by tests / debug).
     pub fn dumpAlloc(self: *Termio, alloc: std.mem.Allocator) ![]const u8 {
         self.mutex.lock();
@@ -118,6 +165,29 @@ test "termio: escape sequences move the cursor (overwrite)" {
     defer alloc.free(dump);
     const line = std.mem.trimRight(u8, dump, " \n");
     try std.testing.expect(std.mem.startsWith(u8, line, "abXXX"));
+}
+
+test "termio: selection over written cells yields the selected text" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("hello world");
+
+    // No selection initially.
+    try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
+
+    // Select viewport cells (0,0)..(4,0) -> "hello".
+    const anchor = io.pinViewportTracked(0, 0) orelse return error.NoPin;
+    defer io.untrackPin(anchor);
+    io.selectTo(anchor, 4, 0);
+
+    const text = (try io.selectionStringAlloc(alloc)) orelse return error.NoSelection;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("hello", text);
+
+    io.clearSelection();
+    try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
 }
 
 test "termio: resize changes dimensions" {

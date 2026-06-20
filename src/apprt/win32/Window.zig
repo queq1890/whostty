@@ -27,6 +27,12 @@ pub const Event = union(enum) {
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
     /// WHEEL_DELTA), positive when rolled away from the user.
     scroll: i32,
+    /// Left mouse button pressed at client pixel (x, y).
+    mouse_down: struct { x: i32, y: i32 },
+    /// Left mouse button released at client pixel (x, y).
+    mouse_up: struct { x: i32, y: i32 },
+    /// Mouse moved to client pixel (x, y).
+    mouse_move: struct { x: i32, y: i32 },
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
     /// The user requested the window close.
@@ -231,6 +237,14 @@ pub const Window = struct {
         };
     }
 
+    /// Decode the signed client-area x/y packed in a mouse message's lParam.
+    fn mouseXY(lparam: w.LPARAM) struct { x: i32, y: i32 } {
+        const lp: usize = @bitCast(lparam);
+        const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(lp & 0xFFFF))));
+        const y: i32 = @as(i16, @bitCast(@as(u16, @truncate((lp >> 16) & 0xFFFF))));
+        return .{ .x = x, .y = y };
+    }
+
     fn fromHwnd(hwnd: w.HWND) ?*Window {
         const ud = w.GetWindowLongPtrW(hwnd, w.GWLP_USERDATA);
         if (ud == 0) return null;
@@ -269,6 +283,41 @@ pub const Window = struct {
                     // The wheel delta is the signed high word of wParam.
                     const hi: u16 = @truncate((wparam >> 16) & 0xFFFF);
                     s.push(.{ .scroll = @as(i16, @bitCast(hi)) });
+                }
+                return 0;
+            },
+            w.WM_LBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    // Capture so a drag that leaves the window still delivers
+                    // moves/up to this window.
+                    _ = w.SetCapture(hwnd);
+                    s.push(.{ .mouse_down = .{ .x = p.x, .y = p.y } });
+                }
+                return 0;
+            },
+            w.WM_LBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    _ = w.ReleaseCapture();
+                    s.push(.{ .mouse_up = .{ .x = p.x, .y = p.y } });
+                }
+                return 0;
+            },
+            w.WM_MOUSEMOVE => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    // Coalesce: replace a pending trailing move rather than
+                    // flooding the ring during a fast drag (which could push the
+                    // mouse-up out).
+                    if (s.tail > s.head) {
+                        const last = &s.events[(s.tail - 1) % queue_len];
+                        if (std.meta.activeTag(last.*) == .mouse_move) {
+                            last.* = .{ .mouse_move = .{ .x = p.x, .y = p.y } };
+                            return 0;
+                        }
+                    }
+                    s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y } });
                 }
                 return 0;
             },
