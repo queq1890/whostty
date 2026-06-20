@@ -12,6 +12,7 @@
 //! on. Build/run: `zig build offscreen-proof -Dfreetype` on a host with Mesa.
 const std = @import("std");
 const gl = @import("renderer/OpenGL.zig");
+const cursor = @import("renderer/cursor.zig");
 const font = @import("font/main.zig");
 const Atlas = @import("font/Atlas.zig");
 
@@ -265,6 +266,8 @@ pub fn main() !void {
     g.enableVertexAttribArray(2);
     g.vertexAttribPointer(3, 1, GL_FLOAT, 0, stride, @ptrFromInt(@offsetOf(gl.Vertex, "m")));
     g.enableVertexAttribArray(3);
+    g.vertexAttribPointer(4, 1, GL_FLOAT, 0, stride, @ptrFromInt(@offsetOf(gl.Vertex, "a")));
+    g.enableVertexAttribArray(4);
 
     // Atlas texture (same params as Renderer.setAtlas).
     var tex: u32 = 0;
@@ -355,4 +358,41 @@ pub fn main() !void {
         return error.SuspiciousFill;
     }
     out.print("[proof] PASS: real shaders + atlas + Freetype glyphs rasterized to {d} lit pixels (ink atlas={d})\n", .{ lit, ink_atlas });
+
+    // --- Cursor render proof (#69) ----------------------------------------
+    // Exercise the real `renderer/cursor.zig` shapeQuads -> pushSolid -> GL path:
+    // a red block cursor over a 16x16 cell must paint ~256 red pixels. This
+    // proves the cursor reaches the framebuffer (on-device launch is WDAC-
+    // blocked), independent of the Win32/apprt wrapper.
+    {
+        var cq: std.ArrayList(gl.Quad) = .empty;
+        defer cq.deinit(alloc);
+        try cursor.shapeQuads(&cq, alloc, .block, .{ .px = 4, .py = 4, .cell_w = 16, .cell_h = 16, .thickness = 2 }, .{ 1, 0, 0 }, 1.0);
+
+        var cverts: std.ArrayList(gl.Vertex) = .empty;
+        defer cverts.deinit(alloc);
+        for (cq.items) |q| switch (q) {
+            .glyph => |c| try gl.pushQuad(&cverts, alloc, c, screen_w, screen_h, atlas.size),
+            .solid => |rect| try gl.pushSolid(&cverts, alloc, rect, screen_w, screen_h),
+        };
+
+        g.clearColor(clear[0], clear[1], clear[2], 1.0);
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.bufferData(GL_ARRAY_BUFFER, @intCast(cverts.items.len * @sizeOf(gl.Vertex)), cverts.items.ptr, GL_DYNAMIC_DRAW);
+        g.drawArrays(GL_TRIANGLES, 0, @intCast(cverts.items.len));
+        g.finish();
+
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+        var red: usize = 0;
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            if (buf[j * 4] > 200 and buf[j * 4 + 1] < 60 and buf[j * 4 + 2] < 60) red += 1;
+        }
+        out.print("[proof] cursor: red pixels = {d} (expect ~256 for a 16x16 block)\n", .{red});
+        if (red < 150 or red > 400) {
+            out.print("[proof] FAIL: block cursor did not paint its cell\n", .{});
+            return error.CursorNotRendered;
+        }
+        out.print("[proof] PASS: block cursor (shapeQuads -> pushSolid) rasterized {d} red pixels\n", .{red});
+    }
 }

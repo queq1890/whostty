@@ -45,6 +45,9 @@ pub const Event = union(enum) {
     mouse_capture_lost,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
+    /// The window gained (true) or lost (false) keyboard focus. Drives the
+    /// hollow-when-unfocused cursor.
+    focus: bool,
     /// The user requested the window close.
     close,
 };
@@ -270,6 +273,14 @@ pub const Window = struct {
             },
             w.WM_DESTROY => {
                 w.PostQuitMessage(0);
+                return 0;
+            },
+            w.WM_SETFOCUS => {
+                if (self) |s| s.push(.{ .focus = true });
+                return 0;
+            },
+            w.WM_KILLFOCUS => {
+                if (self) |s| s.push(.{ .focus = false });
                 return 0;
             },
             w.WM_SIZE => {

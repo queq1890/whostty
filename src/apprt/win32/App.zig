@@ -15,6 +15,7 @@ const Pty = @import("../../pty.zig").Pty;
 const Termio = @import("../../termio.zig").Termio;
 const Window = @import("Window.zig").Window;
 const gl = @import("../../renderer/OpenGL.zig");
+const rcursor = @import("../../renderer/cursor.zig");
 const input = @import("../../input.zig");
 const surface = @import("../../Surface.zig");
 const Atlas = @import("../../font/Atlas.zig");
@@ -93,6 +94,27 @@ fn resolveColor(c: vt.Style.Color, palette: *const vt.color.Palette, fallback: v
         .rgb => |rgb| rgb,
     };
 }
+
+/// A config color as renderer floats, or null when unset (so the caller derives
+/// a default from the cell under the cursor).
+fn cfgColor(c: ?config.Color) ?[3]f32 {
+    return if (c) |x| rgbf(toVtRgb(x)) else null;
+}
+
+/// Per-frame cursor inputs the renderer needs that don't live in the VT state:
+/// window focus, the blink phase, and the configured cursor colors/opacity. The
+/// VT-owned state (position, DECTCEM, blink mode, style) is read in `buildQuads`.
+const CursorRender = struct {
+    focused: bool,
+    blink_visible: bool,
+    /// Cursor fill color; null derives it from the cell's foreground.
+    color: ?[3]f32,
+    /// Block-cursor text color; null derives it from the cell's background.
+    text: ?[3]f32,
+    opacity: f32,
+    /// Bar width / underline & hollow border thickness, in pixels.
+    thickness: u32,
+};
 
 /// Load the user config from `%APPDATA%\whostty\config`, falling back to
 /// defaults if it is missing or unreadable. font-family discovery is deferred
@@ -216,6 +238,21 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // still letting Ctrl+[ / Ctrl+M / etc. (which have no WM_KEYDOWN path) pass.
     var suppress_next_char = false;
 
+    // --- Cursor render state ---
+    // A freshly shown, foreground window has keyboard focus until told otherwise
+    // (WM_KILLFOCUS). Drives the hollow-when-unfocused cursor.
+    var focused = true;
+    // Blink phase. The interval matches ghostty's default (600ms); the timer is
+    // reset on input so the cursor reappears immediately when the user types.
+    // If no monotonic clock is available, the cursor is treated as always-on.
+    const blink_interval_ns: u64 = 600 * std.time.ns_per_ms;
+    var blink_timer: ?std.time.Timer = std.time.Timer.start() catch null;
+    // Configured cursor colors/opacity are constant for the run; focus + blink
+    // vary per frame. Thickness scales with the cell height.
+    const cursor_thickness: u32 = @max(1, cell_h / 10);
+    const cursor_color = cfgColor(cfg.cursor_color);
+    const cursor_text = cfgColor(cfg.cursor_text);
+
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
@@ -227,6 +264,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                     suppress_next_char = false;
                     continue;
                 }
+                if (blink_timer) |*t| t.reset();
                 io.scrollToBottom();
                 writeChar(&pty, cp);
             },
@@ -238,6 +276,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                     input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
                     else => false,
                 };
+                if (blink_timer) |*t| t.reset();
 
                 // A bound chord is consumed as an action; otherwise it's a
                 // normal key written to the shell.
@@ -272,12 +311,25 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
             .mouse_capture_lost => sfc.endDrag(),
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
+            .focus => |f| focused = f,
             .close => closed = true,
         };
         if (closed) break;
 
         const sz = win.clientSize();
-        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme);
+        const blink_visible = blk: {
+            if (blink_timer) |*t| break :blk (t.read() / blink_interval_ns) % 2 == 0;
+            break :blk true;
+        };
+        const cursor_render: CursorRender = .{
+            .focused = focused,
+            .blink_visible = blink_visible,
+            .color = cursor_color,
+            .text = cursor_text,
+            .opacity = cfg.cursor_opacity,
+            .thickness = cursor_thickness,
+        };
+        try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme, cursor_render);
         try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
 
         frame += 1;
@@ -458,6 +510,7 @@ fn buildQuads(
     cell_h: u32,
     ascent: u32,
     theme: *const Theme,
+    cursor_render: CursorRender,
 ) !void {
     quads.clearRetainingCapacity();
 
@@ -577,6 +630,74 @@ fn buildQuads(
                 .g = fg[1],
                 .b = fg[2],
             } });
+        }
+    }
+
+    // --- Cursor (drawn last, above the cell contents) ---
+    // Map the cursor's active-area position into the viewport. A null point, or
+    // one past the viewport bounds, means the cursor scrolled out of view —
+    // resolveStyle then renders nothing.
+    const cpt = screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*);
+    const cx: u32 = if (cpt) |p| p.viewport.x else 0;
+    const cy: u32 = if (cpt) |p| p.viewport.y else 0;
+    const in_viewport = cpt != null and cx < cols and cy < rows;
+
+    const term_style: rcursor.TermStyle = switch (screen.cursor.cursor_style) {
+        .bar => .bar,
+        .block => .block,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+    const cstyle = rcursor.resolveStyle(.{
+        .in_viewport = in_viewport,
+        .visible = term.modes.get(.cursor_visible),
+        .focused = cursor_render.focused,
+        .blinking = term.modes.get(.cursor_blinking),
+        .blink_visible = cursor_render.blink_visible,
+        .term_style = term_style,
+    });
+    if (cstyle) |cs| {
+        const ccx: i32 = @intCast(cx * cell_w);
+        const ccy: i32 = @intCast(cy * cell_h);
+
+        // Default cursor fill = the cell's foreground; default block text = its
+        // background, so a block cursor inverts the cell beneath it.
+        var cur_fg = theme.fg;
+        var cur_bg = theme.bg;
+        var cur_cp: u21 = 0;
+        if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
+            const cell_style = gc.style();
+            cur_fg = cell_style.fg(.{ .default = theme.fg, .palette = palette });
+            if (cell_style.bg(gc.cell, palette)) |c| cur_bg = c;
+            cur_cp = gc.cell.codepoint();
+        }
+        const fill = cursor_render.color orelse rgbf(cur_fg);
+        const text_color = cursor_render.text orelse rgbf(cur_bg);
+
+        try rcursor.shapeQuads(quads, alloc, cs, .{
+            .px = ccx,
+            .py = ccy,
+            .cell_w = cell_w,
+            .cell_h = cell_h,
+            .thickness = cursor_render.thickness,
+        }, fill, cursor_render.opacity);
+
+        // A solid block hides the glyph beneath it; re-draw that glyph in the
+        // cursor text color so it stays legible.
+        if (cs == .block and cur_cp >= first_glyph and cur_cp <= last_glyph) {
+            if (glyphs[cur_cp - first_glyph]) |gi| {
+                try quads.append(alloc, .{ .glyph = .{
+                    .px = ccx + gi.bearing_x,
+                    .py = ccy + ascent_i - gi.bearing_y,
+                    .sx = gi.region.x,
+                    .sy = gi.region.y,
+                    .sw = gi.region.width,
+                    .sh = gi.region.height,
+                    .r = text_color[0],
+                    .g = text_color[1],
+                    .b = text_color[2],
+                } });
+            }
         }
     }
 }

@@ -29,6 +29,9 @@ const std = @import("std");
 /// The OpenGL (WGL) backend — the implemented, default renderer.
 pub const OpenGL = @import("renderer/OpenGL.zig");
 
+/// Cursor style resolution + shape geometry (backend-agnostic).
+pub const cursor = @import("renderer/cursor.zig");
+
 /// Which backend to use. Mirrors `config.RendererBackend`; the app maps the
 /// config value onto this and constructs the matching backend.
 pub const Backend = enum {
@@ -55,6 +58,7 @@ pub const direct3d_status = "pending: needs a Windows host + compiler to verify 
 test {
     // Pull the implemented backend's host tests in via the abstraction module.
     _ = OpenGL;
+    _ = cursor;
 }
 
 test "renderer: backend enum mirrors the config selector names" {
