@@ -46,8 +46,10 @@ const first_drawable: u21 = 0x21;
 /// discovery is #74; the configured size applies now.
 const default_font_path = "C:\\Windows\\Fonts\\consola.ttf";
 
-/// Atlas dimension (square, texels). Holds a few hundred packed glyphs; atlas
-/// growth/eviction when it fills is follow-up work.
+/// Atlas dimension (square, texels). Holds a few hundred packed glyphs; styled
+/// text keys glyphs by (codepoint, bold, italic), so a single codepoint can
+/// consume up to 4 regions (#77). Atlas growth/eviction when it fills is
+/// follow-up work.
 const atlas_size: u32 = 512;
 
 /// The resolved color theme the renderer uses: default fg/bg for cells with no
@@ -512,9 +514,11 @@ fn copyToClipboard(ctx: KeybindCtx) void {
 ///
 /// Color resolution is delegated to libghostty-vt (`Style.fg`/`Style.bg` and
 /// the default palette) rather than reimplemented here, per the hybrid
-/// architecture (ADR 0002). Synthetic bold/italic glyphs require additional
-/// font faces and are deferred to the font work (#13/#14); bold still
-/// brightens palette colors via vt's resolution.
+/// architecture (ADR 0002); bold also brightens palette colors via vt's
+/// resolution. Bold/italic glyphs are synthesized from the single regular face
+/// (the cache rasterizes an emboldened / sheared variant, #77); they aren't
+/// clipped to the cell, so a heavy/slanted glyph may overhang a neighbor by a
+/// pixel or two — cosmetic, and addressed with the per-style-family work.
 fn buildQuads(
     alloc: std.mem.Allocator,
     quads: *std.ArrayList(gl.Quad),
@@ -616,7 +620,7 @@ fn buildQuads(
             if (ft and !style.flags.invisible) {
                 const cp = cell.codepoint();
                 if (cp >= first_drawable) {
-                    if (cache.get(cp)) |gi| {
+                    if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
                         const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
                         try quads.append(alloc, .{ .glyph = .{
                             .px = cell_x + gi.bearing_x,
@@ -721,9 +725,10 @@ fn buildQuads(
             if (cs == .block) {
                 if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
                     const cp = gc.cell.codepoint();
+                    const cs_style = gc.style();
                     if (cp >= first_drawable) {
-                        if (cache.get(cp)) |gi| {
-                            const cur_bg = if (gc.style().bg(gc.cell, palette)) |c| c else eff_bg;
+                        if (cache.get(cp, cs_style.flags.bold, cs_style.flags.italic)) |gi| {
+                            const cur_bg = if (cs_style.bg(gc.cell, palette)) |c| c else eff_bg;
                             const text_color = cursor_render.text orelse rgbf(cur_bg);
                             try quads.append(alloc, .{ .glyph = .{
                                 .px = ccx + gi.bearing_x,
