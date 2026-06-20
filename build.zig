@@ -39,6 +39,11 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("ghostty-vt", ghostty_vt);
     exe.root_module.addImport("build_options", build_options.createModule());
+    // A GUI terminal must be a Windows-subsystem app: a console-subsystem exe
+    // owns a console that the spawned shell attaches to instead of the ConPTY
+    // (so its output bypasses libghostty-vt and nothing renders). GUI subsystem
+    // means no console exists for the child to inherit.
+    if (target.result.os.tag == .windows) exe.subsystem = .Windows;
     if (enable_freetype) {
         if (b.lazyDependency("freetype", .{ .target = target, .optimize = optimize })) |dep| {
             exe.root_module.addImport("freetype", dep.module("freetype"));

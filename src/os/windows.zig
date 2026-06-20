@@ -131,6 +131,13 @@ pub extern "kernel32" fn CreateProcessW(
 
 pub extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
 
+// Console attach: a GUI-subsystem app has no console, so CLI output (`--help`,
+// `--version`) is written by first attaching to the launching shell's console.
+pub const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF; // (DWORD)-1
+pub const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5; // (DWORD)-11
+pub extern "kernel32" fn AttachConsole(dwProcessId: DWORD) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+
 // --- GUI types (not in std.os.windows) -------------------------------------
 
 pub const HWND = windows.HWND;

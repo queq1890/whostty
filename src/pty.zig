@@ -57,10 +57,13 @@ const WindowsPty = struct {
 
     /// Open a new pty with the given initial size.
     pub fn open(size: winsize) OpenError!WindowsPty {
-        // Inheritable handles so the child can use the pty ends.
+        // Non-inheritable: the child connects to the pty via the pseudoconsole
+        // attribute (CreatePseudoConsole duplicates the ends into conhost), not
+        // by inheriting these handles. Inheritable pty ends would leak into the
+        // child and can confuse which console it attaches to.
         const sa: w.SECURITY_ATTRIBUTES = .{
             .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
-            .bInheritHandle = w.TRUE,
+            .bInheritHandle = w.FALSE,
             .lpSecurityDescriptor = null,
         };
 
