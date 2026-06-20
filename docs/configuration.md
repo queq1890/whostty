@@ -26,8 +26,10 @@ which layer consumes it.
 | `font-size` | number (pt) | `12` | |
 | `background` | color | `#000000` | |
 | `foreground` | color | `#ffffff` | |
-| `cursor-style` | `block` \| `bar` \| `underline` | `block` | |
-| `cursor-color` | color | (foreground) | |
+| `cursor-style` | `block` \| `bar` \| `underline` | `block` | Renders block/bar/underline, with blink, hollow-when-unfocused (#69). |
+| `cursor-color` | color | (cell foreground) | |
+| `cursor-text` | color | (cell background) | Color of the text under a block cursor. |
+| `cursor-opacity` | number `0`–`1` | `1` | Cursor fill opacity; clamped to the range. |
 | `selection-background` | color | (derived) | |
 | `selection-foreground` | color | (derived) | |
 | `bold-is-bright` | bool | `false` | Render bold text with the bright palette colors. |

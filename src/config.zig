@@ -152,6 +152,12 @@ pub const Config = struct {
     /// Optional color overrides. `null` means "derive from fg/bg" (the renderer
     /// picks a sensible default — e.g. the cursor uses the foreground).
     cursor_color: ?Color = null,
+    /// The color of the text under a block cursor. `null` derives it from the
+    /// cell (the cell's background, i.e. the glyph is inverted).
+    cursor_text: ?Color = null,
+    /// Cursor opacity (0..1). 1 is fully opaque; lower lets the cell show
+    /// through the cursor. Ported from ghostty's `cursor-opacity`.
+    cursor_opacity: f32 = 1,
     selection_background: ?Color = null,
     selection_foreground: ?Color = null,
 
@@ -238,6 +244,11 @@ pub const Config = struct {
             try self.keybinds.putLine(alloc, value);
         } else if (std.mem.eql(u8, key, "cursor-color")) {
             self.cursor_color = try Color.parse(value);
+        } else if (std.mem.eql(u8, key, "cursor-text")) {
+            self.cursor_text = try Color.parse(value);
+        } else if (std.mem.eql(u8, key, "cursor-opacity")) {
+            const o = try std.fmt.parseFloat(f32, value);
+            self.cursor_opacity = std.math.clamp(o, 0, 1);
         } else if (std.mem.eql(u8, key, "selection-background")) {
             self.selection_background = try Color.parse(value);
         } else if (std.mem.eql(u8, key, "selection-foreground")) {
@@ -369,6 +380,29 @@ test "config: optional color overrides and bold-is-bright" {
     try testing.expectEqual(Color{ .r = 0xff, .g = 0xff, .b = 0xff }, cfg.selection_foreground.?);
     try testing.expect(cfg.bold_is_bright);
     try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+}
+
+test "config: cursor-text and cursor-opacity parse; opacity clamps to 0..1" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\cursor-text = #101010
+        \\cursor-opacity = 0.6
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(Color{ .r = 0x10, .g = 0x10, .b = 0x10 }, cfg.cursor_text.?);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), cfg.cursor_opacity, 0.0001);
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+
+    // Out-of-range opacity is clamped, not rejected.
+    var hi = try Config.parse(testing.allocator, "cursor-opacity = 1.5\n");
+    defer hi.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), hi.cursor_opacity, 0.0001);
+
+    // Defaults: opaque, derive-from-cell text.
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), def.cursor_opacity, 0.0001);
+    try testing.expect(def.cursor_text == null);
 }
 
 test "config: scrollback-limit parses; default otherwise" {

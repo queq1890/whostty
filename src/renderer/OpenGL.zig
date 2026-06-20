@@ -31,10 +31,13 @@ pub const Cell = struct {
     r: f32 = 1,
     g: f32 = 1,
     b: f32 = 1,
+    /// Opacity (0..1) multiplied onto the glyph coverage. 1 = fully opaque.
+    a: f32 = 1,
 };
 
 /// A solid filled rectangle in window pixels, tinted by a color. Used for SGR
-/// background fills and the underline / strikethrough / overline decorations.
+/// background fills, the underline / strikethrough / overline decorations, and
+/// the cursor shapes.
 pub const SolidRect = struct {
     px: i32,
     py: i32,
@@ -44,6 +47,9 @@ pub const SolidRect = struct {
     r: f32,
     g: f32,
     b: f32,
+    /// Opacity (0..1). 1 = fully opaque. Lets the cursor (cursor-opacity) and
+    /// future translucent fills blend over what is already drawn.
+    a: f32 = 1,
 };
 
 /// A single drawable primitive. Quads are drawn in slice order, so callers
@@ -58,7 +64,7 @@ pub const Quad = union(enum) {
 const mode_glyph: f32 = 0;
 const mode_solid: f32 = 1;
 
-/// Interleaved vertex: position (NDC) + atlas uv + color + draw mode.
+/// Interleaved vertex: position (NDC) + atlas uv + color + alpha + draw mode.
 pub const Vertex = extern struct {
     x: f32,
     y: f32,
@@ -67,6 +73,8 @@ pub const Vertex = extern struct {
     r: f32,
     g: f32,
     b: f32,
+    /// Opacity multiplied onto the resolved coverage (glyph) or 1 (solid).
+    a: f32,
     /// 0 = sample the atlas coverage (glyph), 1 = solid fill.
     m: f32,
 };
@@ -111,10 +119,10 @@ pub fn pushQuad(
     const sv0: f32 = @as(f32, @floatFromInt(cell.sy)) / as;
     const sv1: f32 = @as(f32, @floatFromInt(cell.sy + cell.sh)) / as;
 
-    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = su0, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
-    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = su1, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
-    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = su0, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
-    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = su1, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .m = mode_glyph };
+    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = su0, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .a = cell.a, .m = mode_glyph };
+    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = su1, .v = sv0, .r = cell.r, .g = cell.g, .b = cell.b, .a = cell.a, .m = mode_glyph };
+    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = su0, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .a = cell.a, .m = mode_glyph };
+    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = su1, .v = sv1, .r = cell.r, .g = cell.g, .b = cell.b, .a = cell.a, .m = mode_glyph };
 
     try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
 }
@@ -129,10 +137,10 @@ pub fn pushSolid(
     screen_h: u32,
 ) !void {
     const n = ndcRect(rect.px, rect.py, rect.w, rect.h, screen_w, screen_h);
-    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
-    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
-    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
-    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .m = mode_solid };
+    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .a = rect.a, .m = mode_solid };
+    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .a = rect.a, .m = mode_solid };
+    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .a = rect.a, .m = mode_solid };
+    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = 0, .v = 0, .r = rect.r, .g = rect.g, .b = rect.b, .a = rect.a, .m = mode_solid };
     try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
 }
 
@@ -272,13 +280,16 @@ pub const vertex_shader_src: [:0]const u8 =
     \\layout (location = 1) in vec2 a_uv;
     \\layout (location = 2) in vec3 a_color;
     \\layout (location = 3) in float a_mode;
+    \\layout (location = 4) in float a_alpha;
     \\out vec2 v_uv;
     \\out vec3 v_color;
     \\out float v_mode;
+    \\out float v_alpha;
     \\void main() {
     \\    v_uv = a_uv;
     \\    v_color = a_color;
     \\    v_mode = a_mode;
+    \\    v_alpha = a_alpha;
     \\    gl_Position = vec4(a_pos, 0.0, 1.0);
     \\}
 ;
@@ -288,12 +299,15 @@ pub const fragment_shader_src: [:0]const u8 =
     \\in vec2 v_uv;
     \\in vec3 v_color;
     \\in float v_mode;
+    \\in float v_alpha;
     \\out vec4 frag;
     \\uniform sampler2D u_atlas;
     \\void main() {
-    \\    // mode 0: glyph (alpha from atlas coverage); mode 1: solid fill.
-    \\    float a = (v_mode > 0.5) ? 1.0 : texture(u_atlas, v_uv).r;
-    \\    frag = vec4(v_color, a);
+    \\    // mode 0: glyph (coverage from the atlas); mode 1: solid fill. The
+    \\    // per-vertex alpha multiplies the result so cursor-opacity / dim fills
+    \\    // blend over what is already drawn.
+    \\    float base = (v_mode > 0.5) ? 1.0 : texture(u_atlas, v_uv).r;
+    \\    frag = vec4(v_color, base * v_alpha);
     \\}
 ;
 
@@ -346,6 +360,8 @@ pub const Renderer = struct {
         gl.enableVertexAttribArray(2);
         gl.vertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "m")));
         gl.enableVertexAttribArray(3);
+        gl.vertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "a")));
+        gl.enableVertexAttribArray(4);
 
         var tex: GLuint = 0;
         glGenTextures(1, @ptrCast(&tex));
@@ -519,4 +535,20 @@ test "renderer: pushSolid maps full cell rect, solid mode, zero uv" {
     // Top-left pixel (0,0) -> NDC (-1, +1).
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), verts.items[0].x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), verts.items[0].y, 0.0001);
+}
+
+test "renderer: alpha defaults to opaque and propagates to every vertex" {
+    const alloc = std.testing.allocator;
+    var verts: std.ArrayList(Vertex) = .empty;
+    defer verts.deinit(alloc);
+
+    // A glyph with no explicit alpha is fully opaque.
+    try pushQuad(&verts, alloc, .{ .px = 0, .py = 0, .sx = 0, .sy = 0, .sw = 4, .sh = 4 }, 100, 100, 100);
+    for (verts.items) |v| try std.testing.expectApproxEqAbs(@as(f32, 1.0), v.a, 0.0001);
+
+    // A solid with a half alpha carries it on all six vertices.
+    verts.clearRetainingCapacity();
+    try pushSolid(&verts, alloc, .{ .px = 0, .py = 0, .w = 8, .h = 8, .r = 1, .g = 1, .b = 1, .a = 0.5 }, 100, 100);
+    try std.testing.expectEqual(@as(usize, 6), verts.items.len);
+    for (verts.items) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.5), v.a, 0.0001);
 }
