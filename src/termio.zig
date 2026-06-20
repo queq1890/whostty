@@ -58,6 +58,7 @@ const ResponseHandler = struct {
             .device_status => try self.deviceStatus(value),
             .request_mode => try self.requestMode(value.mode),
             .request_mode_unknown => try self.requestModeUnknown(value),
+            .color_operation => try self.colorOperation(value),
 
             // ENQ falls through: ghostty's default `enquiry-response` is the
             // empty string, so replying with nothing (the readonly handler's
@@ -124,6 +125,57 @@ const ResponseHandler = struct {
             if (raw.ansi) "" else "?",
             raw.mode,
         }));
+    }
+
+    /// OSC 4 / 10 / 11 / 12 (and friends) color operations. Set/reset are state
+    /// changes the readonly handler already applies, so we delegate the whole
+    /// operation to it first; then we answer any `?` queries from the resulting
+    /// color state. Colors come from `terminal.colors`, which `Termio.seedColors`
+    /// primes with the configured defaults, so a query before any runtime change
+    /// reports the configured color (not an empty/garbage value).
+    ///
+    /// Replies use the 16-bit `rgb:RRRR/GGGG/BBBB` form (ghostty's default
+    /// `osc-color-report-format`), echoing the request's ST/BEL terminator.
+    ///
+    /// Sets are applied (via the delegate) before any query is reported, so a
+    /// query reports the post-set color. This matches ghostty for the realistic
+    /// `set; query` order and diverges only for a nonsensical same-target
+    /// `query; set` in a single OSC, which no querying tool emits.
+    fn colorOperation(self: *ResponseHandler, value: gvt.StreamAction.Value(.color_operation)) !void {
+        try self.inner.vt(.color_operation, value);
+
+        const term = self.inner.terminal;
+        var it = value.requests.constIterator(0);
+        while (it.next()) |req| {
+            const target = switch (req.*) {
+                .query => |t| t,
+                else => continue,
+            };
+            const c = switch (target) {
+                .palette => |i| term.colors.palette.current[i],
+                .dynamic => |d| switch (d) {
+                    .foreground => term.colors.foreground.get() orelse continue,
+                    .background => term.colors.background.get() orelse continue,
+                    .cursor => term.colors.cursor.get() orelse
+                        term.colors.foreground.get() orelse continue,
+                    // pointer / tektronix / highlight colors aren't tracked yet.
+                    else => continue,
+                },
+                .special => continue,
+            };
+            // 8-bit channels scaled to 16-bit (x257), matching xterm's report.
+            const r: u16 = @as(u16, c.r) * 257;
+            const g: u16 = @as(u16, c.g) * 257;
+            const b: u16 = @as(u16, c.b) * 257;
+            const term_str = value.terminator.string();
+            var buf: [64]u8 = undefined;
+            const body = switch (target) {
+                .palette => |i| try std.fmt.bufPrint(&buf, "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}", .{ i, r, g, b, term_str }),
+                .dynamic => |d| try std.fmt.bufPrint(&buf, "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}", .{ @intFromEnum(d), r, g, b, term_str }),
+                .special => continue,
+            };
+            try self.reply(body);
+        }
     }
 };
 
@@ -212,6 +264,37 @@ pub const Termio = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.stream.nextSlice(bytes);
+    }
+
+    /// Seed the terminal's dynamic colors with the configured defaults so that
+    /// OSC color queries report the configured color (until an app overrides it)
+    /// and the renderer can treat `terminal.colors` as the single source of
+    /// truth (OSC 10/11/4 then take visible effect). Call once before the reader
+    /// thread starts; not synchronized.
+    pub fn seedColors(
+        self: *Termio,
+        fg: vt.color.RGB,
+        bg: vt.color.RGB,
+        cursor: ?vt.color.RGB,
+        palette: *const vt.color.Palette,
+    ) void {
+        self.terminal.colors.foreground = .init(fg);
+        self.terminal.colors.background = .init(bg);
+        // Cursor color is optional: if the user configured one it becomes the
+        // default, which OSC 12 can then override; otherwise it stays unset and
+        // the cursor derives its color from the cell. Either way the query reply
+        // and the rendered cursor read the same `terminal.colors.cursor`.
+        if (cursor) |c| self.terminal.colors.cursor = .init(c);
+        self.terminal.colors.palette = .init(palette.*);
+    }
+
+    /// The effective default background — the OSC 11 override if an app set one,
+    /// else `fallback` (the configured background). Used for the framebuffer
+    /// clear color. Thread-safe.
+    pub fn backgroundColor(self: *Termio, fallback: vt.color.RGB) vt.color.RGB {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.terminal.colors.background.get() orelse fallback;
     }
 
     /// Key-encoding options derived from the current terminal state: cursor-key
@@ -510,6 +593,82 @@ test "termio: keyEncodeOptions reflects DECCKM and forces kitty output off" {
     // ...but key-encode options force kitty output off (the WM_CHAR text path is
     // still legacy; full kitty output is deferred).
     try std.testing.expectEqual(@as(u5, 0), io.keyEncodeOptions().kitty_flags.int());
+}
+
+test "termio: OSC 11 set then query reports the background (16-bit)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [128]u8 = undefined;
+    // Setting a color produces no reply.
+    try std.testing.expectEqualStrings("", try replyTo(io, "\x1b]11;rgb:ff/00/00\x07", &buf));
+    // Querying reports it scaled to 16-bit, echoing the BEL terminator.
+    try std.testing.expectEqualStrings(
+        "\x1b]11;rgb:ffff/0000/0000\x07",
+        try replyTo(io, "\x1b]11;?\x07", &buf),
+    );
+}
+
+test "termio: OSC 4 palette set then query reports the color, ST terminator" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", try replyTo(io, "\x1b]4;5;rgb:12/34/56\x07", &buf));
+    // ST-terminated query -> ST-terminated reply.
+    try std.testing.expectEqualStrings(
+        "\x1b]4;5;rgb:1212/3434/5656\x1b\\",
+        try replyTo(io, "\x1b]4;5;?\x1b\\", &buf),
+    );
+}
+
+test "termio: OSC 10 query reports the seeded foreground default" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // No app override yet: the reply is the configured (seeded) foreground.
+    io.seedColors(.{ .r = 0xab, .g = 0xcd, .b = 0xef }, .{ .r = 0, .g = 0, .b = 0 }, null, &vt.color.default);
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "\x1b]10;rgb:abab/cdcd/efef\x07",
+        try replyTo(io, "\x1b]10;?\x07", &buf),
+    );
+}
+
+test "termio: seeded background is overridden by OSC 11 and read back" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    io.seedColors(.{ .r = 0x10, .g = 0x20, .b = 0x30 }, .{ .r = 0x01, .g = 0x02, .b = 0x03 }, null, &vt.color.default);
+    // backgroundColor returns the seeded default until an app overrides it.
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x01, .g = 0x02, .b = 0x03 }, io.backgroundColor(.{ .r = 0, .g = 0, .b = 0 }));
+    try io.process("\x1b]11;rgb:aa/bb/cc\x07");
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xaa, .g = 0xbb, .b = 0xcc }, io.backgroundColor(.{ .r = 0, .g = 0, .b = 0 }));
+}
+
+test "termio: OSC 12 cursor query reports seed then OSC override" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Seed a configured cursor color: the query reports it (and the renderer,
+    // which reads the same terminal.colors.cursor, would paint it).
+    io.seedColors(.{ .r = 0, .g = 0, .b = 0 }, .{ .r = 0, .g = 0, .b = 0 }, .{ .r = 0x11, .g = 0x22, .b = 0x33 }, &vt.color.default);
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "\x1b]12;rgb:1111/2222/3333\x07",
+        try replyTo(io, "\x1b]12;?\x07", &buf),
+    );
+    // OSC 12 set overrides the seed and is read back.
+    try io.process("\x1b]12;rgb:ee/dd/cc\x07");
+    try std.testing.expectEqualStrings(
+        "\x1b]12;rgb:eeee/dddd/cccc\x07",
+        try replyTo(io, "\x1b]12;?\x07", &buf),
+    );
 }
 
 test "termio: takeResponse drains and clears the queue" {

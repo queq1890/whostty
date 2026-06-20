@@ -16,6 +16,8 @@ const cursor = @import("renderer/cursor.zig");
 const GlyphCache = @import("font/GlyphCache.zig");
 const font = @import("font/main.zig");
 const Atlas = @import("font/Atlas.zig");
+const Termio = @import("termio.zig").Termio;
+const vtcolor = @import("ghostty-vt").color;
 
 // --- dynamic loader --------------------------------------------------------
 extern "c" fn dlopen(path: [*:0]const u8, flag: c_int) ?*anyopaque;
@@ -488,5 +490,40 @@ pub fn main() !void {
             return error.NonAsciiGlyphBlank;
         }
         out.print("[proof] PASS: non-ASCII glyph U+2500 rasterized on demand to {d} lit pixels\n", .{glit});
+    }
+
+    // --- Dynamic background proof (#83): OSC 11 -> clear color -------------
+    // A real Termio parses OSC 11 (set default background); the resolved
+    // `backgroundColor` must reach the framebuffer clear color. Proves the
+    // renderer treats `terminal.colors` as authoritative for the default bg,
+    // so runtime color changes are visible — independent of the Win32 wrapper.
+    {
+        const io = try Termio.create(alloc, 4, 2, 1 << 16);
+        defer io.destroy();
+        io.seedColors(.{ .r = 0x11, .g = 0x11, .b = 0x11 }, .{ .r = 0x22, .g = 0x22, .b = 0x22 }, null, &vtcolor.default);
+        try io.process("\x1b]11;rgb:00/ff/00\x07"); // pure green background
+        const bg = io.backgroundColor(.{ .r = 0, .g = 0, .b = 0 });
+        if (bg.r != 0x00 or bg.g != 0xff or bg.b != 0x00) return error.OscBgNotApplied;
+
+        g.clearColor(
+            @as(f32, @floatFromInt(bg.r)) / 255.0,
+            @as(f32, @floatFromInt(bg.g)) / 255.0,
+            @as(f32, @floatFromInt(bg.b)) / 255.0,
+            1.0,
+        );
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.finish();
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+
+        const ci = ((screen_h / 2) * screen_w + screen_w / 2) * 4;
+        const pr = buf[ci];
+        const pg = buf[ci + 1];
+        const pb = buf[ci + 2];
+        out.print("[proof] osc-colors: OSC 11 background pixel = rgb({d},{d},{d})\n", .{ pr, pg, pb });
+        if (pr > 8 or pg < 247 or pb > 8) {
+            out.print("[proof] FAIL: OSC 11 background did not reach the framebuffer\n", .{});
+            return error.OscBgNotRendered;
+        }
+        out.print("[proof] PASS: OSC 11 dynamic background reached the clear color (green framebuffer)\n", .{});
     }
 }
