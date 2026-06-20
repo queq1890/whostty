@@ -8,8 +8,24 @@
 const std = @import("std");
 const Pty = @import("pty.zig").Pty;
 const Termio = @import("termio.zig").Termio;
+const mouse = @import("mouse.zig");
 
 pub const GridSize = struct { cols: u16, rows: u16 };
+
+/// A viewport cell coordinate (row 0 = top visible row).
+pub const Cell = struct { x: u16 = 0, y: u16 = 0 };
+
+/// Client pixel -> viewport cell, clamped to the grid. The viewport tag means
+/// scrollback offset is resolved by libghostty-vt when the cell is pinned, so
+/// no manual scroll arithmetic is needed here. Pure; host-testable.
+pub fn cellFromPixels(px_x: i32, px_y: i32, cell_w: u32, cell_h: u32, cols: u16, rows: u16) Cell {
+    const x: u32 = if (px_x < 0) 0 else @as(u32, @intCast(px_x)) / @max(cell_w, 1);
+    const y: u32 = if (px_y < 0) 0 else @as(u32, @intCast(px_y)) / @max(cell_h, 1);
+    return .{
+        .x = @intCast(@min(x, @as(u32, @max(cols, 1)) - 1)),
+        .y = @intCast(@min(y, @as(u32, @max(rows, 1)) - 1)),
+    };
+}
 
 /// Derive the terminal grid (cols x rows) from a client pixel size and the
 /// monospace cell size. Always at least 1x1. Pure; host-testable.
@@ -30,6 +46,11 @@ pub const Surface = struct {
     cols: u16,
     rows: u16,
 
+    /// Whether the left mouse button is held (a drag is in progress). The
+    /// selected region and the drag anchor live in the libghostty-vt core,
+    /// managed by Termio's selectStart/Extend/End under its lock.
+    mouse_left_down: bool = false,
+
     /// Handle a window resize (client pixels). Recomputes the grid and, if it
     /// changed, resizes the pseudo console and the terminal grid so reflow
     /// follows the window.
@@ -41,6 +62,57 @@ pub const Surface = struct {
         self.rows = g.rows;
         try self.pty.setSize(.{ .ws_col = g.cols, .ws_row = g.rows });
         try self.termio.resize(g.cols, g.rows);
+    }
+
+    /// A mouse button was pressed/released. When an application has enabled
+    /// mouse tracking the event is encoded and written to the pty (unless Shift
+    /// is held, which forces local selection like xterm); otherwise the left
+    /// button drives text selection.
+    pub fn mouseButton(self: *Surface, button: mouse.Button, action: mouse.Action, px_x: i32, px_y: i32, mods: mouse.Mods) void {
+        const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
+
+        if (!mods.shift) {
+            var buf: [32]u8 = undefined;
+            if (self.termio.encodeMouseReport(&buf, cell.x, cell.y, button, action, mods)) |bytes| {
+                _ = self.pty.write(bytes) catch {};
+                return;
+            }
+        }
+
+        if (button == .left) switch (action) {
+            .press => {
+                self.termio.selectStart(cell.x, cell.y);
+                self.mouse_left_down = true;
+            },
+            .release => {
+                self.mouse_left_down = false;
+                self.termio.selectEnd();
+            },
+            .motion => {},
+        };
+    }
+
+    /// Mouse moved during a left-drag: extend the selection to the current cell.
+    /// (Motion mouse-reporting for button/any modes is a follow-up.)
+    pub fn mouseDrag(self: *Surface, px_x: i32, px_y: i32) void {
+        if (!self.mouse_left_down) return;
+        const cell = cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows);
+        self.termio.selectExtend(cell.x, cell.y);
+    }
+
+    /// End an in-progress selection drag (button release already handled, or
+    /// capture was lost). Releases the anchor; keeps the selection.
+    pub fn endDrag(self: *Surface) void {
+        if (self.mouse_left_down) {
+            self.mouse_left_down = false;
+            self.termio.selectEnd();
+        }
+    }
+
+    /// The current selection as UTF-8, or null if nothing is selected. Caller
+    /// owns the returned slice.
+    pub fn selectionText(self: *Surface, alloc: std.mem.Allocator) !?[:0]const u8 {
+        return self.termio.selectionStringAlloc(alloc);
     }
 };
 
@@ -59,4 +131,14 @@ test "surface: gridFromPixels clamps to at least 1x1" {
 test "surface: gridFromPixels guards against zero cell size" {
     const g = gridFromPixels(80, 40, 0, 0);
     try std.testing.expect(g.cols >= 1 and g.rows >= 1);
+}
+
+test "surface: cellFromPixels maps, floors, and clamps" {
+    // 8x16 cells in a 100x37 grid.
+    try std.testing.expectEqual(Cell{ .x = 0, .y = 0 }, cellFromPixels(3, 5, 8, 16, 100, 37));
+    try std.testing.expectEqual(Cell{ .x = 1, .y = 1 }, cellFromPixels(8, 16, 8, 16, 100, 37));
+    // Negative pixels clamp to the first cell.
+    try std.testing.expectEqual(Cell{ .x = 0, .y = 0 }, cellFromPixels(-5, -9, 8, 16, 100, 37));
+    // Beyond the grid clamps to the last cell.
+    try std.testing.expectEqual(Cell{ .x = 99, .y = 36 }, cellFromPixels(100000, 100000, 8, 16, 100, 37));
 }

@@ -7,10 +7,16 @@
 //! See PORTING.md.
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const mouse = @import("mouse.zig");
 
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
 pub const Termio = struct {
+    pub const Pin = vt.Pin;
+    /// The type of `terminal.screens.active` (`*Screen`), derived without relying
+    /// on libghostty-vt re-exporting the Screen type.
+    const ActiveScreen = @FieldType(@FieldType(vt.Terminal, "screens"), "active");
+
     terminal: vt.Terminal,
     stream: vt.ReadonlyStream,
     /// Guards `terminal`: the reader thread mutates it via `process`, the
@@ -18,12 +24,21 @@ pub const Termio = struct {
     mutex: std.Thread.Mutex,
     alloc: std.mem.Allocator,
 
+    /// Mouse-drag selection anchor: a tracked pin plus the exact screen it was
+    /// created on. Binding the drag to that screen prevents building a
+    /// cross-PageList selection if an app switches to the alternate screen
+    /// (`\e[?1049h`) mid-drag.
+    sel_anchor: ?*Pin = null,
+    sel_anchor_screen: ?ActiveScreen = null,
+
     pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16, max_scrollback: usize) !*Termio {
         const self = try alloc.create(Termio);
         errdefer alloc.destroy(self);
 
         self.alloc = alloc;
         self.mutex = .{};
+        self.sel_anchor = null;
+        self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
@@ -84,6 +99,94 @@ pub const Termio = struct {
         self.mutex.unlock();
     }
 
+    // --- Selection (mouse drag -> screen.selection) ------------------------
+    // All locked internally; the selected region lives in the VT core. The drag
+    // anchor is a tracked pin (survives the reader thread's mutation / scroll /
+    // reflow) bound to the screen it was created on.
+
+    /// Begin a drag selection anchored at the given viewport cell.
+    pub fn selectStart(self: *Termio, x: u16, y: u16) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.releaseAnchorLocked();
+        const screen = self.terminal.screens.active;
+        screen.clearSelection();
+        const p = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
+        self.sel_anchor = screen.pages.trackPin(p) catch return;
+        self.sel_anchor_screen = screen;
+    }
+
+    /// Extend the active drag selection to the given viewport cell.
+    pub fn selectExtend(self: *Termio, x: u16, y: u16) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const anchor = self.sel_anchor orelse return;
+        const screen = self.sel_anchor_screen orelse return;
+        // If the active screen changed since the drag started (alternate-screen
+        // switch), the anchor belongs to a different PageList — don't cross pools.
+        if (screen != self.terminal.screens.active) return;
+        const cur = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
+        screen.select(vt.Selection.init(anchor.*, cur, false)) catch {};
+    }
+
+    /// End the drag (the selection stays set, owning its own tracked pins). The
+    /// anchor is untracked on the screen it was created on.
+    pub fn selectEnd(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.releaseAnchorLocked();
+    }
+
+    fn releaseAnchorLocked(self: *Termio) void {
+        if (self.sel_anchor) |a| {
+            // Only untrack if the anchor's screen is still the active one. If the
+            // app switched away from (or, via RIS, *freed*) that screen, the pin
+            // was freed with it — dereferencing the stored pointer would be a
+            // use-after-free. Just drop the fields in that case.
+            if (self.sel_anchor_screen) |s| {
+                if (s == self.terminal.screens.active) s.pages.untrackPin(a);
+            }
+            self.sel_anchor = null;
+            self.sel_anchor_screen = null;
+        }
+    }
+
+    pub fn clearSelection(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.terminal.screens.active.clearSelection();
+    }
+
+    /// Encode a mouse event as a VT report into `buf` if the terminal currently
+    /// requests mouse tracking, else null. Reads the mode/format under the lock.
+    /// The MouseEvents/MouseFormat enums share integer values with mouse.zig's.
+    pub fn encodeMouseReport(
+        self: *Termio,
+        buf: []u8,
+        col: u16,
+        row: u16,
+        button: mouse.Button,
+        action: mouse.Action,
+        mods: mouse.Mods,
+    ) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ev: mouse.Event = @enumFromInt(@intFromEnum(self.terminal.flags.mouse_event));
+        if (ev == .none) return null;
+        const fmt: mouse.Format = @enumFromInt(@intFromEnum(self.terminal.flags.mouse_format));
+        return mouse.encode(buf, ev, fmt, button, action, mods, col, row);
+    }
+
+    /// The current selection as UTF-8 (NUL-terminated), or null if none. Caller
+    /// owns the returned slice.
+    pub fn selectionStringAlloc(self: *Termio, alloc: std.mem.Allocator) !?[:0]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const sel = screen.selection orelse return null;
+        return try screen.selectionString(alloc, .{ .sel = sel, .trim = false });
+    }
+
     /// Dump the active viewport as plain text (used by tests / debug).
     pub fn dumpAlloc(self: *Termio, alloc: std.mem.Allocator) ![]const u8 {
         self.mutex.lock();
@@ -118,6 +221,29 @@ test "termio: escape sequences move the cursor (overwrite)" {
     defer alloc.free(dump);
     const line = std.mem.trimRight(u8, dump, " \n");
     try std.testing.expect(std.mem.startsWith(u8, line, "abXXX"));
+}
+
+test "termio: selection over written cells yields the selected text" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("hello world");
+
+    // No selection initially.
+    try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
+
+    // Drag-select viewport cells (0,0)..(4,0) -> "hello".
+    io.selectStart(0, 0);
+    io.selectExtend(4, 0);
+
+    const text = (try io.selectionStringAlloc(alloc)) orelse return error.NoSelection;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("hello", text);
+
+    io.selectEnd();
+    io.clearSelection();
+    try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
 }
 
 test "termio: resize changes dimensions" {

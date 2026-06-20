@@ -20,13 +20,29 @@ pub const Mods = struct {
 
 /// Events surfaced from the window message loop.
 pub const Event = union(enum) {
-    /// A character was typed (WM_CHAR), as a Unicode codepoint.
+    /// A character was typed (WM_CHAR), as a Unicode codepoint. The app drops the
+    /// WM_CHAR that follows a handled Enter/Tab/Backspace/Escape WM_KEYDOWN (see
+    /// the suppress-next-char logic) so those keys aren't sent twice.
     char: u21,
     /// A virtual key was pressed (WM_KEYDOWN), with the modifiers held.
     key: struct { vk: u32, mods: Mods },
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
     /// WHEEL_DELTA), positive when rolled away from the user.
     scroll: i32,
+    /// A mouse button was pressed (down = true) or released at client pixel
+    /// (x, y), with the modifiers held.
+    mouse_button: struct {
+        button: enum { left, middle, right },
+        down: bool,
+        x: i32,
+        y: i32,
+        mods: Mods,
+    },
+    /// Mouse moved to client pixel (x, y).
+    mouse_move: struct { x: i32, y: i32 },
+    /// Mouse capture was lost (e.g. alt-tab mid-drag) — end any local drag
+    /// without synthesizing a reportable button event.
+    mouse_capture_lost,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
     /// The user requested the window close.
@@ -126,8 +142,38 @@ pub const Window = struct {
         if (fmt == 0) return error.PixelFormatFailed;
         if (w.SetPixelFormat(self.hdc, fmt, &pfd) == w.FALSE) return error.PixelFormatFailed;
 
-        self.hglrc = w.wglCreateContext(self.hdc) orelse return error.ContextFailed;
-        if (w.wglMakeCurrent(self.hdc, self.hglrc) == w.FALSE) return error.ContextFailed;
+        // Bootstrap a legacy context so wglCreateContextAttribsARB can be
+        // resolved, then upgrade to a 3.3 core context. The renderer hard-requires
+        // GL >= 3.3 (`#version 330 core` shaders, VAOs, sized R8 textures); a bare
+        // wglCreateContext can hand back GL 1.1 (Microsoft GDI generic), which
+        // makes shader compilation / VAO loading fail at startup.
+        const legacy = w.wglCreateContext(self.hdc) orelse return error.ContextFailed;
+        if (w.wglMakeCurrent(self.hdc, legacy) == w.FALSE) {
+            _ = w.wglDeleteContext(legacy);
+            return error.ContextFailed;
+        }
+
+        if (@as(?w.CreateContextAttribsFn, @ptrCast(w.wglProcChecked("wglCreateContextAttribsARB")))) |createAttribs| {
+            const attribs = [_:0]w.INT{
+                w.WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+                w.WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+                w.WGL_CONTEXT_PROFILE_MASK_ARB,  w.WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            };
+            if (createAttribs(self.hdc, null, &attribs)) |core| {
+                _ = w.wglMakeCurrent(null, null);
+                _ = w.wglDeleteContext(legacy);
+                self.hglrc = core;
+                if (w.wglMakeCurrent(self.hdc, self.hglrc) == w.FALSE) return error.ContextFailed;
+                return;
+            }
+            log.warn("wglCreateContextAttribsARB failed; falling back to the legacy GL context", .{});
+        } else {
+            log.warn("wglCreateContextAttribsARB unavailable; falling back to the legacy GL context", .{});
+        }
+
+        // Fallback: keep the legacy context (a real ICD often still reports a
+        // >= 3.3 compatibility profile, which the renderer can use).
+        self.hglrc = legacy;
     }
 
     pub fn deinit(self: *Window) void {
@@ -140,6 +186,11 @@ pub const Window = struct {
 
     pub fn makeCurrent(self: *Window) void {
         _ = w.wglMakeCurrent(self.hdc, self.hglrc);
+    }
+
+    /// The native window handle (for synchronous Win32 calls like the clipboard).
+    pub fn handle(self: *Window) w.HWND {
+        return self.hwnd;
     }
 
     pub fn swapBuffers(self: *Window) void {
@@ -196,6 +247,14 @@ pub const Window = struct {
         };
     }
 
+    /// Decode the signed client-area x/y packed in a mouse message's lParam.
+    fn mouseXY(lparam: w.LPARAM) struct { x: i32, y: i32 } {
+        const lp: usize = @bitCast(lparam);
+        const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(lp & 0xFFFF))));
+        const y: i32 = @as(i16, @bitCast(@as(u16, @truncate((lp >> 16) & 0xFFFF))));
+        return .{ .x = x, .y = y };
+    }
+
     fn fromHwnd(hwnd: w.HWND) ?*Window {
         const ud = w.GetWindowLongPtrW(hwnd, w.GWLP_USERDATA);
         if (ud == 0) return null;
@@ -234,6 +293,76 @@ pub const Window = struct {
                     // The wheel delta is the signed high word of wParam.
                     const hi: u16 = @truncate((wparam >> 16) & 0xFFFF);
                     s.push(.{ .scroll = @as(i16, @bitCast(hi)) });
+                }
+                return 0;
+            },
+            w.WM_LBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    // Capture so a left-drag that leaves the window still
+                    // delivers moves/up to this window.
+                    _ = w.SetCapture(hwnd);
+                    s.push(.{ .mouse_button = .{ .button = .left, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_LBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    _ = w.ReleaseCapture();
+                    s.push(.{ .mouse_button = .{ .button = .left, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_RBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .right, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_RBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .right, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_MBUTTONDOWN => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .middle, .down = true, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_MBUTTONUP => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    s.push(.{ .mouse_button = .{ .button = .middle, .down = false, .x = p.x, .y = p.y, .mods = currentMods() } });
+                }
+                return 0;
+            },
+            w.WM_CAPTURECHANGED => {
+                // Capture was revoked without an LBUTTONUP (alt-tab / modal /
+                // Win+L mid-drag). End the drag (free the anchor pin) without
+                // emitting a reportable button event.
+                if (self) |s| s.push(.mouse_capture_lost);
+                return 0;
+            },
+            w.WM_MOUSEMOVE => {
+                if (self) |s| {
+                    const p = mouseXY(lparam);
+                    // Coalesce: replace a pending trailing move rather than
+                    // flooding the ring during a fast drag (which could push the
+                    // mouse-up out).
+                    if (s.tail > s.head) {
+                        const last = &s.events[(s.tail - 1) % queue_len];
+                        if (std.meta.activeTag(last.*) == .mouse_move) {
+                            last.* = .{ .mouse_move = .{ .x = p.x, .y = p.y } };
+                            return 0;
+                        }
+                    }
+                    s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y } });
                 }
                 return 0;
             },

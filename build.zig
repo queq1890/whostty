@@ -62,4 +62,29 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    // Headless render proof (Linux/EGL + Mesa): exercises the real OpenGL.zig
+    // shaders/geometry, font/main.zig (Freetype) and font/Atlas.zig on a genuine
+    // GL 3.3 core context and asserts glyphs reach lit pixels — on-device
+    // verification of the Windows renderer is WDAC-blocked, so this stands in.
+    // Always built for the native host; requires the freetype source + Mesa.
+    // Pin glibc to 2.42 (the max Zig 0.15.2 bundles) so the build works on hosts
+    // reporting a newer glibc; the binary still runs against the system glibc.
+    const native_target = b.resolveTargetQuery(.{ .glibc_version = .{ .major = 2, .minor = 42, .patch = 0 } });
+    const offscreen = b.addExecutable(.{
+        .name = "offscreen-proof",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/offscreen_proof.zig"),
+            .target = native_target,
+            .optimize = optimize,
+        }),
+    });
+    offscreen.root_module.link_libc = true;
+    const off_step = b.step("offscreen-proof", "Headless GL render proof (Linux/EGL)");
+    if (b.lazyDependency("freetype", .{ .target = native_target, .optimize = optimize })) |dep| {
+        offscreen.root_module.addImport("freetype", dep.module("freetype"));
+        offscreen.root_module.linkLibrary(dep.artifact("freetype"));
+        const off_run = b.addRunArtifact(offscreen);
+        off_step.dependOn(&off_run.step);
+    }
 }

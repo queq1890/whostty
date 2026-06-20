@@ -26,6 +26,7 @@ const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
 const binding = @import("../../input/Binding.zig");
 const keymap = @import("keymap.zig");
+const mouse = @import("../../mouse.zig");
 
 const log = std.log.scoped(.app);
 
@@ -46,16 +47,24 @@ const Theme = struct {
     fg: vt.color.RGB,
     bg: vt.color.RGB,
     palette: vt.color.Palette,
+    /// Selection highlight (renderer floats). Defaults to reverse video (the
+    /// cell's fg becomes the selection bg and vice versa) when unconfigured.
+    sel_bg: [3]f32,
+    sel_fg: [3]f32,
 
     fn fromConfig(cfg: *const config.Config) Theme {
         var palette: vt.color.Palette = vt.color.default;
         for (cfg.palette, 0..) |override, i| {
             if (override) |c| palette[i] = toVtRgb(c);
         }
+        const fg = toVtRgb(cfg.foreground);
+        const bg = toVtRgb(cfg.background);
         return .{
-            .fg = toVtRgb(cfg.foreground),
-            .bg = toVtRgb(cfg.background),
+            .fg = fg,
+            .bg = bg,
             .palette = palette,
+            .sel_bg = rgbf(if (cfg.selection_background) |c| toVtRgb(c) else fg),
+            .sel_fg = rgbf(if (cfg.selection_foreground) |c| toVtRgb(c) else bg),
         };
     }
 };
@@ -140,7 +149,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     if (build_options.freetype) {
         const px: u32 = @intFromFloat(@max(1, @round(cfg.font_size)));
-        try buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px);
+        // A missing/unreadable font must not abort launch: fall back to the
+        // empty atlas (blank glyphs) exactly like the non-freetype build.
+        buildAtlas(alloc, &atlas, &glyphs, &cell_w, &cell_h, &ascent, px) catch |err| {
+            log.warn("glyph atlas build failed ({s}); rendering with blank glyphs", .{@errorName(err)});
+        };
     }
     renderer.setAtlas(atlas.data, atlas.size);
 
@@ -182,18 +195,56 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer quads.deinit(alloc);
     var wheel: scroll.WheelAccumulator = .{};
 
+    // One-shot render self-verification (WHOSTTY_RENDER_DEBUG=1) — counts lit
+    // pixels a few frames in so a build that can't be screenshotted can confirm
+    // glyphs reached the framebuffer. See Renderer.debugCountLitPixels.
+    var frame: u32 = 0;
+    const render_debug = blk: {
+        const v = std.process.getEnvVarOwned(alloc, "WHOSTTY_RENDER_DEBUG") catch break :blk false;
+        defer alloc.free(v);
+        break :blk std.mem.eql(u8, v, "1");
+    };
+
+    // Enter/Tab/Backspace/Escape are VT-encoded on their WM_KEYDOWN; Windows also
+    // posts a WM_CHAR control char for them. This one-shot flag, set when such a
+    // key is seen, drops that trailing WM_CHAR so the key isn't sent twice — while
+    // still letting Ctrl+[ / Ctrl+M / etc. (which have no WM_KEYDOWN path) pass.
+    var suppress_next_char = false;
+
     while (win.pump()) {
         var closed = false;
         while (win.poll()) |ev| switch (ev) {
             // Typing snaps back to the bottom, matching common terminals.
             .char => |cp| {
+                // Drop the WM_CHAR that trails a handled Enter/Tab/Backspace/
+                // Escape WM_KEYDOWN (flagged below) so the key isn't sent twice.
+                if (suppress_next_char) {
+                    suppress_next_char = false;
+                    continue;
+                }
                 io.scrollToBottom();
                 writeChar(&pty, cp);
             },
             .key => |k| {
+                // These keys are VT-encoded here and ALSO post a WM_CHAR; mark the
+                // trailing WM_CHAR for suppression whether the key is sent to the
+                // shell or consumed as a keybind. Other keys clear the flag.
+                suppress_next_char = switch (k.vk) {
+                    input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
+                    else => false,
+                };
+
                 // A bound chord is consumed as an action; otherwise it's a
                 // normal key written to the shell.
-                if (handleKeybind(k, &binds, io, sfc.rows)) continue;
+                const ctx: KeybindCtx = .{
+                    .binds = &binds,
+                    .io = io,
+                    .rows = sfc.rows,
+                    .alloc = alloc,
+                    .win = win,
+                    .pty = &pty,
+                };
+                if (handleKeybind(k, ctx)) continue;
                 io.scrollToBottom();
                 writeKey(&pty, k.vk);
             },
@@ -201,6 +252,20 @@ pub fn run(alloc: std.mem.Allocator) !void {
                 const delta = wheel.feed(raw);
                 if (delta != 0) io.scrollViewport(delta);
             },
+            .mouse_button => |m| {
+                const btn: mouse.Button = switch (m.button) {
+                    .left => .left,
+                    .middle => .middle,
+                    .right => .right,
+                };
+                sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
+                    .shift = m.mods.shift,
+                    .alt = m.mods.alt,
+                    .ctrl = m.mods.ctrl,
+                });
+            },
+            .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
+            .mouse_capture_lost => sfc.endDrag(),
             .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
             .close => closed = true,
         };
@@ -209,6 +274,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
         const sz = win.clientSize();
         try buildQuads(alloc, &quads, io, &glyphs, cell_w, cell_h, ascent, &theme);
         try renderer.draw(quads.items, rgbf(theme.bg), sz.width, sz.height);
+
+        frame += 1;
+        if (render_debug and frame == 10) renderer.debugCountLitPixels(rgbf(theme.bg), sz.width, sz.height);
+
         win.swapBuffers();
     }
 }
@@ -240,9 +309,20 @@ fn writeKey(pty: *Pty, code: u32) void {
     if (out.len > 0) _ = pty.write(out) catch {};
 }
 
+/// Context a keybind action needs: the binding set, the terminal io, and the
+/// window/pty/allocator that clipboard actions reach into.
+const KeybindCtx = struct {
+    binds: *const binding.Set,
+    io: *Termio,
+    rows: u16,
+    alloc: std.mem.Allocator,
+    win: *Window,
+    pty: *Pty,
+};
+
 /// Look up a key event in the binding set and run the bound action. Returns true
 /// if a binding matched and was handled (so the key is not also sent to the pty).
-fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) bool {
+fn handleKeybind(k: anytype, ctx: KeybindCtx) bool {
     const key = keymap.keyFromVk(k.vk) orelse return false;
     const trigger: binding.Trigger = .{ .key = key, .mods = .{
         .ctrl = k.mods.ctrl,
@@ -250,24 +330,67 @@ fn handleKeybind(k: anytype, binds: *const binding.Set, io: *Termio, rows: u16) 
         .alt = k.mods.alt,
         .super = k.mods.super,
     } };
-    const action = binds.get(trigger) orelse return false;
-    dispatchAction(action, io, rows);
+    const action = ctx.binds.get(trigger) orelse return false;
+    dispatchAction(action, ctx);
     return true;
 }
 
-/// Run a bound action. Scrollback actions act on the single current surface;
-/// split/tab actions are recognized but need multi-surface support (#18) before
-/// they can do anything, so they're logged for now.
-fn dispatchAction(action: binding.Action, io: *Termio, rows: u16) void {
+/// Run a bound action. Scrollback + clipboard actions act on the single current
+/// surface; split/tab actions are recognized but need multi-surface support
+/// (#18) before they can do anything, so they're logged for now.
+fn dispatchAction(action: binding.Action, ctx: KeybindCtx) void {
     switch (action) {
-        .scroll_page_up => io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(rows)))),
-        .scroll_page_down => io.scrollViewport(@as(isize, @intCast(scroll.pageRows(rows)))),
-        .scroll_to_bottom => io.scrollToBottom(),
-        .scroll_to_top => io.scrollViewport(-1_000_000), // clamps at the top of history
+        .scroll_page_up => ctx.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
+        .scroll_page_down => ctx.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
+        .scroll_to_bottom => ctx.io.scrollToBottom(),
+        .scroll_to_top => ctx.io.scrollViewport(-1_000_000), // clamps at the top of history
+        .copy_to_clipboard => copyToClipboard(ctx),
+        .paste_from_clipboard => pasteFromClipboard(ctx),
         .new_split, .goto_split, .new_tab, .close_surface, .next_tab, .previous_tab, .goto_tab => {
             log.debug("keybind action '{s}' needs multi-surface support (not yet wired)", .{@tagName(std.meta.activeTag(action))});
         },
     }
+}
+
+/// Paste the system clipboard into the shell. Reads CF_UNICODETEXT, encodes via
+/// libghostty-vt's paste encoder (strips unsafe bytes, applies bracketed-paste
+/// fenceposts when mode 2004 is on), and writes the result to the pty.
+fn pasteFromClipboard(ctx: KeybindCtx) void {
+    const text = (w.clipboardRead(ctx.alloc, ctx.win.handle()) catch return) orelse return;
+    defer ctx.alloc.free(text);
+    if (text.len == 0) return;
+
+    const bracketed = blk: {
+        ctx.io.lock();
+        defer ctx.io.unlock();
+        break :blk ctx.io.terminal.modes.get(.bracketed_paste);
+    };
+
+    ctx.io.scrollToBottom();
+
+    // encodePaste mutates the buffer in place (control-byte stripping / \n->\r),
+    // so pass a mutable copy to use the infallible []u8 overload.
+    const buf = ctx.alloc.dupe(u8, text) catch return;
+    defer ctx.alloc.free(buf);
+    const parts = vt.input.encodePaste(buf, .{ .bracketed = bracketed });
+    for (parts) |part| {
+        if (part.len > 0) _ = ctx.pty.write(part) catch {};
+    }
+}
+
+/// Copy the current selection to the system clipboard. A no-op when there is no
+/// selection (selection is set by mouse-drag, #51).
+fn copyToClipboard(ctx: KeybindCtx) void {
+    const text = blk: {
+        ctx.io.lock();
+        defer ctx.io.unlock();
+        const screen = ctx.io.terminal.screens.active; // *Screen
+        const sel = screen.selection orelse break :blk null;
+        break :blk screen.selectionString(ctx.alloc, .{ .sel = sel, .trim = true }) catch null;
+    } orelse return;
+    defer ctx.alloc.free(text);
+    if (text.len == 0) return;
+    w.clipboardWrite(ctx.alloc, ctx.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
 }
 
 /// Build the per-glyph atlas for printable ASCII via Freetype. Only compiled
@@ -338,6 +461,7 @@ fn buildQuads(
 
     const term = &io.terminal;
     const screen = term.screens.active;
+    const sel = screen.selection;
     const palette = &theme.palette;
     const rows: u32 = term.rows;
     const cols: u32 = term.cols;
@@ -364,6 +488,18 @@ fn buildQuads(
                 const old_fg = fg;
                 fg = bg orelse rgbf(theme.bg);
                 bg = old_fg;
+            }
+
+            // Selection highlight overrides the cell colors (reverse-video by
+            // default). Per-cell containment is fine for whostty's already
+            // per-cell loop; only queried when a selection exists.
+            if (sel) |s| {
+                if (screen.pages.pin(.{ .viewport = .{ .x = @intCast(col), .y = @intCast(row) } })) |p| {
+                    if (s.contains(screen, p)) {
+                        bg = theme.sel_bg;
+                        fg = theme.sel_fg;
+                    }
+                }
             }
 
             const cell_x: i32 = @intCast(col * cell_w);
