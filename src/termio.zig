@@ -297,6 +297,20 @@ pub const Termio = struct {
         return self.terminal.colors.background.get() orelse fallback;
     }
 
+    /// The focus report to send the pty for a focus change, or null if the app
+    /// hasn't enabled focus reporting (DEC mode 1004). `CSI I` = focus in,
+    /// `CSI O` = focus out. Thread-safe; the returned slice is a static literal.
+    ///
+    /// Reports the change only. ghostty additionally emits the current focus
+    /// state the instant mode 1004 is enabled; that on-enable report needs the
+    /// window focus state (which lives in the app layer) and is deferred.
+    pub fn focusReport(self: *Termio, focused: bool) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.terminal.modes.get(.focus_event)) return null;
+        return if (focused) "\x1b[I" else "\x1b[O";
+    }
+
     /// Key-encoding options derived from the current terminal state: cursor-key
     /// application mode (DECCKM), keypad mode, modify-other-keys, and the
     /// alt-esc prefix. Kitty keyboard output is forced **off**: the Win32 layer
@@ -669,6 +683,25 @@ test "termio: OSC 12 cursor query reports seed then OSC override" {
         "\x1b]12;rgb:eeee/dddd/cccc\x07",
         try replyTo(io, "\x1b]12;?\x07", &buf),
     );
+}
+
+test "termio: focus reporting follows DEC mode 1004" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Off by default: no report.
+    try std.testing.expect(io.focusReport(true) == null);
+    try std.testing.expect(io.focusReport(false) == null);
+
+    // App enables focus reporting -> CSI I on focus in, CSI O on focus out.
+    try io.process("\x1b[?1004h");
+    try std.testing.expectEqualStrings("\x1b[I", io.focusReport(true).?);
+    try std.testing.expectEqualStrings("\x1b[O", io.focusReport(false).?);
+
+    // Disabling stops the reports.
+    try io.process("\x1b[?1004l");
+    try std.testing.expect(io.focusReport(true) == null);
 }
 
 test "termio: takeResponse drains and clears the queue" {
