@@ -115,6 +115,7 @@ test {
     _ = @import("mouse.zig");
     _ = @import("cli.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
+    if (@import("build_options").freetype) _ = @import("font/GlyphCache.zig");
 }
 
 test "vt: feed bytes and read back grid state" {

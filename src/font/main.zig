@@ -69,6 +69,13 @@ pub const Face = struct {
         };
     }
 
+    /// The face's glyph index for `codepoint`, or null if the face has no glyph
+    /// for it. Lets a caller draw nothing (blank) for unsupported codepoints
+    /// instead of the `.notdef` box, pending per-codepoint fallback (#75).
+    pub fn glyphIndex(self: Face, codepoint: u32) ?u32 {
+        return self.inner.getCharIndex(codepoint);
+    }
+
     /// Rasterize a single Unicode codepoint to an 8-bit alpha bitmap.
     pub fn rasterize(self: Face, alloc: std.mem.Allocator, codepoint: u32) !Glyph {
         const idx = self.inner.getCharIndex(codepoint) orelse 0;
