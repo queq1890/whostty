@@ -113,13 +113,19 @@ pub const Window = struct {
         ContextFailed,
     };
 
-    /// Create the window and its GL context. `self` must have a stable address
-    /// (heap-allocate it) because the window stores a pointer back to it.
-    pub fn init(self: *Window, title_utf8: []const u8, width: i32, height: i32) CreateError!void {
-        self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined };
+    /// Window classes are a process-global resource: `RegisterClassExW` succeeds
+    /// once and every later call for the same class name fails with
+    /// `ERROR_CLASS_ALREADY_EXISTS`. With multi-window/thread-per-window (#86) a
+    /// second window thread must NOT re-register, so registration is done exactly
+    /// once per process behind `std.once`. The class lives for the process
+    /// lifetime (never unregistered), shared by every `CreateWindowExW`. The result
+    /// is published to `register_ok` so `init` can fail cleanly if the one-time
+    /// registration genuinely failed (vs. the benign already-registered case).
+    var register_class_once = std.once(registerClassOnce);
+    var register_ok: bool = false;
 
+    fn registerClassOnce() void {
         const hinstance = w.GetModuleHandleW(null).?;
-
         const wc: w.WNDCLASSEXW = .{
             .cbSize = @sizeOf(w.WNDCLASSEXW),
             .style = w.CS_OWNDC | w.CS_HREDRAW | w.CS_VREDRAW,
@@ -134,7 +140,24 @@ pub const Window = struct {
             .lpszClassName = class_name,
             .hIconSm = null,
         };
-        if (w.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;
+        // A non-zero ATOM is success; treat ERROR_CLASS_ALREADY_EXISTS (a class
+        // left over from a prior partially-failed run in the same process) as
+        // success too, since the class we need is present either way.
+        register_ok = w.RegisterClassExW(&wc) != 0 or
+            w.GetLastError() == w.ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    /// Create the window and its GL context. `self` must have a stable address
+    /// (heap-allocate it) because the window stores a pointer back to it.
+    pub fn init(self: *Window, title_utf8: []const u8, width: i32, height: i32) CreateError!void {
+        self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined };
+
+        const hinstance = w.GetModuleHandleW(null).?;
+
+        // Register the window class once per process (thread-safe via std.once);
+        // every window after the first reuses the already-registered class.
+        register_class_once.call();
+        if (!register_ok) return error.RegisterClassFailed;
 
         var title_buf: [256]u16 = undefined;
         const title_z = captionUtf16(title_utf8, &title_buf) orelse

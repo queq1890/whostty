@@ -37,6 +37,7 @@ const mouse = @import("../../mouse.zig");
 const cli = @import("../../cli.zig");
 const frame = @import("../../frame.zig");
 const discovery = @import("../../font/discovery.zig");
+const apprt = @import("../action.zig");
 
 const log = std.log.scoped(.app);
 
@@ -181,8 +182,153 @@ fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
     return try config.Config.parse(alloc, data);
 }
 
-/// The full slice-0 terminal. Run on the main thread.
+/// The small, heap-allocated state shared across every window thread (#86). It is
+/// the ONLY cross-thread mutable object: it holds the allocator (std GPA, thread-
+/// safe by default), the read-only CLI options, and the multi-window lifecycle
+/// bookkeeping (a live-window counter + a tracked thread list, both guarded by a
+/// mutex). NO per-window resource lives here — each window thread owns its own
+/// Window/GL-context/Pty/io/GlyphCache(FT_Library)/binding.Set/config, so there is
+/// zero shared mutable per-window state and FreeType/GL isolation is automatic.
+/// `config` is loaded per-window inside `runSurface` (each thread parses its own,
+/// owning its arena) rather than shared, so one window's `cfg.deinit()` can never
+/// free memory another reads.
+const App = struct {
+    alloc: std.mem.Allocator,
+    /// Parsed CLI options — read-only after `main` parses them, freely shared
+    /// (each window's Pty borrows `opts.command`, which outlives all windows).
+    opts: cli.Options,
+
+    /// Guards `live` and `threads`. Held only briefly (counter bump + list
+    /// append/iterate); never held across a blocking window operation.
+    mutex: std.Thread.Mutex = .{},
+    /// Number of live windows. A window thread increments this on entry and
+    /// decrements on exit; `run` returns only once it reaches 0.
+    live: usize = 0,
+    /// Signaled whenever `live` transitions to 0 so the orchestrator can wake and
+    /// (after joining the threads) tear down. A plain `Condition` on `mutex`.
+    empty: std.Thread.Condition = .{},
+    /// Every spawned window thread, joined by `run` before it returns so no thread
+    /// handle leaks. Threads are tracked (not detached) precisely so the
+    /// orchestrator can join them all. NOTE: finished threads are reaped only at
+    /// the final join (when the last window closes), not eagerly as each window
+    /// closes — so a session that opens/closes many windows holds one thread
+    /// handle per closed window until exit. Bounded and freed at exit (every
+    /// thread IS joined), not a true leak; eager reaping is a follow-up (it needs
+    /// per-slot done-flags + join-under-mutex, which deserves its own review and
+    /// shouldn't be bolted onto this refactor). Join-at-end is also what makes the
+    /// lifecycle race-free: it guarantees every thread has fully exited before
+    /// `App` (which holds the mutex/condition) is destroyed.
+    threads: std.ArrayList(std.Thread) = .empty,
+    /// The first error any window thread hit during startup, captured so `run`
+    /// can return a non-zero exit (matching the pre-#86 inline behavior where a
+    /// first-window startup failure propagated to `main`). First-writer-wins;
+    /// a normal window close returns void and never sets this.
+    first_error: ?anyerror = null,
+
+    /// Spawn a fully independent new window on its own thread (#86). Called both
+    /// for the first window (from `run`) and re-entrantly from a live window
+    /// thread handling `new_window`. Only touches `App` (the counter, the thread
+    /// list) — never the caller's per-window resources. `live` is bumped BEFORE
+    /// the thread is spawned so the count can never transiently read 0 between an
+    /// old window closing and the new one starting.
+    fn spawnWindow(self: *App) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Reserve the tracking slot BEFORE spawning so that once the thread is
+        // live there is no fallible step left that could fail and orphan it. The
+        // counter is then the running thread's to decrement (exactly once) on
+        // exit; `spawnWindow` owns the matching increment.
+        try self.threads.ensureUnusedCapacity(self.alloc, 1);
+
+        self.live += 1;
+        errdefer self.live -= 1; // only fires if spawn itself fails (no thread yet)
+        const t = try std.Thread.spawn(.{}, surfaceThread, .{self});
+        self.threads.appendAssumeCapacity(t); // infallible: capacity reserved above
+    }
+
+    /// A window thread's body: run one window to completion, then decrement the
+    /// live counter and wake the orchestrator if this was the last window. The
+    /// per-thread COM apartment, FT_Library, and GL context are all created and
+    /// destroyed inside `runSurface`.
+    fn surfaceThread(self: *App) void {
+        const result = runSurface(self);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (result) |_| {} else |e| {
+            log.err("window thread failed: {}", .{e});
+            if (self.first_error == null) self.first_error = e;
+        }
+        self.live -= 1;
+        if (self.live == 0) self.empty.signal();
+    }
+
+    /// Block until every window has closed (live count == 0). The first window is
+    /// spawned before this is called, so `live` is already >= 1 on entry and the
+    /// wait can't return spuriously-early before any window started.
+    fn waitUntilEmpty(self: *App) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.live != 0) self.empty.wait(&self.mutex);
+    }
+};
+
+/// whostty's entry point (called from `main`). The orchestrator for the
+/// multi-window, thread-per-window runtime (#86): build the shared `App`, spawn
+/// the FIRST window (which runs on its own thread exactly like every later one —
+/// it is NOT special), then block until the last window closes before tearing the
+/// app down and returning. Returning exits the process, so this MUST NOT return
+/// while any window lives.
+///
+/// Single-window behavior is unchanged: with one window this spawns one thread,
+/// waits for it, joins it, and returns — the same setup/render/teardown as before,
+/// just hosted on a window thread via `App` instead of inline on the main thread.
 pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
+    var app: App = .{ .alloc = alloc, .opts = opts };
+    defer app.threads.deinit(alloc);
+
+    // Spawn the first window. If even that fails there is nothing to wait for.
+    try app.spawnWindow();
+
+    // Block until the live-window count hits 0 (the last window closed). Never
+    // returns while a window is alive — the process stays up as long as any
+    // window does.
+    app.waitUntilEmpty();
+
+    // Every window thread has signaled exit; join them so no thread handle leaks
+    // before `run` (and thus the process) returns. Each thread has already run its
+    // own full teardown (pty.cancelRead, reader.join, GL/FT/COM teardown) before
+    // decrementing the counter, so joining here only reaps the handles.
+    for (app.threads.items) |t| t.join();
+
+    // Surface a first-window startup failure as a non-zero exit (the pre-#86
+    // inline run() propagated it to main; the threaded surfaceThread otherwise
+    // swallows it after logging). A normal close leaves first_error null.
+    if (app.first_error) |e| return e;
+}
+
+/// One window, start to finish, on its OWN thread (#86). This is the OLD `run`
+/// body verbatim — it creates and owns every per-window resource (Window + WGL/GL
+/// context, GlyphCache with its own FT_Library, Pty + shell, Termio, the reader
+/// thread, the binding set, the surface, all loop-locals) and runs the blocking
+/// message loop until the window closes, then runs the teardown defers. The shared
+/// `app` is read for the allocator + CLI opts and reached only for `new_window`
+/// (which spawns a sibling window thread) and the close flag.
+fn runSurface(app: *App) !void {
+    const alloc = app.alloc;
+    const opts = app.opts;
+
+    // Per-thread COM apartment. DirectWrite font discovery today uses
+    // DWriteCreateFactory(SHARED), which needs no apartment init, so this is a
+    // forward-looking safety net: any apartment-bound COM added later (the
+    // apartment state is thread-local) needs a CoInitializeEx on EACH window
+    // thread, not once per process. Harmless if it returns S_FALSE (already
+    // initialized). Paired with CoUninitialize on thread exit.
+    // CoUninitialize must be paired only with a SUCCEEDED CoInitializeEx (S_OK or
+    // S_FALSE, both >= 0); a failure like RPC_E_CHANGED_MODE must NOT be balanced.
+    const co_hr = w.CoInitializeEx(null, w.COINIT_APARTMENTTHREADED);
+    defer if (co_hr >= 0) w.CoUninitialize();
+
     // --- Window + GL context (UI thread) ---
     const win = try alloc.create(Window);
     defer alloc.destroy(win);
@@ -314,6 +460,23 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         .origin_y = layout0.origin_y,
     };
 
+    // Set by performAction(.close_surface) (and the WM_CLOSE path) to break THIS
+    // window's loop on the next iteration. Closing breaks only this window; the
+    // process exits when the last window's loop ends (its thread decrements the
+    // shared live counter). Built once: every field is stable for the window's
+    // life (`sfc` is borrowed by pointer so `rows` stays live across resizes).
+    var close_requested = false;
+    const ctx: SurfaceCtx = .{
+        .app = app,
+        .binds = &binds,
+        .io = io,
+        .sfc = &sfc,
+        .alloc = alloc,
+        .win = win,
+        .pty = &pty,
+        .close_requested = &close_requested,
+    };
+
     // --- Main loop ---
     var quads: std.ArrayList(gl.Quad) = .empty;
     defer quads.deinit(alloc);
@@ -358,7 +521,6 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     var first_frame = true;
 
     while (win.pump()) {
-        var closed = false;
         // Any OS event (key/mouse/resize/focus/scroll) may change the frame, so
         // it forces a redraw this iteration.
         var ui_event = false;
@@ -389,14 +551,6 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                         // which produces CSI-u (or passes text through, per flags).
                         // Keybinds still take priority, but only on a press.
                         if (blink_timer) |*t| t.reset();
-                        const ctx: KeybindCtx = .{
-                            .binds = &binds,
-                            .io = io,
-                            .rows = sfc.rows,
-                            .alloc = alloc,
-                            .win = win,
-                            .pty = &pty,
-                        };
                         if (k.down and handleKeybind(k, ctx)) {
                             // A consumed chord still posts a trailing WM_CHAR for
                             // a text key; drop it so the bound key isn't also typed.
@@ -429,14 +583,6 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
 
                     // A bound chord is consumed as an action; otherwise it's a
                     // normal key written to the shell.
-                    const ctx: KeybindCtx = .{
-                        .binds = &binds,
-                        .io = io,
-                        .rows = sfc.rows,
-                        .alloc = alloc,
-                        .win = win,
-                        .pty = &pty,
-                    };
                     if (handleKeybind(k, ctx)) continue;
                     io.scrollToBottom();
                     writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), enc_opts);
@@ -474,11 +620,15 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                 // proceed to break the loop (which runs the shell/pty teardown
                 // defer) if the user confirms — or if nothing is running, in which
                 // case confirmClose returns true with no prompt. Choosing "No"
-                // leaves the window open with the shell intact.
-                .close => closed = win.confirmClose(),
+                // leaves the window open with the shell intact. close_surface
+                // (ctrl+shift+w via performAction) sets the same flag, so the X
+                // and the keybind share one teardown path.
+                .close => if (win.confirmClose()) {
+                    close_requested = true;
+                },
             }
         }
-        if (closed) break;
+        if (close_requested) break;
 
         // Drain VT replies the terminal owes the pty (DSR/DA/DECRQM), generated
         // on the reader thread as it parses queries. Writing them here keeps
@@ -760,20 +910,32 @@ fn writeKeyKitty(
     };
 }
 
-/// Context a keybind action needs: the binding set, the terminal io, and the
-/// window/pty/allocator that clipboard actions reach into.
-const KeybindCtx = struct {
+/// The per-window context a surface-scoped action acts on (#86) — the whostty
+/// stand-in for ghostty's `Target.surface: *CoreSurface`. Holds everything an
+/// action reaches into for THIS window: the binding set, the terminal io, the
+/// surface (for its live `rows`), the window/pty/allocator clipboard + window-
+/// state actions use, plus the `close_requested` flag a `close_surface` sets to
+/// break this window's loop. `app` is the shared state, threaded through so the
+/// app-scoped `new_window` can spawn a sibling window thread. Stack-resident in
+/// `runSurface`; every field is owned by (or, for `app`/`alloc`, safely shared
+/// across) the window thread.
+const SurfaceCtx = struct {
+    app: *App,
     binds: *const binding.Set,
     io: *Termio,
-    rows: u16,
+    sfc: *const surface.Surface,
     alloc: std.mem.Allocator,
     win: *Window,
     pty: *Pty,
+    close_requested: *bool,
 };
 
 /// Look up a key event in the binding set and run the bound action. Returns true
 /// if a binding matched and was handled (so the key is not also sent to the pty).
-fn handleKeybind(k: anytype, ctx: KeybindCtx) bool {
+/// The matched `binding.Action` is translated to the formal `apprt.Action` and
+/// dispatched through `performAction`, mirroring ghostty's
+/// `Surface.performBindingAction`.
+fn handleKeybind(k: anytype, ctx: SurfaceCtx) bool {
     const key = keymap.keyFromVk(k.vk) orelse return false;
     const trigger: binding.Trigger = .{ .key = key, .mods = .{
         .ctrl = k.mods.ctrl,
@@ -782,27 +944,81 @@ fn handleKeybind(k: anytype, ctx: KeybindCtx) bool {
         .super = k.mods.super,
     } };
     const action = ctx.binds.get(trigger) orelse return false;
-    dispatchAction(action, ctx);
+    _ = performAction(ctx.app, &ctx, apprt.fromBinding(action));
     return true;
 }
 
-/// Run a bound action. Scrollback + clipboard actions act on the single current
-/// surface; split/tab actions are recognized but need multi-surface support
-/// (#18) before they can do anything, so they're logged for now.
-fn dispatchAction(action: binding.Action, ctx: KeybindCtx) void {
+/// The formal apprt action dispatch (#86) — the whostty mirror of ghostty's
+/// `App.performAction` / the GTK `performAction` switch. Routes each `apprt.Action`
+/// to its effect: app-scoped actions act on the shared `app`; surface-scoped
+/// actions act on the calling window's `ctx`. Returns whether the action was
+/// handled (the still-stubbed tab/split actions return false). The split between
+/// app- and surface-scope follows `apprt.Action.target()`.
+///
+/// Threading: every surface-scoped effect touches only THIS window's resources
+/// (its io/win/pty/sfc), so this always runs on the owning window thread.
+/// `.new_window` is the only cross-thread step — it spawns an independent window
+/// thread via `app.spawnWindow()` and touches nothing of the caller's window.
+fn performAction(app: *App, ctx: *const SurfaceCtx, action: apprt.Action) bool {
     switch (action) {
-        .scroll_page_up => ctx.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
-        .scroll_page_down => ctx.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(ctx.rows)))),
-        .scroll_to_bottom => ctx.io.scrollToBottom(),
-        .scroll_to_top => ctx.io.scrollViewport(-1_000_000), // clamps at the top of history
-        .copy_to_clipboard => copyToClipboard(ctx),
-        .paste_from_clipboard => pasteFromClipboard(ctx),
-        // Window-state actions (#91) act on the single current window.
-        .toggle_fullscreen => ctx.win.toggleFullscreen(),
-        .toggle_maximize => ctx.win.toggleMaximize(),
-        .toggle_window_decorations => ctx.win.toggleDecorations(),
-        .new_split, .goto_split, .new_tab, .close_surface, .next_tab, .previous_tab, .goto_tab => {
-            log.debug("keybind action '{s}' needs multi-surface support (not yet wired)", .{@tagName(std.meta.activeTag(action))});
+        // --- App-scoped ---
+        .new_window => {
+            app.spawnWindow() catch |e| log.err("new_window: spawn failed: {}", .{e});
+            // Handled regardless: a failed spawn is logged, not propagated (the
+            // calling window keeps running), matching ghostty's best-effort
+            // new-window semantics.
+            return true;
+        },
+
+        // --- Surface-scoped: the calling window ---
+        .close_surface => {
+            // Break only THIS window's loop next iteration; the process exits when
+            // the last window's thread decrements the shared live counter.
+            ctx.close_requested.* = true;
+            return true;
+        },
+        .scroll_page_up => {
+            ctx.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(ctx.sfc.rows))));
+            return true;
+        },
+        .scroll_page_down => {
+            ctx.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(ctx.sfc.rows))));
+            return true;
+        },
+        .scroll_to_bottom => {
+            ctx.io.scrollToBottom();
+            return true;
+        },
+        .scroll_to_top => {
+            ctx.io.scrollViewport(-1_000_000); // clamps at the top of history
+            return true;
+        },
+        .copy_to_clipboard => {
+            copyToClipboard(ctx.*);
+            return true;
+        },
+        .paste_from_clipboard => {
+            pasteFromClipboard(ctx.*);
+            return true;
+        },
+        // Window-state actions (#91) act on the calling window.
+        .toggle_fullscreen => {
+            ctx.win.toggleFullscreen();
+            return true;
+        },
+        .toggle_maximize => {
+            ctx.win.toggleMaximize();
+            return true;
+        },
+        .toggle_window_decorations => {
+            ctx.win.toggleDecorations();
+            return true;
+        },
+
+        // --- Still stubbed: in-window subdivision (#87) ---
+        .new_split, .goto_split, .new_tab, .next_tab, .previous_tab, .goto_tab => {
+            log.debug("apprt action '{s}' needs in-window subdivision (#87)", .{@tagName(std.meta.activeTag(action))});
+            return false;
         },
     }
 }
@@ -810,7 +1026,7 @@ fn dispatchAction(action: binding.Action, ctx: KeybindCtx) void {
 /// Paste the system clipboard into the shell. Reads CF_UNICODETEXT, encodes via
 /// libghostty-vt's paste encoder (strips unsafe bytes, applies bracketed-paste
 /// fenceposts when mode 2004 is on), and writes the result to the pty.
-fn pasteFromClipboard(ctx: KeybindCtx) void {
+fn pasteFromClipboard(ctx: SurfaceCtx) void {
     const text = (w.clipboardRead(ctx.alloc, ctx.win.handle()) catch return) orelse return;
     defer ctx.alloc.free(text);
     if (text.len == 0) return;
@@ -835,7 +1051,7 @@ fn pasteFromClipboard(ctx: KeybindCtx) void {
 
 /// Copy the current selection to the system clipboard. A no-op when there is no
 /// selection (selection is set by mouse-drag, #51).
-fn copyToClipboard(ctx: KeybindCtx) void {
+fn copyToClipboard(ctx: SurfaceCtx) void {
     const text = blk: {
         ctx.io.lock();
         defer ctx.io.unlock();

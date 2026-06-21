@@ -85,6 +85,28 @@ pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*anyopaque) ca
 
 pub extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 
+/// System error code: a window class with this name is already registered. Window
+/// classes are process-global, so the second+ `RegisterClassExW` for the shared
+/// whostty class returns 0 and sets this — which the multi-window path (#86)
+/// treats as success rather than a fatal error.
+pub const ERROR_CLASS_ALREADY_EXISTS: DWORD = 1410;
+
+// --- COM apartment (ole32) -------------------------------------------------
+//
+// COM apartment state is THREAD-LOCAL, so with thread-per-window (#86) each
+// window thread that may touch apartment-bound COM must CoInitializeEx itself
+// (once per process is not enough). DirectWrite font discovery uses
+// DWriteCreateFactory(SHARED) which needs no apartment today, so these calls are
+// a forward-looking safety net; they are cheap and idempotent (S_FALSE when the
+// apartment is already initialized).
+
+/// COINIT flag: single-threaded (apartment-threaded) apartment. The conventional
+/// choice for a UI thread that owns an HWND.
+pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
+
+pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: DWORD) callconv(.winapi) HRESULT;
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+
 pub extern "kernel32" fn TerminateProcess(
     hProcess: HANDLE,
     uExitCode: c_uint,
