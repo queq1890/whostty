@@ -818,4 +818,62 @@ pub fn main() !void {
         }
         out.print("[proof] PASS: underline styles draw distinctly (dotted gaps, curly squiggle)\n", .{});
     }
+
+    // --- Per-codepoint fallback proof (#75): a fallback face fills CJK ---------
+    // The primary (DejaVu) lacks CJK, so U+4E00 (一) draws blank; a CJK fallback
+    // makes the GlyphCache rasterize + pack it, and that glyph must reach the
+    // framebuffer. Proves the fallback chain end-to-end (skipped if the CJK font
+    // isn't installed).
+    cjk: {
+        const cjk_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+        std.fs.accessAbsolute(cjk_path, .{}) catch {
+            out.print("[proof] SKIP: CJK fallback font not installed\n", .{});
+            break :cjk;
+        };
+
+        var cache = try GlyphCache.init(alloc, font_path, 24, 512);
+        defer cache.deinit();
+        // No fallback yet: the primary lacks U+4E00, so it draws nothing.
+        if (cache.get(0x4E00, false, false) != null) return error.PrimaryUnexpectedlyHasCjk;
+
+        var cache2 = try GlyphCache.init(alloc, font_path, 24, 512);
+        defer cache2.deinit();
+        cache2.addFallback(cjk_path);
+        const place = cache2.get(0x4E00, false, false) orelse return error.NoCjkFallbackGlyph;
+
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache2.atlas.size), @intCast(cache2.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache2.atlas.data.ptr);
+
+        var gv: std.ArrayList(gl.Vertex) = .empty;
+        defer gv.deinit(alloc);
+        try gl.pushQuad(&gv, alloc, .{
+            .px = 10,
+            .py = 10,
+            .sx = place.region.x,
+            .sy = place.region.y,
+            .sw = place.region.width,
+            .sh = place.region.height,
+            .r = 1,
+            .g = 1,
+            .b = 1,
+        }, screen_w, screen_h, cache2.atlas.size);
+        g.clearColor(clear[0], clear[1], clear[2], 1.0);
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.bufferData(GL_ARRAY_BUFFER, @intCast(gv.items.len * @sizeOf(gl.Vertex)), gv.items.ptr, GL_DYNAMIC_DRAW);
+        g.drawArrays(GL_TRIANGLES, 0, @intCast(gv.items.len));
+        g.finish();
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+        var clit: usize = 0;
+        var ci: usize = 0;
+        while (ci < n) : (ci += 1) {
+            if (@abs(@as(i16, buf[ci * 4]) - cr) > 2 or @abs(@as(i16, buf[ci * 4 + 1]) - cg) > 2 or @abs(@as(i16, buf[ci * 4 + 2]) - cb) > 2) clit += 1;
+        }
+        out.print("[proof] fallback: U+4E00 via CJK fallback lit pixels = {d}\n", .{clit});
+        if (clit == 0) {
+            out.print("[proof] FAIL: CJK fallback glyph did not reach the framebuffer\n", .{});
+            return error.CjkFallbackNotRendered;
+        }
+        out.print("[proof] PASS: per-codepoint fallback rasterized a CJK glyph the primary lacks (#75)\n", .{});
+    }
 }

@@ -48,6 +48,18 @@ const first_drawable: u21 = 0x21;
 /// discovery is #74; the configured size applies now.
 const default_font_path = "C:\\Windows\\Fonts\\consola.ttf";
 
+/// Fallback fonts tried (in order) for codepoints the primary font lacks (#75) —
+/// CJK first, then symbols. Each missing path is skipped, so this is a sensible
+/// Windows default; per-family discovery and a configurable chain via DirectWrite
+/// are #74. (Color emoji needs the 4-byte atlas of #78; these are monochrome.)
+const default_fallback_fonts = [_][:0]const u8{
+    "C:\\Windows\\Fonts\\YuGothM.ttc", // Yu Gothic Medium (JP, Win10+)
+    "C:\\Windows\\Fonts\\msgothic.ttc", // MS Gothic (JP/CJK)
+    "C:\\Windows\\Fonts\\malgun.ttf", // Malgun Gothic (KR)
+    "C:\\Windows\\Fonts\\simsun.ttc", // SimSun (Simplified Chinese)
+    "C:\\Windows\\Fonts\\seguisym.ttf", // Segoe UI Symbol
+};
+
 /// Atlas dimension (square, texels). Holds a few hundred packed glyphs; styled
 /// text keys glyphs by (codepoint, bold, italic), so a single codepoint can
 /// consume up to 4 regions (#77). Atlas growth/eviction when it fills is
@@ -210,6 +222,10 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         cell_w = cache.cell_w;
         cell_h = cache.cell_h;
         ascent = cache.ascent;
+        // Per-codepoint fallback (#75): register fallback faces (before any glyph
+        // is cached) so codepoints the primary font lacks — CJK, symbols — render
+        // from another font instead of drawing blank. Missing fonts are skipped.
+        for (default_fallback_fonts) |fb| cache.addFallback(fb);
         // Upload the (empty) atlas once so the glyph texture + its sampling
         // params are configured before the first draw; new glyphs re-upload.
         renderer.setAtlas(cache.atlas.data, cache.atlas.size);
