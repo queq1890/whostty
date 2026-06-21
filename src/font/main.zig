@@ -12,6 +12,16 @@ const c = freetype.c;
 
 pub const Library = freetype.Library;
 
+/// Byte pointer to row `r` of a FreeType bitmap. FreeType defines `pitch` as
+/// "the offset to add to a bitmap pointer to go down one row" *in all cases*, so
+/// row `r` is `buffer + r*pitch` for both a positive (top-down) and a negative
+/// (bottom-up) pitch — a single signed formula, no sign branch (which would read
+/// out of bounds for bottom-up bitmaps).
+fn bitmapRow(buffer: [*]const u8, r: u32, pitch: i32) [*]const u8 {
+    const off: isize = @as(isize, @intCast(r)) * @as(isize, pitch);
+    return @ptrFromInt(@as(usize, @intFromPtr(buffer)) +% @as(usize, @bitCast(off)));
+}
+
 /// A rasterized glyph: an 8-bit alpha coverage bitmap plus placement metrics.
 pub const Glyph = struct {
     /// Bitmap dimensions in pixels.
@@ -153,11 +163,7 @@ pub const Face = struct {
             const src: [*]const u8 = @ptrCast(bm.buffer);
             var y: u32 = 0;
             while (y < height) : (y += 1) {
-                const row_off: i64 = @as(i64, @intCast(y)) * pitch;
-                const src_row: [*]const u8 = if (pitch >= 0)
-                    src + @as(usize, @intCast(row_off))
-                else
-                    src + @as(usize, @intCast(@as(i64, @intCast((height - 1 - y))) * (-pitch)));
+                const src_row = bitmapRow(src, y, pitch);
                 @memcpy(pixels[y * width ..][0..width], src_row[0..width]);
             }
         }
@@ -210,11 +216,7 @@ pub const Face = struct {
         var ty: u32 = 0;
         while (ty < cell_h) : (ty += 1) {
             const sy = ty * sh / cell_h; // nearest-neighbor
-            // Source row honoring pitch sign (color bitmaps are usually top-down).
-            const src_row: [*]const u8 = if (pitch >= 0)
-                src + @as(usize, @intCast(@as(i64, @intCast(sy)) * pitch))
-            else
-                src + @as(usize, @intCast(@as(i64, @intCast(sh - 1 - sy)) * (-pitch)));
+            const src_row = bitmapRow(src, sy, pitch);
             var tx: u32 = 0;
             while (tx < cell_w) : (tx += 1) {
                 const sx = tx * sw / cell_w;

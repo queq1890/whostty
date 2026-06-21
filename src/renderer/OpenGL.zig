@@ -433,6 +433,9 @@ pub const Renderer = struct {
     /// Upload an R8 coverage atlas as the glyph texture.
     pub fn setAtlas(self: *Renderer, data: []const u8, size: u32) void {
         self.atlas_size = size;
+        // Select unit 0 explicitly so the upload doesn't depend on whichever unit
+        // a prior draw left active (the color atlas lives on unit 1).
+        self.gl.activeTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, self.atlas_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_R8), @intCast(size), @intCast(size), 0, GL_RED, GL_UNSIGNED_BYTE, data.ptr);
@@ -448,6 +451,9 @@ pub const Renderer = struct {
     /// straight-alpha RGBA bytes.
     pub fn setColorAtlas(self: *Renderer, data: []const u8, size: u32) void {
         self.color_atlas_size = size;
+        // Select unit 1 explicitly (its dedicated unit) so the upload is
+        // independent of the active unit left by a prior draw / setAtlas.
+        self.gl.activeTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, self.color_atlas_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA8), @intCast(size), @intCast(size), 0, GL_RGBA, GL_UNSIGNED_BYTE, data.ptr);
