@@ -268,7 +268,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         // opens its OWN face from the same path/size — a SEPARATE FT face, so
         // Harfbuzz shaping can't corrupt the rasterizer's face (see shaper.zig).
         if (cache.face != null) {
-            shaper_inst = shaper.Shaper.init(alloc, cache.lib, primary_path, cache.px, cfg.font_features.items) catch |err| blk: {
+            shaper_inst = shaper.Shaper.init(alloc, primary_path, cache.px, cfg.font_features.items) catch |err| blk: {
                 log.warn("shaper init failed ({s}); ligatures disabled", .{@errorName(err)});
                 break :blk null;
             };

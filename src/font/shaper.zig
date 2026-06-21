@@ -184,12 +184,19 @@ pub const ShapedGlyph = struct {
 /// its per-cell glyph path). A default-constructed `Shaper{}` has no font and
 /// also returns `error.Unimplemented`, so the seam stays valid in both builds.
 pub const Shaper = struct {
-    /// The shaper's OWN FreeType face, opened from the same font file as the
-    /// renderer's primary face — NOT shared. Harfbuzz shaping mutates the FT face
-    /// (loads glyphs, may change the active size), so sharing the rasterizer's
-    /// face corrupts glyph rasterization mid-frame (every glyph comes out empty).
-    /// Same file => identical glyph indices, so `GlyphCache.getByIndex` resolves
-    /// the shaped indices against its own face correctly.
+    /// The shaper's OWN FreeType library — NOT the rasterizer's `cache.lib`.
+    /// FreeType's FT_Library is non-reentrant (shared per-library glyph-loader /
+    /// raster state). Interleaving glyph loads on two faces of ONE library — the
+    /// shaper's `shape()` (own_face) and the cache's `getByIndex()` (cache.face),
+    /// alternating per row every frame — corrupts that shared state and
+    /// intermittently spins FT_Load_Glyph / FT_Render_Glyph (the #79 UI hang). A
+    /// separate library per independent face-user is FreeType's supported model.
+    own_lib: if (build_options.freetype) ?font.Library else void =
+        if (build_options.freetype) null else {},
+    /// The shaper's OWN FreeType face (opened from `own_lib`), separate from the
+    /// rasterizer's face. Harfbuzz shaping mutates the FT face; same font file =>
+    /// identical glyph indices, so `GlyphCache.getByIndex` resolves the shaped
+    /// indices against its own face correctly.
     own_face: if (build_options.freetype) ?font.Face else void =
         if (build_options.freetype) null else {},
     /// The hb font wrapping `own_face`. `null` until `init` runs (or always in
@@ -206,23 +213,23 @@ pub const Shaper = struct {
     features: if (build_options.freetype) []const harfbuzz.Feature else void =
         if (build_options.freetype) &.{} else {},
 
-    /// Build a shaper from the primary face. `features` are converted from the
-    /// project's `Feature` list (4-byte tag + value) into `hb_feature_t[]`; the
-    /// caller owns the converted slice and must keep it alive (or pass an
-    /// allocator-owned one freed by `deinit`). The FT face wrapped here must
-    /// outlive the shaper (Harfbuzz holds a counted reference, but the bytes
-    /// stay owned by `font.Face`).
+    /// Build a shaper that owns its FreeType library + face (opened from `path` at
+    /// `px`) and an hb_font over them. `features` are converted to `hb_feature_t[]`,
+    /// allocator-owned and freed by `deinit`. The shaper's library/face are kept
+    /// fully separate from the rasterizer's (see `own_lib`).
     pub fn init(
         alloc: std.mem.Allocator,
-        lib: font.Library,
         path: [:0]const u8,
         px: u32,
         features: []const Feature,
     ) !Shaper {
         comptime std.debug.assert(build_options.freetype);
-        // Open a SEPARATE face for Harfbuzz (see `own_face`): shaping mutates the
-        // FT face, so it must not be the one the GlyphCache rasterizes with.
-        var own_face = try font.Face.init(lib, path, px);
+        // Own library + face for Harfbuzz, fully separate from the rasterizer's
+        // (#79): sharing the FT_Library (not just the face) intermittently spins
+        // FreeType and hangs the UI thread.
+        var own_lib = try font.Library.init();
+        errdefer own_lib.deinit();
+        var own_face = try font.Face.init(own_lib, path, px);
         errdefer own_face.deinit();
         var hb_font = try harfbuzz.freetype.createFont(own_face.inner.handle);
         errdefer hb_font.destroy();
@@ -247,16 +254,17 @@ pub const Shaper = struct {
             };
         }
 
-        return .{ .own_face = own_face, .hb_font = hb_font, .hb_buf = hb_buf, .features = hb_feats };
+        return .{ .own_lib = own_lib, .own_face = own_face, .hb_font = hb_font, .hb_buf = hb_buf, .features = hb_feats };
     }
 
     pub fn deinit(self: *Shaper, alloc: std.mem.Allocator) void {
         if (build_options.freetype) {
             if (self.hb_buf) |*b| b.destroy();
+            // Destroy hb_font (holds a counted ref to own_face) first, then the
+            // face, then the library that owns the face.
             if (self.hb_font) |*f| f.destroy();
-            // Destroy hb_font (which holds a counted ref to own_face) BEFORE the
-            // face, then free our own face.
             if (self.own_face) |*f| f.deinit();
+            if (self.own_lib) |*l| l.deinit();
             alloc.free(self.features);
             self.* = .{};
         }
@@ -439,12 +447,9 @@ test "shaper: a font-backed shaper shapes a run into glyphs (#79)" {
     std.fs.accessAbsolute(path, .{}) catch return error.SkipZigTest;
     const alloc = testing.allocator;
 
-    var lib = try font.Library.init();
-    defer lib.deinit();
-
-    // The shaper opens its OWN face from `path` (separate from any rasterizer
-    // face), so pass the library + path + size, not a face.
-    var sh = try Shaper.init(alloc, lib, path, 24, &.{});
+    // The shaper opens its OWN FreeType library + face from `path` (#79), so it
+    // needs only the path + size.
+    var sh = try Shaper.init(alloc, path, 24, &.{});
     defer sh.deinit(alloc);
 
     // "Hi" — two narrow ASCII cells, one run, no ligature: two glyphs whose
