@@ -28,8 +28,15 @@ pub const Key = struct {
 alloc: std.mem.Allocator,
 lib: font.Library,
 /// null when the configured face could not be opened (missing font / bring-up):
-/// every lookup then misses and the renderer draws blank glyphs, as before.
+/// every lookup then misses (unless a fallback has the glyph) and the renderer
+/// draws blank, as before.
 face: ?font.Face,
+/// Pixel size faces are opened at; fallback faces added later use it too.
+px: u32,
+/// Per-codepoint fallback faces (#75), tried in order when the primary face
+/// lacks a glyph — so CJK / symbols / rare scripts render from another font
+/// instead of drawing blank. Empty by default (behaves exactly as before).
+fallbacks: std.ArrayListUnmanaged(font.Face),
 atlas: Atlas,
 /// (codepoint, style) -> placement, or a cached null meaning "draw nothing" (a
 /// blank glyph such as space, a codepoint the face lacks, or the atlas being
@@ -71,6 +78,8 @@ pub fn init(alloc: std.mem.Allocator, path: [:0]const u8, px: u32, atlas_size: u
         .alloc = alloc,
         .lib = lib,
         .face = face,
+        .px = px,
+        .fallbacks = .empty,
         .atlas = atlas,
         .map = .empty,
         .cell_w = cell_w,
@@ -80,9 +89,26 @@ pub fn init(alloc: std.mem.Allocator, path: [:0]const u8, px: u32, atlas_size: u
     };
 }
 
+/// Append a fallback face opened from `path` at the cache's pixel size (#75). A
+/// missing/unreadable path is skipped with a warning (best-effort — a terminal
+/// should still run if a fallback font isn't installed). Call after `init`,
+/// before rendering; fallbacks are tried in the order added.
+pub fn addFallback(self: *GlyphCache, path: [:0]const u8) void {
+    if (font.Face.init(self.lib, path, self.px)) |f| {
+        self.fallbacks.append(self.alloc, f) catch {
+            var ff = f;
+            ff.deinit();
+        };
+    } else |err| {
+        log.warn("fallback font '{s}' unavailable ({s}); skipping", .{ path, @errorName(err) });
+    }
+}
+
 pub fn deinit(self: *GlyphCache) void {
     self.map.deinit(self.alloc);
     if (self.face) |*f| f.deinit();
+    for (self.fallbacks.items) |*f| f.deinit();
+    self.fallbacks.deinit(self.alloc);
     self.lib.deinit();
     self.atlas.deinit(self.alloc);
     self.* = undefined;
@@ -108,11 +134,21 @@ pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placemen
     return placed;
 }
 
+/// The face to draw `cp` from: the primary if it has the glyph, else the first
+/// fallback that does (#75), else null (draw nothing — blank, not the .notdef
+/// box).
+fn faceFor(self: *GlyphCache, cp: u21) ?*font.Face {
+    if (self.face) |*f| {
+        if (f.glyphIndex(cp) != null) return f;
+    }
+    for (self.fallbacks.items) |*f| {
+        if (f.glyphIndex(cp) != null) return f;
+    }
+    return null;
+}
+
 fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
-    const face = self.face orelse return null;
-    // Draw nothing for codepoints the face lacks (blank, not the .notdef box) —
-    // per-codepoint fallback to another face is #75.
-    if (face.glyphIndex(key.cp) == null) return null;
+    const face = self.faceFor(key.cp) orelse return null;
     var g = face.rasterize(self.alloc, key.cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
     defer g.deinit(self.alloc);
     // A zero-area bitmap (space, control) has no quad.
@@ -213,4 +249,29 @@ test "glyphcache: a codepoint the face lacks draws nothing (no .notdef box)" {
     // DejaVuSansMono has no CJK; U+4E00 (一) must render as blank, not a box.
     try std.testing.expect(cache.get(0x4E00, false, false) == null);
     try std.testing.expect(!cache.takeDirty());
+}
+
+const cjk_fallback = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+
+test "glyphcache: a fallback face renders a glyph the primary lacks (#75)" {
+    std.fs.accessAbsolute(test_font, .{}) catch return error.SkipZigTest;
+    std.fs.accessAbsolute(cjk_fallback, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, test_font, 24, 512);
+    defer cache.deinit();
+
+    // Fallbacks are added right after init, before any glyph is cached (adding
+    // one later would not revisit a codepoint already cached as "draw nothing").
+    cache.addFallback(cjk_fallback);
+
+    // U+4E00 (一), which the primary DejaVu lacks, now packs a real glyph from
+    // the CJK fallback instead of drawing blank.
+    const placed = cache.get(0x4E00, false, false) orelse return error.NoFallbackGlyph;
+    try std.testing.expect(placed.region.width > 0 and placed.region.height > 0);
+    try std.testing.expect(cache.takeDirty());
+
+    // ASCII still comes from the primary face; a codepoint NEITHER face has
+    // still draws nothing (no fallback can fill it).
+    try std.testing.expect(cache.get('A', false, false) != null);
+    try std.testing.expect(cache.get(0x10FFFF, false, false) == null);
 }
