@@ -19,6 +19,7 @@ const Atlas = @import("font/Atlas.zig");
 const Termio = @import("termio.zig").Termio;
 const surface = @import("Surface.zig");
 const scroll = @import("scroll.zig");
+const decoration = @import("renderer/decoration.zig");
 const vt = @import("ghostty-vt");
 const vtcolor = vt.color;
 
@@ -746,5 +747,75 @@ pub fn main() !void {
             return error.BoldWrongColor;
         }
         out.print("[proof] PASS: bold-is-bright maps palette 1 -> 9 (Style.fg resolution; buildQuads wiring review-covered)\n", .{});
+    }
+
+    // --- Decoration sprites proof (#80): underline styles draw distinctly -----
+    // Render the SAME `decoration.underlineRects` geometry buildQuads uses: a
+    // dotted underline must leave gaps (fewer lit pixels than a solid single),
+    // and a curly underline must oscillate (span more than one row) — proving
+    // the styles reach the framebuffer as more than one flat line.
+    {
+        const cw: u32 = 40;
+        const base: i32 = 20;
+        const thick: u32 = 2;
+
+        const Measure = struct {
+            fn run(g2: GL, alloc2: std.mem.Allocator, rects: []const decoration.Rect, sw: u32, sh: u32, buf2: []u8, n2: usize, c: [3]i16) struct { lit: usize, min_y: usize, max_y: usize } {
+                var dverts: std.ArrayList(gl.Vertex) = .empty;
+                defer dverts.deinit(alloc2);
+                for (rects) |r| gl.pushSolid(&dverts, alloc2, .{ .px = r.x, .py = r.y, .w = r.w, .h = r.h, .r = 1, .g = 1, .b = 1 }, sw, sh) catch {};
+                g2.clearColor(0.1, 0.1, 0.12, 1.0);
+                g2.clear(GL_COLOR_BUFFER_BIT);
+                g2.bufferData(GL_ARRAY_BUFFER, @intCast(dverts.items.len * @sizeOf(gl.Vertex)), dverts.items.ptr, GL_DYNAMIC_DRAW);
+                g2.drawArrays(GL_TRIANGLES, 0, @intCast(dverts.items.len));
+                g2.finish();
+                g2.readPixels(0, 0, @intCast(sw), @intCast(sh), GL_RGBA, GL_UNSIGNED_BYTE, buf2.ptr);
+                var dlit: usize = 0;
+                var dmn: usize = sh;
+                var dmx: usize = 0;
+                var di: usize = 0;
+                while (di < n2) : (di += 1) {
+                    if (@abs(@as(i16, buf2[di * 4]) - c[0]) > 2 or @abs(@as(i16, buf2[di * 4 + 1]) - c[1]) > 2 or @abs(@as(i16, buf2[di * 4 + 2]) - c[2]) > 2) {
+                        dlit += 1;
+                        const dyrow = di / sw;
+                        dmn = @min(dmn, dyrow);
+                        dmx = @max(dmx, dyrow);
+                    }
+                }
+                // No lit pixels -> a 0-span (dmn was left at sh); normalize so the
+                // caller's `max_y - min_y` never underflows (usize).
+                if (dlit == 0) {
+                    dmn = 0;
+                    dmx = 0;
+                }
+                return .{ .lit = dlit, .min_y = dmn, .max_y = dmx };
+            }
+        };
+        const cc = [3]i16{ cr, cg, cb };
+
+        var single_rects: std.ArrayList(decoration.Rect) = .empty;
+        defer single_rects.deinit(alloc);
+        var dotted_rects: std.ArrayList(decoration.Rect) = .empty;
+        defer dotted_rects.deinit(alloc);
+        var curly_rects: std.ArrayList(decoration.Rect) = .empty;
+        defer curly_rects.deinit(alloc);
+        try decoration.underlineRects(&single_rects, alloc, .single, cw, base, thick);
+        try decoration.underlineRects(&dotted_rects, alloc, .dotted, cw, base, thick);
+        try decoration.underlineRects(&curly_rects, alloc, .curly, cw, base, thick);
+
+        const single = Measure.run(g, alloc, single_rects.items, screen_w, screen_h, buf, n, cc);
+        const dotted = Measure.run(g, alloc, dotted_rects.items, screen_w, screen_h, buf, n, cc);
+        const curly = Measure.run(g, alloc, curly_rects.items, screen_w, screen_h, buf, n, cc);
+
+        out.print("[proof] decorations: single lit={d}, dotted lit={d} (gaps), curly y-span={d}\n", .{ single.lit, dotted.lit, curly.max_y - curly.min_y });
+        if (dotted.lit == 0 or dotted.lit >= single.lit) {
+            out.print("[proof] FAIL: dotted underline did not leave gaps\n", .{});
+            return error.DottedNoGaps;
+        }
+        if (curly.max_y <= curly.min_y) {
+            out.print("[proof] FAIL: curly underline did not oscillate\n", .{});
+            return error.CurlyFlat;
+        }
+        out.print("[proof] PASS: underline styles draw distinctly (dotted gaps, curly squiggle)\n", .{});
     }
 }
