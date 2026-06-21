@@ -72,7 +72,11 @@ events cross that boundary (#85).
   plus the cwd's downstream consumers (title #89, new-window #87).
 - The side channel shares `Termio.mutex` with the grid, so a frame's drain and the
   reader's capture never race, and there is no second lock to reason about.
-- The kitty-keyboard *query* is answered, but kitty-form key *output* (the WM_CHAR
-  pipeline rework) remains deferred (#82), and the kitty *graphics* protocol is
-  blocked at the dependency layer — see
+- The kitty-keyboard *query* is answered and kitty-form key *output* is wired
+  (#82): when an app enables the protocol, printable and special keys alike route
+  through the encoder (deriving the unshifted codepoint + typed text via the Win32
+  keyboard APIs) and are emitted as CSI-u sequences; when it is off, legacy WM_CHAR
+  typing is byte-identical. Full Alt-as-Meta under kitty (Alt+printable as
+  `CSI …;3u`) stays deferred with the WM_SYSKEYDOWN forwarding work. The kitty
+  *graphics* protocol is blocked at the dependency layer — see
   [0009](0009-kitty-graphics-dependency-constraint.md).

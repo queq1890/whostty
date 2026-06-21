@@ -371,6 +371,46 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                     writeChar(&pty, cp);
                 },
                 .key => |k| {
+                    // Read the live key-encode options fresh per press: the reader
+                    // thread can flip the kitty keyboard flags between keystrokes.
+                    const enc_opts = io.keyEncodeOptions();
+                    const kitty = enc_opts.kitty_flags.int() != 0;
+
+                    if (kitty) {
+                        // --- Kitty keyboard output path (#82) ---
+                        // Printables and specials alike route through the encoder,
+                        // which produces CSI-u (or passes text through, per flags).
+                        // Keybinds still take priority, but only on a press.
+                        if (blink_timer) |*t| t.reset();
+                        const ctx: KeybindCtx = .{
+                            .binds = &binds,
+                            .io = io,
+                            .rows = sfc.rows,
+                            .alloc = alloc,
+                            .win = win,
+                            .pty = &pty,
+                        };
+                        if (k.down and handleKeybind(k, ctx)) {
+                            // A consumed chord still posts a trailing WM_CHAR for
+                            // a text key; drop it so the bound key isn't also typed.
+                            suppress_next_char = switch (k.vk) {
+                                input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
+                                else => false,
+                            };
+                            continue;
+                        }
+                        if (k.down) io.scrollToBottom();
+                        const km = input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt);
+                        suppress_next_char = writeKeyKitty(&pty, k.vk, k.scancode, k.down, k.repeat, km, enc_opts);
+                        continue;
+                    }
+
+                    // --- Legacy path (kitty off): byte-identical to pre-#82 ---
+                    // Releases never produced output legacy-mode, so drop them.
+                    if (!k.down) {
+                        suppress_next_char = false;
+                        continue;
+                    }
                     // These keys are VT-encoded here and ALSO post a WM_CHAR; mark the
                     // trailing WM_CHAR for suppression whether the key is sent to the
                     // shell or consumed as a keybind. Other keys clear the flag.
@@ -392,7 +432,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                     };
                     if (handleKeybind(k, ctx)) continue;
                     io.scrollToBottom();
-                    writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), io.keyEncodeOptions());
+                    writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), enc_opts);
                 },
                 .scroll => |raw| {
                     const delta = wheel.feed(raw);
@@ -548,6 +588,163 @@ fn writeKey(pty: *Pty, code: u32, key_mods: input.Mods, opts: input.Options) voi
     var buf: [32]u8 = undefined;
     const out = input.encode(&buf, .{ .key = key, .mods = key_mods }, opts) catch return;
     if (out.len > 0) _ = pty.write(out) catch {};
+}
+
+/// What `deriveKeyText` produced for a key press: the actual generated text
+/// (`utf8`, a slice into the caller-owned buffer), the unshifted base codepoint,
+/// which mods were consumed to produce the text, and whether the key left the
+/// keyboard in a dead-key (composing) state.
+const KeyText = struct {
+    utf8: []const u8,
+    unshifted_codepoint: u21,
+    consumed_mods: input.Mods,
+    composing: bool,
+};
+
+/// Derive the base (unshifted) codepoint and the actual typed text for a key
+/// press, for the kitty-keyboard output path (#82). Windows-only: uses the live
+/// keyboard layout (MapVirtualKeyW for the unshifted codepoint; ToUnicodeEx +
+/// GetKeyboardState for the layout-translated text incl. Shift/AltGr).
+///
+/// `utf8_buf` is borrowed for the returned `utf8` slice (so it must outlive the
+/// returned struct). Every buffer is fixed-size and bounds-checked (the #89
+/// stack-overflow precedent): the UTF-16 scratch is 8 units, and the conversion
+/// into `utf8_buf` is length-checked.
+///
+/// Dead keys: ToUnicodeEx returns -1 and leaves the dead-key state pending; we
+/// flag `composing` and immediately call ToUnicodeEx a SECOND time with the same
+/// key so the pending state is consumed back out (otherwise it would corrupt the
+/// NEXT keystroke — a documented Win32 footgun).
+fn deriveKeyText(vk: u32, scancode: u32, down: bool, mods: input.Mods, utf8_buf: []u8) KeyText {
+    // Unshifted base codepoint via the layout's VK->char map. The high bit
+    // (0x80000000) marks a dead key; mask it off. ASCII letters come back
+    // uppercase, so lowercase them for the canonical base codepoint ('a' for A).
+    var unshifted: u21 = 0;
+    const mapped = w.MapVirtualKeyW(vk, w.MAPVK_VK_TO_CHAR) & 0x7FFFFFFF;
+    if (mapped != 0 and mapped <= 0x10FFFF) {
+        var cp: u21 = @intCast(mapped);
+        if (cp >= 'A' and cp <= 'Z') cp += 32;
+        unshifted = cp;
+    }
+
+    // Releases (and key repeats reported as releases) generate no committed text
+    // and must NOT touch the dead-key state via ToUnicodeEx. The encoder skips
+    // associated text on release anyway (`seq.event != .release`), so the
+    // unshifted codepoint alone is enough to key the CSI-u release sequence.
+    if (!down) {
+        return .{ .utf8 = "", .unshifted_codepoint = unshifted, .consumed_mods = .{}, .composing = false };
+    }
+
+    // Actual typed text via the full layout translation. GetKeyboardState gives
+    // the live modifier/lock state ToUnicodeEx needs.
+    var key_state: [256]u8 = undefined;
+    if (w.GetKeyboardState(&key_state) == w.FALSE) {
+        return .{ .utf8 = "", .unshifted_codepoint = unshifted, .consumed_mods = .{}, .composing = false };
+    }
+
+    const layout = w.GetKeyboardLayout(0);
+    var utf16: [8]u16 = undefined;
+    const n = w.ToUnicodeEx(vk, scancode, &key_state, &utf16, utf16.len, 0, layout);
+
+    if (n < 0) {
+        // Dead key: re-feed the same key so the pending dead-key state is not
+        // leaked into the next keystroke. Report composing with no committed text.
+        _ = w.ToUnicodeEx(vk, scancode, &key_state, &utf16, utf16.len, 0, layout);
+        return .{ .utf8 = "", .unshifted_codepoint = unshifted, .consumed_mods = .{}, .composing = true };
+    }
+
+    if (n == 0) {
+        // No translation (e.g. a bare modifier, or ctrl that yields nothing).
+        return .{ .utf8 = "", .unshifted_codepoint = unshifted, .consumed_mods = .{}, .composing = false };
+    }
+
+    // n > 0: that many UTF-16 units. `utf16LeToUtf8` does NOT bounds-check its
+    // destination — it asserts internally and writes — so an oversized
+    // translation would overflow the stack buffer (#89 class). Convert ONLY when
+    // the worst case provably fits: each UTF-16 unit is at most 3 UTF-8 bytes (a
+    // surrogate pair is 2 units -> 4 bytes = 2 bytes/unit), so `units * 3` is a
+    // safe upper bound. Bail to empty text rather than overflow.
+    const units: usize = @min(@as(usize, @intCast(n)), utf16.len);
+    const utf8: []const u8 = if (units != 0 and units * 3 <= utf8_buf.len)
+        utf8_buf[0..(std.unicode.utf16LeToUtf8(utf8_buf, utf16[0..units]) catch 0)]
+    else
+        "";
+
+    // Mods consumed to produce the text, so the encoder's effectiveMods drops
+    // them. AltGr on Windows is delivered as Ctrl+Alt: when BOTH are held and
+    // text was produced, AltGr is what produced it, so consume BOTH — otherwise
+    // the leftover ctrl makes binding_mods non-empty and the AltGr character
+    // (e.g. German '@' = AltGr+Q, '{' '}' '[' ']' '\' '~' on EU layouts)
+    // mis-encodes as a CSI-u escape instead of passing through as text. Plain
+    // ctrl (no alt) never yields printable text here, so it stays unconsumed and
+    // shows in the CSI-u modifier field (ctrl+a -> ESC[97;5u).
+    var consumed: input.Mods = .{};
+    if (utf8.len > 0) {
+        consumed.shift = mods.shift;
+        if (mods.ctrl and mods.alt) {
+            consumed.ctrl = true;
+            consumed.alt = true;
+        } else {
+            consumed.alt = mods.alt;
+        }
+    }
+
+    return .{
+        .utf8 = utf8,
+        .unshifted_codepoint = unshifted,
+        .consumed_mods = consumed,
+        .composing = false,
+    };
+}
+
+/// Kitty-keyboard output path (#82): build a full KeyEvent from a Win32 key
+/// event and encode it. Returns true if a trailing WM_CHAR for this key should
+/// be suppressed (it was already consumed into the encoded sequence or passed
+/// through as text). Only called when `opts.kitty_flags.int() != 0`.
+fn writeKeyKitty(
+    pty: *Pty,
+    vk: u32,
+    scancode: u32,
+    down: bool,
+    repeat: bool,
+    key_mods: input.Mods,
+    opts: input.Options,
+) bool {
+    const key = input.kittyKeyFromVk(vk);
+    if (key == .unidentified) return false; // unknown key: leave it to WM_CHAR.
+
+    // Sized for the [8]u16 ToUnicodeEx scratch worst case (8 units * 3 bytes/unit
+    // = 24); 32 matches the other fixed buffers and leaves headroom.
+    var text_buf: [32]u8 = undefined;
+    const text = deriveKeyText(vk, scancode, down, key_mods, &text_buf);
+
+    const action: input.Action = if (!down) .release else if (repeat) .repeat else .press;
+    const event = input.kittyKeyEvent(.{
+        .key = key,
+        .unshifted_codepoint = text.unshifted_codepoint,
+        .utf8 = text.utf8,
+        .mods = key_mods,
+        .consumed_mods = text.consumed_mods,
+        .action = action,
+        .composing = text.composing,
+    });
+
+    // Buffer sized for a kitty sequence with associated text + alternates (the
+    // legacy 32 bytes is too small once report_associated is on). The fixed
+    // writer truncates rather than overflowing; 128 covers realistic sequences.
+    var buf: [128]u8 = undefined;
+    const out = input.encode(&buf, event, opts) catch return false;
+    if (out.len > 0) _ = pty.write(out) catch {};
+
+    // Suppress the trailing WM_CHAR Windows posts for a press of a text-producing
+    // key (printables) or the control keys (Enter/Tab/Backspace/Escape), since
+    // we already encoded/passed them. Release/repeat-with-no-char don't post a
+    // fresh WM_CHAR to worry about, but a press that produced text always does.
+    if (!down) return false;
+    return text.utf8.len > 0 or switch (vk) {
+        input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
+        else => false,
+    };
 }
 
 /// Context a keybind action needs: the binding set, the terminal io, and the
