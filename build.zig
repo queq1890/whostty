@@ -45,7 +45,11 @@ pub fn build(b: *std.Build) void {
     // means no console exists for the child to inherit.
     if (target.result.os.tag == .windows) exe.subsystem = .Windows;
     if (enable_freetype) {
-        if (b.lazyDependency("freetype", .{ .target = target, .optimize = optimize })) |dep| {
+        // enable-libpng builds Freetype with PNG support so it can decode the
+        // PNG-compressed CBDT color-bitmap strikes used by color-emoji fonts
+        // (Noto Color Emoji) — otherwise FT_Load_Glyph returns Unimplemented for
+        // them. Needed by the color-glyph path (#78).
+        if (b.lazyDependency("freetype", .{ .target = target, .optimize = optimize, .@"enable-libpng" = true })) |dep| {
             exe.root_module.addImport("freetype", dep.module("freetype"));
             // The freetype module's `@cImport` pulls in libc headers (e.g.
             // <string.h>). Link libc so they resolve — for cross-compiled
@@ -89,7 +93,7 @@ pub fn build(b: *std.Build) void {
     // dynamic-color render check, so it needs the libghostty-vt module too.
     offscreen.root_module.addImport("ghostty-vt", ghostty_vt);
     const off_step = b.step("offscreen-proof", "Headless GL render proof (Linux/EGL)");
-    if (b.lazyDependency("freetype", .{ .target = native_target, .optimize = optimize })) |dep| {
+    if (b.lazyDependency("freetype", .{ .target = native_target, .optimize = optimize, .@"enable-libpng" = true })) |dep| {
         offscreen.root_module.addImport("freetype", dep.module("freetype"));
         offscreen.root_module.linkLibrary(dep.artifact("freetype"));
         const off_run = b.addRunArtifact(offscreen);
