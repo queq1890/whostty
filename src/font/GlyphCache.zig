@@ -13,6 +13,7 @@
 const std = @import("std");
 const Atlas = @import("Atlas.zig");
 const font = @import("main.zig");
+const sprite = @import("sprite.zig");
 
 const GlyphCache = @This();
 const log = std.log.scoped(.font);
@@ -148,6 +149,18 @@ fn faceFor(self: *GlyphCache, cp: u21) ?*font.Face {
 }
 
 fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
+    // Built-in sprite glyphs (block elements, braille) are drawn procedurally so
+    // they are crisp and present regardless of the font (#76), filling the whole
+    // cell. Tried before the font face; style (bold/italic) doesn't apply.
+    if (sprite.rasterize(self.alloc, key.cp, self.cell_w, self.cell_h) catch null) |pixels| {
+        defer self.alloc.free(pixels);
+        const region = self.atlas.reserve(self.cell_w, self.cell_h) catch return null;
+        self.atlas.set(region, pixels);
+        // bearing_y = ascent so the cell-sized sprite sits flush at the cell top
+        // (buildQuads draws at cell_y + ascent - bearing_y); no horizontal bearing.
+        return .{ .region = region, .bearing_x = 0, .bearing_y = @intCast(self.ascent) };
+    }
+
     const face = self.faceFor(key.cp) orelse return null;
     var g = face.rasterize(self.alloc, key.cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
     defer g.deinit(self.alloc);
@@ -274,4 +287,34 @@ test "glyphcache: a fallback face renders a glyph the primary lacks (#75)" {
     // still draws nothing (no fallback can fill it).
     try std.testing.expect(cache.get('A', false, false) != null);
     try std.testing.expect(cache.get(0x10FFFF, false, false) == null);
+}
+
+test "glyphcache: sprite glyphs are drawn procedurally, cell-sized, font-independent (#76)" {
+    std.fs.accessAbsolute(test_font, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, test_font, 24, 512);
+    defer cache.deinit();
+
+    // U+2588 FULL BLOCK is a sprite: it packs a full cell-sized region (the
+    // procedural path reserves cell_w x cell_h), not a font-glyph-sized one, and
+    // sits flush at the cell top (bearing_y == ascent, no horizontal bearing).
+    const block = cache.get(0x2588, false, false) orelse return error.NoSprite;
+    try std.testing.expectEqual(cache.cell_w, block.region.width);
+    try std.testing.expectEqual(cache.cell_h, block.region.height);
+    try std.testing.expectEqual(@as(i32, 0), block.bearing_x);
+    try std.testing.expectEqual(@as(i32, @intCast(cache.ascent)), block.bearing_y);
+
+    // A braille pattern is likewise a sprite, cell-sized.
+    const br = cache.get(0x28FF, false, false) orelse return error.NoBraille;
+    try std.testing.expectEqual(cache.cell_w, br.region.width);
+}
+
+test "glyphcache: sprites render even when the primary font is missing" {
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, "Z:\\does\\not\\exist.ttf", 24, 512);
+    defer cache.deinit();
+    try std.testing.expect(cache.face == null);
+    // Letters draw nothing (no face), but a sprite is procedural -> still packs.
+    try std.testing.expect(cache.get('A', false, false) == null);
+    try std.testing.expect(cache.get(0x2588, false, false) != null);
 }
