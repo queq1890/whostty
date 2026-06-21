@@ -334,6 +334,12 @@ pub const Termio = struct {
     /// Guards `terminal`: the reader thread mutates it via `process`, the
     /// renderer reads it. Lock with `lock`/`unlock` around grid access.
     mutex: std.Thread.Mutex,
+    /// Bumped on every `process` (pty-output apply) so the UI thread can tell,
+    /// without diffing the grid, that the screen may have changed and a redraw
+    /// is needed — the basis of frame pacing (#72). Wraps harmlessly. Guarded by
+    /// `mutex`. UI-initiated mutations (resize/scroll/selection) are already
+    /// known to the UI thread (they ride its own events), so they don't bump it.
+    dirty_gen: u64,
     alloc: std.mem.Allocator,
 
     /// Mouse-drag selection anchor: a tracked pin plus the exact screen it was
@@ -352,6 +358,7 @@ pub const Termio = struct {
         self.response = .empty;
         self.clipboard_write = null;
         self.side = .{};
+        self.dirty_gen = 0;
         self.sel_anchor = null;
         self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
@@ -455,7 +462,32 @@ pub const Termio = struct {
     pub fn process(self: *Termio, bytes: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        // Mark the screen potentially-changed so the UI thread redraws this
+        // frame. `defer` so a mid-slice error (the reader then exits) still
+        // reflects any bytes already applied.
+        defer self.dirty_gen +%= 1;
         try self.stream.nextSlice(bytes);
+    }
+
+    /// The current dirty generation — the number of `process` calls so far.
+    /// The UI thread redraws when this differs from the last frame's value
+    /// (frame pacing, #72). Thread-safe.
+    pub fn dirtyGen(self: *Termio) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.dirty_gen;
+    }
+
+    /// Whether a *blinking* cursor is currently shown (so the UI must keep
+    /// redrawing at the blink cadence). False when unfocused, when the cursor is
+    /// hidden (DECTCEM off), or when blink mode is off — in which case the UI can
+    /// sleep until input/output instead of waking twice a second. Thread-safe.
+    pub fn cursorBlinks(self: *Termio, focused: bool) bool {
+        if (!focused) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.terminal.modes.get(.cursor_blinking) and
+            self.terminal.modes.get(.cursor_visible);
     }
 
     /// Seed the terminal's dynamic colors with the configured defaults so that
@@ -1101,6 +1133,33 @@ test "termio: scrollbar reflects scrollback growth and viewport position" {
     // total/len are unchanged by scrolling the viewport.
     try std.testing.expectEqual(grown.total, scrolled.total);
     try std.testing.expectEqual(grown.len, scrolled.len);
+}
+
+test "termio: dirty generation bumps on output; cursorBlinks gates on focus/visibility/mode" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Each pty-output apply bumps the generation (the UI thread's redraw signal).
+    const g0 = io.dirtyGen();
+    try io.process("a");
+    const g1 = io.dirtyGen();
+    try std.testing.expect(g1 != g0);
+    try io.process("b");
+    try std.testing.expect(io.dirtyGen() != g1);
+
+    // A blinking cursor style (DECSCUSR 1), visible + focused -> blinking, so the
+    // UI must keep waking at the blink cadence.
+    try io.process("\x1b[1 q");
+    try std.testing.expect(io.cursorBlinks(true));
+    // Unfocused never blinks (the cursor renders hollow/static).
+    try std.testing.expect(!io.cursorBlinks(false));
+    // Hiding the cursor (DECTCEM off) stops the blink wake even when focused.
+    try io.process("\x1b[?25l");
+    try std.testing.expect(!io.cursorBlinks(true));
+    // A steady cursor style (DECSCUSR 2) doesn't blink either.
+    try io.process("\x1b[?25h\x1b[2 q");
+    try std.testing.expect(!io.cursorBlinks(true));
 }
 
 test "termio: takeResponse drains and clears the queue" {

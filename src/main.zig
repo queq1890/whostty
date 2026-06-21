@@ -106,6 +106,7 @@ test {
     _ = @import("Surface.zig");
     _ = @import("config.zig");
     _ = @import("scroll.zig");
+    _ = @import("frame.zig");
     _ = @import("apprt/win32/SplitTree.zig");
     _ = @import("font/discovery.zig");
     _ = @import("font/shaper.zig");

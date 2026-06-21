@@ -299,6 +299,35 @@ pub extern "user32" fn PeekMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UIN
 pub extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostQuitMessage(nExitCode: INT) callconv(.winapi) void;
+pub extern "user32" fn PostMessageW(hWnd: ?HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
+
+// --- Idle wait (frame pacing #72) ---------------------------------------------
+/// All input-queue states — wake when any message (input, paint, posted) arrives.
+/// The Windows 8+ value: the legacy 0x04FF plus QS_TOUCH (0x0800) and QS_POINTER
+/// (0x1000), so touch/pen input also wakes the idle wait. (Our wake path uses
+/// posted messages — QS_POSTMESSAGE, in both values — so this only affects
+/// promptness on touch/pen, never the pty-output wake.)
+pub const QS_ALLINPUT: DWORD = 0x1CFF;
+pub const INFINITE: DWORD = 0xFFFFFFFF;
+/// Base of the application-private message range. We post `WM_WHOSTTY_WAKE` from
+/// the reader thread to wake the idle UI thread when new pty output lands.
+pub const WM_USER: UINT = 0x0400;
+pub const WM_WHOSTTY_WAKE: UINT = WM_USER + 1;
+pub extern "user32" fn MsgWaitForMultipleObjectsEx(
+    nCount: DWORD,
+    pHandles: ?[*]const HANDLE,
+    dwMilliseconds: DWORD,
+    dwWakeMask: DWORD,
+    dwFlags: DWORD,
+) callconv(.winapi) DWORD;
+
+/// Block the UI thread until a window message arrives or `timeout_ms` elapses,
+/// yielding the CPU while idle. Used by the frame-pacing loop to avoid spinning
+/// when nothing has changed; the reader thread's `PostMessageW(WM_WHOSTTY_WAKE)`
+/// and any OS input both wake it immediately.
+pub fn waitForMessage(timeout_ms: u32) void {
+    _ = MsgWaitForMultipleObjectsEx(0, null, timeout_ms, QS_ALLINPUT, 0);
+}
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
 pub extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;

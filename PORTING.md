@@ -47,7 +47,7 @@ The `Tests` column below tracks this per layer.
 | VT core | `src/terminal/` | — (via `ghostty-vt` module) | dependency | done | upstream |
 | VT input encoding | `src/input/` (key/mouse/paste encode) | — (via `ghostty-vt` `input`) | dependency | done | upstream |
 | Entrypoint | `src/main.zig` | `src/main.zig` | port | done | done (vt wiring) |
-| App (Windows) | `src/apprt/gtk/App.zig` | `src/apprt/win32/App.zig` | template | slice-0 + SGR cells, config-driven colors/size (#12/#17) | links |
+| App (Windows) | `src/apprt/gtk/App.zig` | `src/apprt/win32/App.zig` | template | slice-0 + SGR cells, config-driven colors/size (#12/#17); **frame pacing** (`src/frame.zig`): redraw only when the terminal's dirty generation, the (blinking) cursor phase, focus, or a UI event changed — otherwise the loop sleeps via `MsgWaitForMultipleObjects` and the reader thread wakes it with `PostMessage` on new output (#72) | links; frame-pacing logic host-tested |
 | Surface | `src/Surface.zig` | `src/Surface.zig` | port | resize done + window padding (`window-padding-x/y/-balance`): `layout()` reserves padding on each side, fits the grid, and offsets the origin (renderer + mouse both honor it); balance centers the grid (#71). Per-cell selection reverse-video done (#51, `buildQuads`); custom GLSL shaders deferred (host) | done (host: layout/origin); GL (offscreen-proof: pad shifts glyph) |
 | apprt registry | `src/apprt.zig` | `src/apprt.zig` | port | scaffolded | port tests |
 | apprt (Windows) | `src/apprt/gtk/` | `src/apprt/win32/Window.zig` | template | done (window+WGL) | fresh tests |
