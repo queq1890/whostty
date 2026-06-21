@@ -18,6 +18,7 @@ const font = @import("font/main.zig");
 const Atlas = @import("font/Atlas.zig");
 const Termio = @import("termio.zig").Termio;
 const surface = @import("Surface.zig");
+const scroll = @import("scroll.zig");
 const vtcolor = @import("ghostty-vt").color;
 
 // --- dynamic loader --------------------------------------------------------
@@ -649,5 +650,70 @@ pub fn main() !void {
             return error.PaddingNotApplied;
         }
         out.print("[proof] PASS: window padding shifted the rendered glyph right by exactly the configured pad\n", .{});
+    }
+
+    // --- Scrollbar proof (#73): the thumb tracks the viewport position ------
+    // `scroll.scrollbarThumb` (host-tested) sizes/places the thumb; here we draw
+    // it as a solid on the right edge at two scroll offsets and confirm the lit
+    // thumb moves DOWN the track as the viewport moves toward the live bottom —
+    // proving the thumb geometry reaches the framebuffer. (The App-side
+    // `appendScrollbar` mapping is Win32-only and cross-compile-verified.)
+    {
+        const total: usize = 100;
+        const len: usize = 20;
+        const track: f32 = @floatFromInt(screen_h);
+        const bar_w: u32 = 6;
+        const bar_x: i32 = @intCast(screen_w - bar_w);
+
+        var centers: [2]f32 = .{ 0, 0 };
+        // offset 0 = scrolled to the oldest line (thumb at top); offset total-len
+        // = the live bottom (thumb at the track end).
+        for ([_]usize{ 0, total - len }, 0..) |off, pass| {
+            const thumb = scroll.scrollbarThumb(total, len, off, track);
+            var sv: std.ArrayList(gl.Vertex) = .empty;
+            defer sv.deinit(alloc);
+            try gl.pushSolid(&sv, alloc, .{
+                .px = bar_x,
+                .py = @intFromFloat(@round(thumb.offset)),
+                .w = bar_w,
+                .h = @max(1, @as(u32, @intFromFloat(@round(thumb.size)))),
+                .r = 1,
+                .g = 1,
+                .b = 1,
+            }, screen_w, screen_h);
+            g.clearColor(clear[0], clear[1], clear[2], 1.0);
+            g.clear(GL_COLOR_BUFFER_BIT);
+            g.bufferData(GL_ARRAY_BUFFER, @intCast(sv.items.len * @sizeOf(gl.Vertex)), sv.items.ptr, GL_DYNAMIC_DRAW);
+            g.drawArrays(GL_TRIANGLES, 0, @intCast(sv.items.len));
+            g.finish();
+            g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+            // Average y of lit pixels in the right-edge band (x >= bar_x).
+            var sum_y: usize = 0;
+            var cnt: usize = 0;
+            var pix: usize = 0;
+            while (pix < n) : (pix += 1) {
+                const x = pix % screen_w;
+                if (x < @as(usize, @intCast(bar_x))) continue;
+                const r: i16 = buf[pix * 4];
+                const gg: i16 = buf[pix * 4 + 1];
+                const b: i16 = buf[pix * 4 + 2];
+                if (@abs(r - cr) > 2 or @abs(gg - cg) > 2 or @abs(b - cb) > 2) {
+                    // readPixels is bottom-up (GL origin is bottom-left), so flip
+                    // to screen coords (top = 0) to match the renderer's y-down
+                    // projection — the scrollbar's py=0 is the visual top.
+                    sum_y += screen_h - 1 - (pix / screen_w);
+                    cnt += 1;
+                }
+            }
+            if (cnt == 0) return error.ScrollbarNothingLit;
+            centers[pass] = @as(f32, @floatFromInt(sum_y)) / @as(f32, @floatFromInt(cnt));
+        }
+        out.print("[proof] scrollbar: thumb center y — top-offset={d:.1}, bottom-offset={d:.1}\n", .{ centers[0], centers[1] });
+        // Moving the viewport to the bottom must push the thumb clearly downward.
+        if (centers[1] <= centers[0] + @as(f32, @floatFromInt(screen_h)) / 4.0) {
+            out.print("[proof] FAIL: scrollbar thumb did not move down as the viewport scrolled\n", .{});
+            return error.ScrollbarNotTracking;
+        }
+        out.print("[proof] PASS: scrollbar thumb tracks the viewport position (moves down toward the live bottom)\n", .{});
     }
 }
