@@ -41,6 +41,9 @@ const SideChannel = struct {
     /// Latest OSC 7 working directory (the raw `file://` URL), owned by `alloc`.
     /// An empty OSC 7 url clears it (ghostty's "forget the pwd" behavior).
     cwd: ?[]u8 = null,
+    /// Latest OSC 0/2 window title (UTF-8), owned by `alloc`; latest wins until
+    /// drained. An empty title clears it (matching the cwd reset semantics).
+    title: ?[]u8 = null,
     /// Latest desktop notification, owned; latest wins until drained.
     notification: ?Notification = null,
     /// Latest taskbar progress state (OSC 9;4). A *state*, not an event: it
@@ -49,6 +52,7 @@ const SideChannel = struct {
 
     fn deinit(self: *SideChannel, alloc: std.mem.Allocator) void {
         if (self.cwd) |c| alloc.free(c);
+        if (self.title) |t| alloc.free(t);
         if (self.notification) |*n| n.deinit(alloc);
         self.* = undefined;
     }
@@ -119,6 +123,15 @@ const ResponseHandler = struct {
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showNotification(value),
             .progress_report => self.side.progress = value,
+            .window_title => try self.setTitle(value.title),
+
+            // CSI 21t report-title and the CSI 22t/23t title stack are deferred.
+            // The vt surfaces 21t muxed into `.size_report = .csi_21_t` (alongside
+            // the pixel/cell size reports) and 22t/23t as bare `.title_push`/
+            // `.title_pop` u16 index events carrying no title bytes — both require
+            // whostty to own the title state and (for 21t) gate the reply behind
+            // config, which ghostty itself leaves stubbed for the stack. They fall
+            // through to the inner readonly handler (a no-op) for now.
 
             // ENQ falls through: ghostty's default `enquiry-response` is the
             // empty string, so replying with nothing (the readonly handler's
@@ -296,6 +309,19 @@ const ResponseHandler = struct {
         self.side.cwd = try self.alloc.dupe(u8, url);
     }
 
+    /// OSC 0 / OSC 2 — capture the window title (UTF-8). The vt has already
+    /// UTF-8-validated the bytes; the slice is valid only during the call, so it
+    /// is duplicated into the side channel. An empty title clears it (matching
+    /// the cwd reset semantics). The UI thread drains it via `takeTitle`.
+    fn setTitle(self: *ResponseHandler, title: []const u8) !void {
+        if (self.side.title) |old| {
+            self.alloc.free(old);
+            self.side.title = null;
+        }
+        if (title.len == 0) return;
+        self.side.title = try self.alloc.dupe(u8, title);
+    }
+
     /// OSC 9 / OSC 777 — capture a desktop notification (title may be empty for
     /// the OSC 9 form). Both fields are valid only during the call, so they are
     /// duplicated; the latest notification wins until the app drains it.
@@ -427,6 +453,17 @@ pub const Termio = struct {
         const n = self.side.notification;
         self.side.notification = null;
         return n;
+    }
+
+    /// Take the pending window title (OSC 0/2), transferring ownership to the
+    /// caller (free with `alloc`), or null if none is pending. Drained on the UI
+    /// thread to apply once per change. Thread-safe.
+    pub fn takeTitle(self: *Termio) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const t = self.side.title;
+        self.side.title = null;
+        return t;
     }
 
     /// The current taskbar progress state (OSC 9;4). Unlike the other side
@@ -1054,6 +1091,40 @@ test "termio: OSC 7 records and resets the working directory" {
     // An empty OSC 7 forgets the pwd.
     try io.process("\x1b]7;\x1b\\");
     try std.testing.expect((try io.cwdAlloc(alloc)) == null);
+}
+
+test "termio: OSC 0 / OSC 2 capture the window title, drained once, empty clears" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Plain output sets no title.
+    try io.process("hi");
+    try std.testing.expect(io.takeTitle() == null);
+
+    // OSC 0 (icon + window title) sets it.
+    try io.process("\x1b]0;Hello\x07");
+    {
+        const t = io.takeTitle() orelse return error.NoTitle;
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("Hello", t);
+    }
+    // Draining clears it.
+    try std.testing.expect(io.takeTitle() == null);
+
+    // OSC 2 (window title) sets it; a later title overwrites an undrained one.
+    try io.process("\x1b]2;World\x07");
+    try io.process("\x1b]2;Again\x07");
+    {
+        const t = io.takeTitle() orelse return error.NoTitle;
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("Again", t);
+    }
+
+    // An empty title clears it.
+    try io.process("\x1b]2;Set\x07");
+    try io.process("\x1b]2;\x07");
+    try std.testing.expect(io.takeTitle() == null);
 }
 
 test "termio: OSC 9 / OSC 777 desktop notifications, latest wins" {

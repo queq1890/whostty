@@ -101,14 +101,13 @@ pub const Window = struct {
         if (w.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;
 
         var title_buf: [256]u16 = undefined;
-        const title_len = std.unicode.utf8ToUtf16Le(&title_buf, title_utf8) catch
+        const title_z = captionUtf16(title_utf8, &title_buf) orelse
             return error.CreateWindowFailed;
-        title_buf[@min(title_len, title_buf.len - 1)] = 0;
 
         const hwnd = w.CreateWindowExW(
             0,
             class_name,
-            title_buf[0..title_len :0].ptr,
+            title_z.ptr,
             w.WS_OVERLAPPEDWINDOW | w.WS_VISIBLE,
             w.CW_USEDEFAULT,
             w.CW_USEDEFAULT,
@@ -195,6 +194,33 @@ pub const Window = struct {
     /// The native window handle (for synchronous Win32 calls like the clipboard).
     pub fn handle(self: *Window) w.HWND {
         return self.hwnd;
+    }
+
+    /// Convert `title_utf8` to a NUL-terminated UTF-16 caption in `buf`, truncating
+    /// on a UTF-8 codepoint boundary so it always fits. CRITICAL: `utf8ToUtf16Le`
+    /// has NO destination bounds check and does not truncate — feeding it a title
+    /// longer than the buffer overflows it (a program-supplied OSC title can be
+    /// arbitrarily long). Clamp the INPUT first (≤1 u16 per input byte). Returns
+    /// null only on invalid UTF-8.
+    fn captionUtf16(title_utf8: []const u8, buf: *[256]u16) ?[:0]u16 {
+        var end: usize = title_utf8.len;
+        if (end > buf.len - 1) {
+            end = buf.len - 1;
+            // Back off any UTF-8 continuation bytes so we don't split a codepoint.
+            while (end > 0 and (title_utf8[end] & 0xC0) == 0x80) end -= 1;
+        }
+        const len = std.unicode.utf8ToUtf16Le(buf, title_utf8[0..end]) catch return null;
+        buf[len] = 0;
+        return buf[0..len :0];
+    }
+
+    /// Update the live window caption from a UTF-8 title (OSC 0/2, #89). Over-long
+    /// titles are truncated on a codepoint boundary and invalid UTF-8 is ignored
+    /// (the caption keeps its previous value) — see `captionUtf16`.
+    pub fn setTitle(self: *Window, title_utf8: []const u8) void {
+        var buf: [256]u16 = undefined;
+        const title_z = captionUtf16(title_utf8, &buf) orelse return;
+        _ = w.SetWindowTextW(self.hwnd, title_z.ptr);
     }
 
     pub fn swapBuffers(self: *Window) void {
