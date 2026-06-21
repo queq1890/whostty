@@ -876,4 +876,62 @@ pub fn main() !void {
         }
         out.print("[proof] PASS: per-codepoint fallback rasterized a CJK glyph the primary lacks (#75)\n", .{});
     }
+
+    // --- Sprite glyph proof (#76): block elements drawn procedurally ----------
+    // U+2588 FULL BLOCK is rasterized by the built-in sprite renderer (not the
+    // font) and must fill the cell; a quadrant must fill only a quarter. Proves
+    // the procedural sprite reaches the framebuffer through the atlas/shader.
+    {
+        var cache = try GlyphCache.init(alloc, font_path, 24, 512);
+        defer cache.deinit();
+        const cwid = cache.cell_w;
+        const chei = cache.cell_h;
+        const full = cache.get(0x2588, false, false) orelse return error.NoFullBlock;
+        const quad = cache.get(0x2598, false, false) orelse return error.NoQuadrant; // upper-left
+
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
+
+        var counts: [2]usize = .{ 0, 0 };
+        for ([_]Atlas.Placement{ full, quad }, 0..) |place, idx| {
+            var sgv: std.ArrayList(gl.Vertex) = .empty;
+            defer sgv.deinit(alloc);
+            try gl.pushQuad(&sgv, alloc, .{
+                .px = 4,
+                .py = 4,
+                .sx = place.region.x,
+                .sy = place.region.y,
+                .sw = place.region.width,
+                .sh = place.region.height,
+                .r = 1,
+                .g = 1,
+                .b = 1,
+            }, screen_w, screen_h, cache.atlas.size);
+            g.clearColor(clear[0], clear[1], clear[2], 1.0);
+            g.clear(GL_COLOR_BUFFER_BIT);
+            g.bufferData(GL_ARRAY_BUFFER, @intCast(sgv.items.len * @sizeOf(gl.Vertex)), sgv.items.ptr, GL_DYNAMIC_DRAW);
+            g.drawArrays(GL_TRIANGLES, 0, @intCast(sgv.items.len));
+            g.finish();
+            g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+            var slit: usize = 0;
+            var si: usize = 0;
+            while (si < n) : (si += 1) {
+                if (@abs(@as(i16, buf[si * 4]) - cr) > 2 or @abs(@as(i16, buf[si * 4 + 1]) - cg) > 2 or @abs(@as(i16, buf[si * 4 + 2]) - cb) > 2) slit += 1;
+            }
+            counts[idx] = slit;
+        }
+        const cell_area = cwid * chei;
+        out.print("[proof] sprite: full-block lit={d} (cell area={d}), quadrant lit={d}\n", .{ counts[0], cell_area, counts[1] });
+        // The full block should cover ~the whole cell; the quadrant about a quarter.
+        if (counts[0] < (cell_area * 9) / 10) {
+            out.print("[proof] FAIL: full block did not fill the cell\n", .{});
+            return error.FullBlockNotFilled;
+        }
+        if (counts[1] == 0 or counts[1] >= counts[0]) {
+            out.print("[proof] FAIL: quadrant did not render as a partial fill\n", .{});
+            return error.QuadrantWrong;
+        }
+        out.print("[proof] PASS: built-in sprites rasterized procedurally (full block fills cell, quadrant a quarter)\n", .{});
+    }
 }
