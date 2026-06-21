@@ -34,6 +34,7 @@ const binding = @import("../../input/Binding.zig");
 const keymap = @import("keymap.zig");
 const mouse = @import("../../mouse.zig");
 const cli = @import("../../cli.zig");
+const frame = @import("../../frame.zig");
 
 const log = std.log.scoped(.app);
 
@@ -233,7 +234,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
 
     // --- Reader thread: pty -> libghostty-vt ---
     var stop = std.atomic.Value(bool).init(false);
-    const reader = try std.Thread.spawn(.{}, readerLoop, .{ &pty, io, &stop });
+    const reader = try std.Thread.spawn(.{}, readerLoop, .{ &pty, io, &stop, win.handle() });
 
     // Cleanup order: stop the shell so the reader's blocking read returns,
     // join it, then tear down the pty/io.
@@ -266,7 +267,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // One-shot render self-verification (WHOSTTY_RENDER_DEBUG=1) — counts lit
     // pixels a few frames in so a build that can't be screenshotted can confirm
     // glyphs reached the framebuffer. See Renderer.debugCountLitPixels.
-    var frame: u32 = 0;
+    var dbg_frame: u32 = 0;
     const render_debug = blk: {
         const v = std.process.getEnvVarOwned(alloc, "WHOSTTY_RENDER_DEBUG") catch break :blk false;
         defer alloc.free(v);
@@ -294,75 +295,88 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     const cursor_thickness: u32 = @max(1, cell_h / 10);
     const cursor_text = cfgColor(cfg.cursor_text);
 
+    // --- Frame pacing (#72) ---
+    // Render only when something changed; sleep while idle instead of rebuilding
+    // and swapping every iteration. `fs_prev` is the last drawn frame's state;
+    // `first_frame` forces the initial paint.
+    var fs_prev: frame.FrameState = .{};
+    var first_frame = true;
+
     while (win.pump()) {
         var closed = false;
-        while (win.poll()) |ev| switch (ev) {
-            // Typing snaps back to the bottom, matching common terminals.
-            .char => |cp| {
-                // Drop the WM_CHAR that trails a handled Enter/Tab/Backspace/
-                // Escape WM_KEYDOWN (flagged below) so the key isn't sent twice.
-                if (suppress_next_char) {
-                    suppress_next_char = false;
-                    continue;
-                }
-                if (blink_timer) |*t| t.reset();
-                io.scrollToBottom();
-                writeChar(&pty, cp);
-            },
-            .key => |k| {
-                // These keys are VT-encoded here and ALSO post a WM_CHAR; mark the
-                // trailing WM_CHAR for suppression whether the key is sent to the
-                // shell or consumed as a keybind. Other keys clear the flag.
-                suppress_next_char = switch (k.vk) {
-                    input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
-                    else => false,
-                };
-                if (blink_timer) |*t| t.reset();
+        // Any OS event (key/mouse/resize/focus/scroll) may change the frame, so
+        // it forces a redraw this iteration.
+        var ui_event = false;
+        while (win.poll()) |ev| {
+            ui_event = true;
+            switch (ev) {
+                // Typing snaps back to the bottom, matching common terminals.
+                .char => |cp| {
+                    // Drop the WM_CHAR that trails a handled Enter/Tab/Backspace/
+                    // Escape WM_KEYDOWN (flagged below) so the key isn't sent twice.
+                    if (suppress_next_char) {
+                        suppress_next_char = false;
+                        continue;
+                    }
+                    if (blink_timer) |*t| t.reset();
+                    io.scrollToBottom();
+                    writeChar(&pty, cp);
+                },
+                .key => |k| {
+                    // These keys are VT-encoded here and ALSO post a WM_CHAR; mark the
+                    // trailing WM_CHAR for suppression whether the key is sent to the
+                    // shell or consumed as a keybind. Other keys clear the flag.
+                    suppress_next_char = switch (k.vk) {
+                        input.vk.back, input.vk.tab, input.vk.enter, input.vk.escape => true,
+                        else => false,
+                    };
+                    if (blink_timer) |*t| t.reset();
 
-                // A bound chord is consumed as an action; otherwise it's a
-                // normal key written to the shell.
-                const ctx: KeybindCtx = .{
-                    .binds = &binds,
-                    .io = io,
-                    .rows = sfc.rows,
-                    .alloc = alloc,
-                    .win = win,
-                    .pty = &pty,
-                };
-                if (handleKeybind(k, ctx)) continue;
-                io.scrollToBottom();
-                writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), io.keyEncodeOptions());
-            },
-            .scroll => |raw| {
-                const delta = wheel.feed(raw);
-                if (delta != 0) io.scrollViewport(delta);
-            },
-            .mouse_button => |m| {
-                const btn: mouse.Button = switch (m.button) {
-                    .left => .left,
-                    .middle => .middle,
-                    .right => .right,
-                };
-                sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
-                    .shift = m.mods.shift,
-                    .alt = m.mods.alt,
-                    .ctrl = m.mods.ctrl,
-                });
-            },
-            .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
-            .mouse_capture_lost => sfc.endDrag(),
-            .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
-            .focus => |f| {
-                // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
-                // can't emit a duplicate report.
-                if (focused != f) {
-                    focused = f;
-                    // Report the change to apps that asked for it (mode 1004).
-                    if (io.focusReport(f)) |r| _ = pty.write(r) catch {};
-                }
-            },
-            .close => closed = true,
-        };
+                    // A bound chord is consumed as an action; otherwise it's a
+                    // normal key written to the shell.
+                    const ctx: KeybindCtx = .{
+                        .binds = &binds,
+                        .io = io,
+                        .rows = sfc.rows,
+                        .alloc = alloc,
+                        .win = win,
+                        .pty = &pty,
+                    };
+                    if (handleKeybind(k, ctx)) continue;
+                    io.scrollToBottom();
+                    writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), io.keyEncodeOptions());
+                },
+                .scroll => |raw| {
+                    const delta = wheel.feed(raw);
+                    if (delta != 0) io.scrollViewport(delta);
+                },
+                .mouse_button => |m| {
+                    const btn: mouse.Button = switch (m.button) {
+                        .left => .left,
+                        .middle => .middle,
+                        .right => .right,
+                    };
+                    sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
+                        .shift = m.mods.shift,
+                        .alt = m.mods.alt,
+                        .ctrl = m.mods.ctrl,
+                    });
+                },
+                .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
+                .mouse_capture_lost => sfc.endDrag(),
+                .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
+                .focus => |f| {
+                    // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
+                    // can't emit a duplicate report.
+                    if (focused != f) {
+                        focused = f;
+                        // Report the change to apps that asked for it (mode 1004).
+                        if (io.focusReport(f)) |r| _ = pty.write(r) catch {};
+                    }
+                },
+                .close => closed = true,
+            }
+        }
         if (closed) break;
 
         // Drain VT replies the terminal owes the pty (DSR/DA/DECRQM), generated
@@ -396,10 +410,28 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         }
 
         const sz = win.clientSize();
-        const blink_visible = blk: {
-            if (blink_timer) |*t| break :blk (t.read() / blink_interval_ns) % 2 == 0;
-            break :blk true;
-        };
+        const blink_elapsed: u64 = if (blink_timer) |*t| t.read() else 0;
+        const blink_visible = if (blink_timer != null)
+            (blink_elapsed / blink_interval_ns) % 2 == 0
+        else
+            true;
+
+        // Frame pacing (#72): redraw only when something changed. A *blinking*
+        // cursor's phase is folded in only while it's actually blinking, so a
+        // steady / hidden / unfocused cursor lets the loop go fully idle.
+        const cursor_blinks = io.cursorBlinks(focused);
+        const eff_blink = if (cursor_blinks) blink_visible else true;
+        const fs_cur: frame.FrameState = .{ .gen = io.dirtyGen(), .blink = eff_blink, .focused = focused };
+        if (!first_frame and !frame.needsRedraw(fs_prev, fs_cur, ui_event)) {
+            // Nothing changed: sleep until input, the reader's wake message, or
+            // the next blink toggle — instead of re-rendering every iteration.
+            const wait_blinking = cursor_blinks and blink_timer != null;
+            w.waitForMessage(frame.idleWaitMs(wait_blinking, blink_elapsed, blink_interval_ns, 1000));
+            continue;
+        }
+        fs_prev = fs_cur;
+        first_frame = false;
+
         const cursor_render: CursorRender = .{
             .focused = focused,
             .blink_visible = blink_visible,
@@ -422,8 +454,8 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         const clear_bg = rgbf(io.backgroundColor(theme.bg));
         try renderer.draw(quads.items, clear_bg, sz.width, sz.height);
 
-        frame += 1;
-        if (render_debug and frame == 10) renderer.debugCountLitPixels(clear_bg, sz.width, sz.height);
+        dbg_frame += 1;
+        if (render_debug and dbg_frame == 10) renderer.debugCountLitPixels(clear_bg, sz.width, sz.height);
 
         win.swapBuffers();
     }
@@ -434,11 +466,16 @@ fn shellCommandLine() []const u8 {
     return "cmd.exe";
 }
 
-fn readerLoop(pty: *Pty, io: *Termio, stop: *std.atomic.Value(bool)) void {
+fn readerLoop(pty: *Pty, io: *Termio, stop: *std.atomic.Value(bool), hwnd: w.HWND) void {
     var buf: [4096]u8 = undefined;
     while (!stop.load(.monotonic)) {
         const n = pty.read(&buf) catch break;
         io.process(buf[0..n]) catch {};
+        // Wake the (possibly idle) UI thread so it renders the new output and
+        // drains any VT reply this frame, instead of waiting out its timeout
+        // (frame pacing, #72). PostMessage is thread-safe; a failure (window
+        // gone during shutdown) is harmless.
+        _ = w.PostMessageW(hwnd, w.WM_WHOSTTY_WAKE, 0, 0);
     }
 }
 
