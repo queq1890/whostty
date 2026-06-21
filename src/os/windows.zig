@@ -240,9 +240,14 @@ pub const WM_PAINT: UINT = 0x000F;
 pub const WM_SETFOCUS: UINT = 0x0007;
 pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_KEYDOWN: UINT = 0x0100;
+/// A key was released (the WM_KEYDOWN counterpart). Used for kitty keyboard
+/// `report_events` release reporting (#82).
+pub const WM_KEYUP: UINT = 0x0101;
 pub const WM_CHAR: UINT = 0x0102;
 /// Posted instead of WM_KEYDOWN when a key is pressed while ALT is held.
 pub const WM_SYSKEYDOWN: UINT = 0x0104;
+/// Posted instead of WM_KEYUP when a key is released while ALT is held.
+pub const WM_SYSKEYUP: UINT = 0x0105;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_CREATE: UINT = 0x0001;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
@@ -372,6 +377,46 @@ pub fn flashWindow(hwnd: HWND) void {
 
 pub const SHORT = i16;
 pub extern "user32" fn GetKeyState(nVirtKey: INT) callconv(.winapi) SHORT;
+
+// --- Keyboard layout translation (kitty keyboard output, #82) -----------------
+// Deriving the unshifted base codepoint + the actual typed text for a key press
+// so it can be encoded in kitty CSI-u form. These are Windows-only and exercised
+// on-device; the host tests cover the pure encoding logic separately.
+
+/// Opaque keyboard-layout handle (HKL).
+pub const HKL = HANDLE;
+
+/// uMapType for MapVirtualKeyW: translate a virtual key to its (unshifted)
+/// character value. The result has the high bit (0x80000000) set for dead keys;
+/// mask it off and lowercase ASCII letters to get the base codepoint.
+pub const MAPVK_VK_TO_CHAR: UINT = 2;
+
+/// Translate a virtual-key code to a character (unshifted) for the current
+/// keyboard layout. Returns 0 if there is no translation.
+pub extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.winapi) UINT;
+
+/// Copy the 256-byte virtual-key state array (the input to ToUnicodeEx). The
+/// buffer must be 256 bytes.
+pub extern "user32" fn GetKeyboardState(lpKeyState: [*]u8) callconv(.winapi) BOOL;
+
+/// The active keyboard layout for the given thread (0 = the calling thread).
+pub extern "user32" fn GetKeyboardLayout(idThread: DWORD) callconv(.winapi) HKL;
+
+/// Translate a virtual key + scan code + key state into Unicode text using the
+/// given keyboard layout. Returns:
+///   >0  the number of UTF-16 units written to `pwszBuff`,
+///    0  no translation,
+///   -1  a dead key (the caller should treat the press as "composing" and call
+///       again with the same arguments to avoid leaking the dead-key state).
+pub extern "user32" fn ToUnicodeEx(
+    wVirtKey: UINT,
+    wScanCode: UINT,
+    lpKeyState: [*]const u8,
+    pwszBuff: [*]u16,
+    cchBuff: INT,
+    wFlags: UINT,
+    dwhkl: ?HKL,
+) callconv(.winapi) INT;
 
 // --- gdi32 -----------------------------------------------------------------
 

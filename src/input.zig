@@ -12,6 +12,7 @@ pub const KeyEvent = vt.input.KeyEvent;
 pub const Key = vt.input.Key;
 pub const Mods = vt.input.KeyMods;
 pub const Options = vt.input.KeyEncodeOptions;
+pub const Action = vt.input.KeyAction;
 
 /// Win32 virtual-key codes we map to terminal keys. These are the
 /// non-character keys (control, navigation, editing, function) whose bytes are
@@ -60,6 +61,9 @@ pub fn altSpecialToShell(code: u32) bool {
 /// Map a Win32 virtual-key code to a libghostty-vt `Key`. Returns
 /// `.unidentified` for keys whose text comes from WM_CHAR instead (letters,
 /// digits, punctuation), which the caller drops so they are not double-sent.
+/// This is the LEGACY mapping: printables intentionally stay unmapped so the
+/// legacy encoder path leaves them to the WM_CHAR raw-UTF-8 route. The kitty
+/// path uses `kittyKeyFromVk`, which additionally maps the printables.
 pub fn keyFromVk(code: u32) Key {
     return switch (code) {
         vk.back => .backspace,
@@ -82,9 +86,81 @@ pub fn keyFromVk(code: u32) Key {
     };
 }
 
+/// Map a Win32 virtual-key code to a libghostty-vt `Key`, including the
+/// printable keys (letters, digits, space, OEM punctuation) that
+/// `keyFromVk` leaves unmapped. Used ONLY on the kitty-keyboard output path
+/// (#82): the kitty encoder needs a real `Key` for a letter/digit so it can
+/// produce the functional-key table lookup and the base-layout alternate
+/// (`event.key.codepoint()`); the CSI-u key *code* itself comes from
+/// `unshifted_codepoint`. The legacy path must keep using `keyFromVk` so
+/// printables continue to arrive via WM_CHAR when kitty is off.
+///
+/// OEM punctuation VKs are mapped using their US-layout key positions (the
+/// `Key` enum is layout-independent — it names the physical key — and the
+/// US positions are the W3C `code` defaults). The actual typed character is
+/// carried separately in `utf8`/`unshifted_codepoint`, derived from the live
+/// layout, so a non-US layout still types correctly even though the physical
+/// `Key` is named for its US position.
+pub fn kittyKeyFromVk(code: u32) Key {
+    return switch (code) {
+        // Letters: VK 'A'..'Z' (0x41..0x5A) -> key_a..key_z (contiguous).
+        'A'...'Z' => @enumFromInt(@intFromEnum(Key.key_a) + @as(c_int, @intCast(code - 'A'))),
+        // Digits: VK '0'..'9' (0x30..0x39) -> digit_0..digit_9 (contiguous).
+        '0'...'9' => @enumFromInt(@intFromEnum(Key.digit_0) + @as(c_int, @intCast(code - '0'))),
+        ' ' => .space,
+        // OEM punctuation, named by US-layout key position.
+        0xBA => .semicolon, // VK_OEM_1   ;:
+        0xBB => .equal, // VK_OEM_PLUS  =+
+        0xBC => .comma, // VK_OEM_COMMA ,<
+        0xBD => .minus, // VK_OEM_MINUS -_
+        0xBE => .period, // VK_OEM_PERIOD .>
+        0xBF => .slash, // VK_OEM_2   /?
+        0xC0 => .backquote, // VK_OEM_3   `~
+        0xDB => .bracket_left, // VK_OEM_4   [{
+        0xDC => .backslash, // VK_OEM_5   \|
+        0xDD => .bracket_right, // VK_OEM_6   ]}
+        0xDE => .quote, // VK_OEM_7   '"
+        // Everything else: fall back to the special-key mapping.
+        else => keyFromVk(code),
+    };
+}
+
 /// Build modifiers from individual key states (as read from GetKeyState).
 pub fn mods(shift: bool, ctrl: bool, alt: bool) Mods {
     return .{ .shift = shift, .ctrl = ctrl, .alt = alt };
+}
+
+/// Build a full `KeyEvent` for the kitty-keyboard output path (#82). This is
+/// the Win32-free, host-testable core: the caller derives `unshifted_codepoint`
+/// (from MapVirtualKeyW) and `utf8` (from ToUnicodeEx) on the platform side and
+/// passes them in, so the encoding logic can be exercised without any Win32
+/// keyboard API. `consumed_mods` should carry the mods that were used to
+/// produce `utf8` (typically shift/altgr when text was generated); the encoder
+/// negates them out of the effective mods via `KeyEvent.effectiveMods`.
+pub const KittyKeyEventArgs = struct {
+    key: Key,
+    /// The base (unshifted) codepoint of the key, e.g. 'a' for shift+a, or 0
+    /// if none (functional keys, dead-key composition).
+    unshifted_codepoint: u21 = 0,
+    /// The actual generated text (incl. Shift/AltGr), or "" if none.
+    utf8: []const u8 = "",
+    mods: Mods = .{},
+    consumed_mods: Mods = .{},
+    action: Action = .press,
+    /// True mid dead-key composition (then the encoder sends only modifiers).
+    composing: bool = false,
+};
+
+pub fn kittyKeyEvent(args: KittyKeyEventArgs) KeyEvent {
+    return .{
+        .key = args.key,
+        .unshifted_codepoint = args.unshifted_codepoint,
+        .utf8 = args.utf8,
+        .mods = args.mods,
+        .consumed_mods = args.consumed_mods,
+        .action = args.action,
+        .composing = args.composing,
+    };
 }
 
 /// Encode a key event into terminal bytes, writing into `buf`. Returns the
@@ -196,4 +272,238 @@ test "input: navigation and function keys map and encode" {
         const out = try encode(&buf, .{ .key = k }, .{});
         try std.testing.expect(out.len >= 2 and out[0] == 0x1b);
     }
+}
+
+// --- Kitty keyboard output (#82) -------------------------------------------
+//
+// The kitty encoding logic lives entirely in libghostty-vt; these tests assert
+// the exact bytes whostty's encode() produces for crafted KeyEvents under kitty
+// flags, plus that `kittyKeyFromVk` maps printables (the legacy `keyFromVk`
+// keeps them unmapped). Win32 codepoint derivation (MapVirtualKeyW/ToUnicodeEx)
+// is platform glue verified on-device; here we feed the codepoints directly.
+
+/// The kitty keyboard flag set (libghostty-vt's `terminal.kitty.key.Flags`),
+/// reached through the field so we don't import ghostty's terminal package.
+const KittyFlags = @FieldType(Options, "kitty_flags");
+
+/// kitty options with the given flag bits set (any unset flag = false).
+fn kittyOpts(flags: KittyFlags) Options {
+    var opts: Options = .{};
+    opts.kitty_flags = flags;
+    return opts;
+}
+
+test "input: kittyKeyFromVk maps printables while keyFromVk does not" {
+    // Letters / digits / space.
+    try std.testing.expectEqual(Key.key_a, kittyKeyFromVk('A'));
+    try std.testing.expectEqual(Key.key_z, kittyKeyFromVk('Z'));
+    try std.testing.expectEqual(Key.digit_0, kittyKeyFromVk('0'));
+    try std.testing.expectEqual(Key.digit_9, kittyKeyFromVk('9'));
+    try std.testing.expectEqual(Key.space, kittyKeyFromVk(' '));
+    // OEM punctuation (US positions).
+    try std.testing.expectEqual(Key.semicolon, kittyKeyFromVk(0xBA));
+    try std.testing.expectEqual(Key.equal, kittyKeyFromVk(0xBB));
+    try std.testing.expectEqual(Key.minus, kittyKeyFromVk(0xBD));
+    try std.testing.expectEqual(Key.slash, kittyKeyFromVk(0xBF));
+    try std.testing.expectEqual(Key.bracket_left, kittyKeyFromVk(0xDB));
+    try std.testing.expectEqual(Key.quote, kittyKeyFromVk(0xDE));
+    // Special keys still map identically through the kitty mapping.
+    try std.testing.expectEqual(Key.enter, kittyKeyFromVk(vk.enter));
+    try std.testing.expectEqual(Key.arrow_up, kittyKeyFromVk(vk.up));
+    try std.testing.expectEqual(Key.f1, kittyKeyFromVk(vk.f1));
+
+    // Legacy mapping leaves printables unmapped (they go via WM_CHAR off-kitty).
+    try std.testing.expectEqual(Key.unidentified, keyFromVk('A'));
+    try std.testing.expectEqual(Key.unidentified, keyFromVk('0'));
+    try std.testing.expectEqual(Key.unidentified, keyFromVk(' '));
+    try std.testing.expectEqual(Key.unidentified, keyFromVk(0xBA));
+}
+
+test "input: kitty ctrl+a encodes CSI 97;5u" {
+    var buf: [32]u8 = undefined;
+    // Ctrl+a: no utf8 (ctrl not consumed), unshifted 'a'. ctrl appears in the
+    // modifier field (1+4 = 5). disambiguate flag is enough to enable kitty.
+    const ev = kittyKeyEvent(.{
+        .key = .key_a,
+        .unshifted_codepoint = 'a',
+        .mods = .{ .ctrl = true },
+    });
+    try std.testing.expectEqualStrings(
+        "\x1b[97;5u",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty plain 'a' passes through as text (disambiguate only)" {
+    var buf: [32]u8 = undefined;
+    // No mods, utf8="a": with report_all off, plain printable text passes
+    // through unchanged (the kitty "disambiguate" mode only escapes ambiguous
+    // keys, not plain letters).
+    const ev = kittyKeyEvent(.{ .key = .key_a, .unshifted_codepoint = 'a', .utf8 = "a" });
+    try std.testing.expectEqualStrings(
+        "a",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty report_all forces plain 'a' to CSI 97u" {
+    var buf: [32]u8 = undefined;
+    // With report_all, even an unmodified letter is reported as a CSI-u escape.
+    const ev = kittyKeyEvent(.{ .key = .key_a, .unshifted_codepoint = 'a', .utf8 = "a" });
+    try std.testing.expectEqualStrings(
+        "\x1b[97u",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true, .report_all = true })),
+    );
+}
+
+test "input: kitty shift+a encodes CSI 97;2u (unshifted code, shift mod)" {
+    var buf: [32]u8 = undefined;
+    // Shift+a -> utf8 "A", shift consumed to produce it. effectiveMods drops
+    // shift (utf8 non-empty), but with report_all the plain-text passthrough is
+    // skipped, so we get the CSI-u form keyed on the UNSHIFTED codepoint 97.
+    // Shift is still reported in the modifier field via all_mods.
+    const ev = kittyKeyEvent(.{
+        .key = .key_a,
+        .unshifted_codepoint = 'a',
+        .utf8 = "A",
+        .mods = .{ .shift = true },
+        .consumed_mods = .{ .shift = true },
+    });
+    try std.testing.expectEqualStrings(
+        "\x1b[97;2u",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true, .report_all = true })),
+    );
+}
+
+test "input: kitty AltGr printable passes through as text" {
+    var buf: [32]u8 = undefined;
+    // On international layouts Windows delivers AltGr as Ctrl+Alt; ToUnicodeEx
+    // returns the AltGr character (e.g. German AltGr+Q -> '@'). deriveKeyText must
+    // mark BOTH ctrl and alt as consumed so effectiveMods/binding_mods are empty
+    // and the char passes through — not mis-encoded as a CSI-u escape. This pins
+    // the encoder contract that fix depends on.
+    const ev = kittyKeyEvent(.{
+        .key = .key_q,
+        .unshifted_codepoint = 'q',
+        .utf8 = "@",
+        .mods = .{ .ctrl = true, .alt = true },
+        .consumed_mods = .{ .ctrl = true, .alt = true },
+    });
+    try std.testing.expectEqualStrings(
+        "@",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty F1 and arrow_up use functional-key entries" {
+    var buf: [32]u8 = undefined;
+    // F1 -> CSI 1 P (final 'P', code 1, no mods).
+    try std.testing.expectEqualStrings(
+        "\x1b[P",
+        try encode(&buf, kittyKeyEvent(.{ .key = .f1 }), kittyOpts(.{ .disambiguate = true })),
+    );
+    // arrow_up -> CSI A.
+    try std.testing.expectEqualStrings(
+        "\x1b[A",
+        try encode(&buf, kittyKeyEvent(.{ .key = .arrow_up }), kittyOpts(.{ .disambiguate = true })),
+    );
+    // ctrl+arrow_up -> CSI 1;5 A (special-key form with modifier).
+    try std.testing.expectEqualStrings(
+        "\x1b[1;5A",
+        try encode(&buf, kittyKeyEvent(.{ .key = .arrow_up, .mods = .{ .ctrl = true } }), kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty release event needs report_events" {
+    var buf: [32]u8 = undefined;
+    // A release of ctrl+a with report_events: CSI 97 ; <mods> : 3 u (3=release).
+    const ev = kittyKeyEvent(.{
+        .key = .key_a,
+        .unshifted_codepoint = 'a',
+        .mods = .{ .ctrl = true },
+        .action = .release,
+    });
+    try std.testing.expectEqualStrings(
+        "\x1b[97;5:3u",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true, .report_events = true })),
+    );
+
+    // Without report_events the release produces nothing.
+    try std.testing.expectEqualStrings(
+        "",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty Enter/Tab/Backspace keep legacy bytes when unmodified" {
+    var buf: [32]u8 = undefined;
+    // Enter/Tab/Backspace with empty binding mods and report_all off still send
+    // the legacy CR/Tab/0x7F (so a shell stays usable if an app crashes leaving
+    // the mode on). The trailing WM_CHAR is suppressed by the app layer.
+    try std.testing.expectEqualStrings(
+        "\r",
+        try encode(&buf, kittyKeyEvent(.{ .key = .enter }), kittyOpts(.{ .disambiguate = true })),
+    );
+    try std.testing.expectEqualStrings(
+        "\t",
+        try encode(&buf, kittyKeyEvent(.{ .key = .tab }), kittyOpts(.{ .disambiguate = true })),
+    );
+    try std.testing.expectEqualStrings(
+        "\x7f",
+        try encode(&buf, kittyKeyEvent(.{ .key = .backspace }), kittyOpts(.{ .disambiguate = true })),
+    );
+
+    // With a modifier they switch to CSI-u: shift+enter -> CSI 13;2 u.
+    try std.testing.expectEqualStrings(
+        "\x1b[13;2u",
+        try encode(&buf, kittyKeyEvent(.{ .key = .enter, .mods = .{ .shift = true } }), kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: kitty release of Enter is suppressed unless report_all" {
+    var buf: [32]u8 = undefined;
+    // Even with report_events, Enter/Tab/Backspace release is suppressed unless
+    // report_all is also set.
+    const ev = kittyKeyEvent(.{ .key = .enter, .action = .release });
+    try std.testing.expectEqualStrings(
+        "",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true, .report_events = true })),
+    );
+    // With report_all, the release IS reported: CSI 13 ; 1 : 3 u.
+    try std.testing.expectEqualStrings(
+        "\x1b[13;1:3u",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true, .report_events = true, .report_all = true })),
+    );
+}
+
+test "input: kitty composing (dead key) emits nothing" {
+    var buf: [32]u8 = undefined;
+    // Mid dead-key composition: only modifiers would be sent, and a plain letter
+    // key in composition produces no output.
+    const ev = kittyKeyEvent(.{ .key = .key_a, .unshifted_codepoint = 'a', .composing = true });
+    try std.testing.expectEqualStrings(
+        "",
+        try encode(&buf, ev, kittyOpts(.{ .disambiguate = true })),
+    );
+}
+
+test "input: legacy bytes unchanged when kitty disabled (regression)" {
+    var buf: [32]u8 = undefined;
+    // With kitty OFF (default opts, kitty_flags disabled), the legacy encoder is
+    // used: a plain printable KeyEvent passes its utf8 through, ctrl+a yields the
+    // C0 control byte, and arrow_up yields CSI A — exactly as before #82.
+    try std.testing.expectEqualStrings(
+        "a",
+        try encode(&buf, .{ .key = .key_a, .unshifted_codepoint = 'a', .utf8 = "a" }, .{}),
+    );
+    // Ctrl+a (legacy) -> 0x01.
+    try std.testing.expectEqualStrings(
+        "\x01",
+        try encode(&buf, .{ .key = .key_a, .unshifted_codepoint = 'a', .mods = .{ .ctrl = true } }, .{}),
+    );
+    // Arrow up (legacy) -> CSI A.
+    try std.testing.expectEqualStrings(
+        "\x1b[A",
+        try encode(&buf, .{ .key = .arrow_up }, .{}),
+    );
 }

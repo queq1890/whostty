@@ -285,10 +285,10 @@ const ResponseHandler = struct {
     }
 
     /// Kitty keyboard query (`CSI ? u`) — report the active screen's current
-    /// kitty keyboard flags as `CSI ? <flags> u`. ghostty answers this whether
-    /// or not the WM_CHAR key path uses the flags, so a probing app (e.g. nvim)
-    /// learns the protocol is understood. (Encoding *output* in kitty form is
-    /// the WM_CHAR-pipeline part of #82, still deferred.)
+    /// kitty keyboard flags as `CSI ? <flags> u`, so a probing app (e.g. nvim)
+    /// learns the protocol is understood. Once an app pushes flags, key *output*
+    /// is encoded in kitty CSI-u form by the Win32 layer (#82); this query just
+    /// reports the live flag set.
     fn queryKittyKeyboard(self: *ResponseHandler) !void {
         const flags = self.inner.terminal.screens.active.kitty_keyboard.current().int();
         var buf: [32]u8 = undefined;
@@ -573,18 +573,20 @@ pub const Termio = struct {
     }
 
     /// Key-encoding options derived from the current terminal state: cursor-key
-    /// application mode (DECCKM), keypad mode, modify-other-keys, and the
-    /// alt-esc prefix. Kitty keyboard output is forced **off**: the Win32 layer
-    /// still emits raw UTF-8 for printable keys via WM_CHAR, so routing special
-    /// keys through the kitty encoder would be inconsistent. The `CSI ? u` query
-    /// is answered (`ResponseHandler.queryKittyKeyboard`); only kitty-form key
-    /// *output* (the WM_CHAR-pipeline rework) stays deferred (#82). Thread-safe.
+    /// application mode (DECCKM), keypad mode, modify-other-keys, the alt-esc
+    /// prefix, and the active screen's **kitty keyboard flags**. When an app has
+    /// enabled the kitty keyboard protocol (`CSI > … u`), the returned
+    /// `kitty_flags` are non-empty and the encoder produces kitty CSI-u key
+    /// output instead of the legacy bytes (#82). The Win32 layer routes printable
+    /// keys through the encoder only when these flags are non-empty, so legacy
+    /// WM_CHAR typing is byte-identical when the protocol is off (the common
+    /// case). Reading the flags requires the lock (the reader thread mutates
+    /// `screens.active` as it parses), which `fromTerminal` reads under the lock
+    /// held here. Thread-safe.
     pub fn keyEncodeOptions(self: *Termio) vt.input.KeyEncodeOptions {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var opts = vt.input.KeyEncodeOptions.fromTerminal(&self.terminal);
-        opts.kitty_flags = .disabled;
-        return opts;
+        return vt.input.KeyEncodeOptions.fromTerminal(&self.terminal);
     }
 
     /// Resize the terminal grid. Thread-safe.
@@ -863,23 +865,30 @@ test "termio: DECRQM reports an unknown mode as not recognized" {
     try std.testing.expectEqualStrings("\x1b[?9999;0$y", try replyTo(io, "\x1b[?9999$p", &buf));
 }
 
-test "termio: keyEncodeOptions reflects DECCKM and forces kitty output off" {
+test "termio: keyEncodeOptions reflects DECCKM and live kitty flags" {
     const alloc = std.testing.allocator;
     const io = try Termio.create(alloc, 20, 3, 1 << 20);
     defer io.destroy();
 
-    // Default: cursor-key application mode off.
+    // Default: cursor-key application mode off and kitty keyboard disabled, so
+    // legacy encoding (raw WM_CHAR for printables) stays in effect.
     try std.testing.expect(!io.keyEncodeOptions().cursor_key_application);
+    try std.testing.expectEqual(@as(u5, 0), io.keyEncodeOptions().kitty_flags.int());
 
     // App enables DECCKM (cursor keys) -> reflected in the encode options.
     try io.process("\x1b[?1h");
     try std.testing.expect(io.keyEncodeOptions().cursor_key_application);
 
-    // App pushes kitty keyboard flags: the terminal records them...
+    // App pushes kitty keyboard flags (`CSI > 1 u` = disambiguate): the terminal
+    // records them AND they now flow through to the encode options, so key output
+    // switches to kitty CSI-u form (#82). `>1u` sets just the disambiguate bit.
     try io.process("\x1b[>1u");
     try std.testing.expect(io.terminal.screens.active.kitty_keyboard.current().int() != 0);
-    // ...but key-encode options force kitty output off (the WM_CHAR text path is
-    // still legacy; full kitty output is deferred).
+    try std.testing.expectEqual(@as(u5, 1), io.keyEncodeOptions().kitty_flags.int());
+    try std.testing.expect(io.keyEncodeOptions().kitty_flags.disambiguate);
+
+    // Popping back to an empty stack returns to legacy (flags off).
+    try io.process("\x1b[<u");
     try std.testing.expectEqual(@as(u5, 0), io.keyEncodeOptions().kitty_flags.int());
 }
 

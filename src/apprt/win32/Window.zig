@@ -25,8 +25,20 @@ pub const Event = union(enum) {
     /// WM_CHAR that follows a handled Enter/Tab/Backspace/Escape WM_KEYDOWN (see
     /// the suppress-next-char logic) so those keys aren't sent twice.
     char: u21,
-    /// A virtual key was pressed (WM_KEYDOWN), with the modifiers held.
-    key: struct { vk: u32, mods: Mods },
+    /// A virtual key changed state (WM_KEYDOWN / WM_KEYUP and their WM_SYS*
+    /// twins), with the modifiers held. `down` is true for a press/repeat and
+    /// false for a release; `repeat` is true for auto-repeat presses; `scancode`
+    /// is the hardware scan code (lParam bits 16–23). The release/repeat/scancode
+    /// fields are only consumed on the kitty-keyboard output path (#82) — the
+    /// legacy path acts on presses (`down`) and ignores the rest, so its bytes
+    /// are unchanged when kitty is off.
+    key: struct {
+        vk: u32,
+        mods: Mods,
+        down: bool = true,
+        repeat: bool = false,
+        scancode: u32 = 0,
+    },
     /// The mouse wheel moved (WM_MOUSEWHEEL); raw signed delta (multiples of
     /// WHEEL_DELTA), positive when rolled away from the user.
     scroll: i32,
@@ -277,6 +289,16 @@ pub const Window = struct {
         };
     }
 
+    /// Decode the scan code (bits 16–23) and the auto-repeat flag (bit 30, set
+    /// while a key repeats from being held) packed into a key message's lParam.
+    fn keyLParam(lparam: w.LPARAM) struct { scancode: u32, repeat: bool } {
+        const lp: usize = @bitCast(lparam);
+        return .{
+            .scancode = @truncate((lp >> 16) & 0xFF),
+            .repeat = (lp >> 30) & 1 != 0,
+        };
+    }
+
     /// Decode the signed client-area x/y packed in a mouse message's lParam.
     fn mouseXY(lparam: w.LPARAM) struct { x: i32, y: i32 } {
         const lp: usize = @bitCast(lparam);
@@ -323,7 +345,32 @@ pub const Window = struct {
                 return 0;
             },
             w.WM_KEYDOWN => {
-                if (self) |s| s.push(.{ .key = .{ .vk = @truncate(wparam), .mods = currentMods() } });
+                if (self) |s| {
+                    const lp = keyLParam(lparam);
+                    s.push(.{ .key = .{
+                        .vk = @truncate(wparam),
+                        .mods = currentMods(),
+                        .down = true,
+                        .repeat = lp.repeat,
+                        .scancode = lp.scancode,
+                    } });
+                }
+                return 0;
+            },
+            w.WM_KEYUP => {
+                // Release events drive the kitty keyboard `report_events` mode
+                // (#82). The app forwards them to the encoder only when an app
+                // has enabled that mode; otherwise (the common case) they are
+                // ignored, so legacy behavior is unchanged.
+                if (self) |s| {
+                    const lp = keyLParam(lparam);
+                    s.push(.{ .key = .{
+                        .vk = @truncate(wparam),
+                        .mods = currentMods(),
+                        .down = false,
+                        .scancode = lp.scancode,
+                    } });
+                }
                 return 0;
             },
             w.WM_SYSKEYDOWN => {
@@ -334,7 +381,30 @@ pub const Window = struct {
                 // Windows' default handling.
                 const vk: u32 = @truncate(wparam);
                 if (self) |s| if (input.altSpecialToShell(vk)) {
-                    s.push(.{ .key = .{ .vk = vk, .mods = currentMods() } });
+                    const lp = keyLParam(lparam);
+                    s.push(.{ .key = .{
+                        .vk = vk,
+                        .mods = currentMods(),
+                        .down = true,
+                        .repeat = lp.repeat,
+                        .scancode = lp.scancode,
+                    } });
+                    return 0;
+                };
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+            w.WM_SYSKEYUP => {
+                // The release twin of WM_SYSKEYDOWN (Alt held). Forward only the
+                // same nav/arrow/function keys, for kitty `report_events`.
+                const vk: u32 = @truncate(wparam);
+                if (self) |s| if (input.altSpecialToShell(vk)) {
+                    const lp = keyLParam(lparam);
+                    s.push(.{ .key = .{
+                        .vk = vk,
+                        .mods = currentMods(),
+                        .down = false,
+                        .scancode = lp.scancode,
+                    } });
                     return 0;
                 };
                 return w.DefWindowProcW(hwnd, msg, wparam, lparam);
