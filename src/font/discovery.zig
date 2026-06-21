@@ -160,10 +160,11 @@ fn firstInChain(chain: []const []const u8, available: []const []const u8) ?[]con
 /// Windows: enumerate the system font collection via DirectWrite, pick the
 /// family per `resolveFamily`, select the face matching `dwriteWeight`/
 /// `dwriteStyle`, and return its on-disk file path (via the local font-file
-/// loader). The concrete COM sequence is:
+/// loader). The COM sequence (implemented in `discoverWindows`) is:
 ///
-///   DWriteCreateFactory(ISOLATED, IID_IDWriteFactory, &factory)
+///   DWriteCreateFactory(SHARED, IID_IDWriteFactory, &factory)
 ///   factory->GetSystemFontCollection(&collection, FALSE)
+///   <enumerate family names> -> resolveFamily picks the winner
 ///   collection->FindFamilyName(name, &index, &exists)
 ///   collection->GetFontFamily(index, &family)
 ///   family->GetFirstMatchingFont(weight, STRETCH_NORMAL, style, &font)
@@ -172,18 +173,157 @@ fn firstInChain(chain: []const []const u8, available: []const []const u8) ?[]con
 ///   file->GetReferenceKey(&key, &keySize) + GetLoader(&loader)
 ///   loader as IDWriteLocalFontFileLoader->GetFilePathFromKey(...)
 ///
-/// This requires hand-written COM vtable bindings in `os/windows.zig` and a
-/// Windows host to verify (a wrong vtable layout faults at run time, not at
-/// compile time), so it is intentionally not landed blind in this environment.
-/// Until then it reports `error.Unimplemented`; the app falls back to its
-/// bundled/configured font path. The pure pieces above (`Descriptor`,
-/// `resolveFamily`, weight/style mapping) are complete and tested and are what
-/// the backend will call.
+/// The hand-written COM vtable bindings live in `os/dwrite.zig`. Errors propagate
+/// to the caller (the app then falls back to its bundled/configured font path).
+/// Returns a `Resolved` whose `family` and `path` are owned by `alloc`. Verified
+/// on a real Windows host (Georgia, Courier New, and the default chain all
+/// resolve to their real font files and load).
 pub fn discover(alloc: std.mem.Allocator, desc: Descriptor) !Resolved {
-    _ = alloc;
-    _ = desc;
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
-    return error.Unimplemented;
+    return discoverWindows(alloc, desc);
+}
+
+const dw = if (builtin.os.tag == .windows) @import("../os/dwrite.zig") else struct {};
+const win = if (builtin.os.tag == .windows) @import("../os/windows.zig") else struct {};
+
+/// DirectWrite backend for `discover`. Enumerates the system font collection's
+/// family names, picks one per `resolveFamily`, selects the styled face, and
+/// resolves it to an on-disk file path via the local font-file loader. Every
+/// COM object acquired is released on every return path (factory last).
+fn discoverWindows(alloc: std.mem.Allocator, desc: Descriptor) !Resolved {
+    var factory_raw: ?*anyopaque = null;
+    if (!dw.SUCCEEDED(dw.DWriteCreateFactory(
+        dw.DWRITE_FACTORY_TYPE_SHARED,
+        &dw.IID_IDWriteFactory,
+        &factory_raw,
+    ))) return error.DWriteFactoryFailed;
+    const factory: *dw.IDWriteFactory = @ptrCast(@alignCast(factory_raw.?));
+    defer _ = factory.Release();
+
+    var collection: ?*dw.IDWriteFontCollection = null;
+    if (!dw.SUCCEEDED(factory.GetSystemFontCollection(&collection, win.FALSE)) or collection == null)
+        return error.DWriteCollectionFailed;
+    const coll = collection.?;
+    defer _ = coll.Release();
+
+    // Enumerate every family's primary (locale-0) name into an owned list so the
+    // pure `resolveFamily` can pick the winner case-insensitively.
+    const count = coll.GetFontFamilyCount();
+    var names = std.ArrayList([]const u8){};
+    defer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    try names.ensureTotalCapacity(alloc, count);
+
+    var i: dw.UINT32 = 0;
+    while (i < count) : (i += 1) {
+        const name = familyName(alloc, coll, i) catch continue;
+        names.append(alloc, name) catch {
+            alloc.free(name);
+            return error.OutOfMemory;
+        };
+    }
+
+    const chosen = resolveFamily(desc.family, names.items) orelse return error.NoFontFound;
+    // `chosen` is a slice into `names`; dupe it now since we free `names` on exit.
+    const chosen_owned = try alloc.dupe(u8, chosen);
+    errdefer alloc.free(chosen_owned);
+
+    const path = try familyFilePath(alloc, coll, chosen, desc);
+    return .{ .family = chosen_owned, .path = path, .style = desc.style() };
+}
+
+/// Read family index `i`'s first localized name as owned UTF-8.
+fn familyName(alloc: std.mem.Allocator, coll: *dw.IDWriteFontCollection, i: dw.UINT32) ![]const u8 {
+    var family: ?*dw.IDWriteFontFamily = null;
+    if (!dw.SUCCEEDED(coll.GetFontFamily(i, &family)) or family == null) return error.NoFamily;
+    const fam = family.?;
+    defer _ = fam.Release();
+
+    var strings: ?*dw.IDWriteLocalizedStrings = null;
+    if (!dw.SUCCEEDED(fam.GetFamilyNames(&strings)) or strings == null) return error.NoNames;
+    const s = strings.?;
+    defer _ = s.Release();
+
+    var len: dw.UINT32 = 0;
+    if (!dw.SUCCEEDED(s.GetStringLength(0, &len))) return error.NoName;
+
+    const buf = try alloc.alloc(u16, len + 1);
+    defer alloc.free(buf);
+    if (!dw.SUCCEEDED(s.GetString(0, buf.ptr, len + 1))) return error.NoName;
+
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..len]);
+}
+
+/// Resolve a chosen family name to a concrete face file path (owned UTF-8).
+fn familyFilePath(
+    alloc: std.mem.Allocator,
+    coll: *dw.IDWriteFontCollection,
+    family_name: []const u8,
+    desc: Descriptor,
+) ![]const u8 {
+    const name_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, family_name);
+    defer alloc.free(name_w);
+
+    var index: dw.UINT32 = 0;
+    var exists: win.BOOL = win.FALSE;
+    if (!dw.SUCCEEDED(coll.FindFamilyName(name_w.ptr, &index, &exists)) or exists == win.FALSE)
+        return error.FamilyNotFound;
+
+    var family: ?*dw.IDWriteFontFamily = null;
+    if (!dw.SUCCEEDED(coll.GetFontFamily(index, &family)) or family == null) return error.NoFamily;
+    const fam = family.?;
+    defer _ = fam.Release();
+
+    var font: ?*dw.IDWriteFont = null;
+    if (!dw.SUCCEEDED(fam.GetFirstMatchingFont(
+        @intCast(desc.dwriteWeight()),
+        dw.DWRITE_FONT_STRETCH_NORMAL,
+        @intCast(desc.dwriteStyle()),
+        &font,
+    )) or font == null) return error.NoMatchingFont;
+    const f = font.?;
+    defer _ = f.Release();
+
+    var face: ?*dw.IDWriteFontFace = null;
+    if (!dw.SUCCEEDED(f.CreateFontFace(&face)) or face == null) return error.NoFontFace;
+    const fc = face.?;
+    defer _ = fc.Release();
+
+    // GetFiles is in/out on the count: query the count, then fetch one file.
+    var n_files: dw.UINT32 = 0;
+    if (!dw.SUCCEEDED(fc.GetFiles(&n_files, null)) or n_files == 0) return error.NoFontFile;
+    n_files = 1;
+    var file: ?*dw.IDWriteFontFile = null;
+    if (!dw.SUCCEEDED(fc.GetFiles(&n_files, @ptrCast(&file))) or file == null) return error.NoFontFile;
+    const ff = file.?;
+    defer _ = ff.Release();
+
+    var key: ?*const anyopaque = null;
+    var key_size: dw.UINT32 = 0;
+    if (!dw.SUCCEEDED(ff.GetReferenceKey(&key, &key_size))) return error.NoReferenceKey;
+
+    var loader: ?*dw.IDWriteFontFileLoader = null;
+    if (!dw.SUCCEEDED(ff.GetLoader(&loader)) or loader == null) return error.NoLoader;
+    const ld = loader.?;
+    defer _ = ld.Release();
+
+    var local_raw: ?*anyopaque = null;
+    if (!dw.SUCCEEDED(ld.QueryInterface(&dw.IID_IDWriteLocalFontFileLoader, &local_raw)) or local_raw == null)
+        return error.NotLocalLoader;
+    const local: *dw.IDWriteLocalFontFileLoader = @ptrCast(@alignCast(local_raw.?));
+    defer _ = local.Release();
+
+    var len: dw.UINT32 = 0;
+    if (!dw.SUCCEEDED(local.GetFilePathLengthFromKey(key, key_size, &len))) return error.NoFilePath;
+
+    const path_w = try alloc.alloc(u16, len + 1);
+    defer alloc.free(path_w);
+    if (!dw.SUCCEEDED(local.GetFilePathFromKey(key, key_size, path_w.ptr, len + 1)))
+        return error.NoFilePath;
+
+    return std.unicode.utf16LeToUtf8Alloc(alloc, path_w[0..len]);
 }
 
 const testing = std.testing;
@@ -275,4 +415,21 @@ test "discovery: discover is unsupported off-Windows" {
     if (builtin.os.tag != .windows) {
         try testing.expectError(error.Unsupported, discover(testing.allocator, .{}));
     }
+}
+
+test "discovery: discover resolves a system family to a real font file (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const resolved = try discover(alloc, .{ .family = "Consolas" });
+    defer alloc.free(resolved.family);
+    defer alloc.free(resolved.path);
+
+    // The path must exist on disk and look like a font file.
+    try std.fs.cwd().access(resolved.path, .{});
+    const lower = try std.ascii.allocLowerString(alloc, resolved.path);
+    defer alloc.free(lower);
+    const is_font = std.mem.endsWith(u8, lower, ".ttf") or
+        std.mem.endsWith(u8, lower, ".ttc") or
+        std.mem.endsWith(u8, lower, ".otf");
+    try testing.expect(is_font);
 }

@@ -36,6 +36,7 @@ const keymap = @import("keymap.zig");
 const mouse = @import("../../mouse.zig");
 const cli = @import("../../cli.zig");
 const frame = @import("../../frame.zig");
+const discovery = @import("../../font/discovery.zig");
 
 const log = std.log.scoped(.app);
 
@@ -44,8 +45,9 @@ const log = std.log.scoped(.app);
 /// the cache lookup for them.
 const first_drawable: u21 = 0x21;
 
-/// The default monospace font on Windows. font-family selection via DirectWrite
-/// discovery is #74; the configured size applies now.
+/// The bundled default monospace face, used when DirectWrite discovery (#74)
+/// can't resolve the configured `font-family` (off-Windows, family absent, or a
+/// COM failure). The configured family is preferred when discovery succeeds.
 const default_font_path = "C:\\Windows\\Fonts\\consola.ttf";
 
 /// Fallback fonts tried (in order) for codepoints the primary font lacks (#75) —
@@ -158,8 +160,9 @@ const CursorRender = struct {
 };
 
 /// Load the user config from `%APPDATA%\whostty\config`, falling back to
-/// defaults if it is missing or unreadable. font-family discovery is deferred
-/// to #14, so only size/colors take effect today.
+/// defaults if it is missing or unreadable. The configured `font-family` is
+/// resolved to a concrete face via DirectWrite discovery (#74); size/colors
+/// also take effect.
 fn loadConfig(alloc: std.mem.Allocator, override_text: []const u8) config.Config {
     var cfg = loadConfigFile(alloc) catch config.Config.init(alloc);
     // CLI `--key value` flags arrive as `key = value` lines applied on top of
@@ -214,8 +217,32 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // here and draws solids only. The cache is constructed in the declaration so
     // there is never an `undefined` window the cleanup defer could act on: a
     // failed init returns before the defer is registered.
+    // Resolve the primary face path from the configured `font-family` via
+    // DirectWrite (#74). On any failure (off-Windows, family not found, COM
+    // error) fall back to the bundled default. The discovered path is duped to a
+    // sentinel-terminated buffer for `GlyphCache.init` and kept alive (freed)
+    // for the lifetime of `run`.
+    var primary_path_buf: ?[:0]u8 = null;
+    defer if (primary_path_buf) |p| alloc.free(p);
+    const primary_path: [:0]const u8 = if (ft) blk: {
+        const fam: ?[]const u8 = if (cfg.font_family) |f|
+            (if (f.len == 0) null else f)
+        else
+            null;
+        const desc = discovery.Descriptor.forStyle(fam, cfg.font_size, .regular);
+        const resolved = discovery.discover(alloc, desc) catch |err| {
+            log.info("font discovery failed ({s}); using default {s}", .{ @errorName(err), default_font_path });
+            break :blk default_font_path;
+        };
+        defer alloc.free(resolved.family);
+        defer alloc.free(resolved.path);
+        primary_path_buf = alloc.dupeZ(u8, resolved.path) catch break :blk default_font_path;
+        log.info("font-family '{s}' resolved to {s}", .{ resolved.family, primary_path_buf.? });
+        break :blk primary_path_buf.?;
+    } else default_font_path;
+
     var cache: GlyphCache = if (ft)
-        try GlyphCache.init(alloc, default_font_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
+        try GlyphCache.init(alloc, primary_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
     else {};
     defer if (ft) cache.deinit();
 
