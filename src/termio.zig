@@ -541,6 +541,18 @@ pub const Termio = struct {
         self.terminal.screens.active.pages.scroll(.active);
     }
 
+    /// Scrollbar geometry from the VT viewport (libghostty-vt's authoritative
+    /// computation): `total` scrollable rows, the viewport's `offset` from the
+    /// top (rows above the first visible row), and the visible `len`. The
+    /// renderer turns this into a thumb via `scroll.scrollbarThumb`. Thread-safe.
+    pub const Scrollbar = struct { total: usize, offset: usize, len: usize };
+    pub fn scrollbar(self: *Termio) Scrollbar {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sb = self.terminal.screens.active.pages.scrollbar();
+        return .{ .total = sb.total, .offset = sb.offset, .len = sb.len };
+    }
+
     /// Lock the terminal for reading the grid; pair with `unlock`.
     pub fn lock(self: *Termio) void {
         self.mutex.lock();
@@ -1059,6 +1071,36 @@ test "termio: OSC 9;4 progress report is captured as persistent state" {
     // Remove clears the bar.
     try io.process("\x1b]9;4;0;\x07");
     try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.remove, io.progressReport().state);
+}
+
+test "termio: scrollbar reflects scrollback growth and viewport position" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Fresh screen: the viewport is everything, so total == len and no offset.
+    {
+        const sb = io.scrollbar();
+        try std.testing.expectEqual(@as(usize, 3), sb.len);
+        try std.testing.expectEqual(sb.len, sb.total);
+        try std.testing.expectEqual(@as(usize, 0), sb.offset);
+    }
+
+    // Print more lines than fit -> history accumulates, total exceeds the view.
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try io.process("line\r\n");
+    const grown = io.scrollbar();
+    try std.testing.expect(grown.total > grown.len);
+    // At the live bottom the thumb is at the end: offset == total - len.
+    try std.testing.expectEqual(grown.total - grown.len, grown.offset);
+
+    // Scrolling up into history moves the viewport (and the thumb) up.
+    io.scrollViewport(-5);
+    const scrolled = io.scrollbar();
+    try std.testing.expect(scrolled.offset < grown.offset);
+    // total/len are unchanged by scrolling the viewport.
+    try std.testing.expectEqual(grown.total, scrolled.total);
+    try std.testing.expectEqual(grown.len, scrolled.len);
 }
 
 test "termio: takeResponse drains and clears the queue" {

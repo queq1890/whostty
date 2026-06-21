@@ -402,6 +402,12 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         // buildQuads may have packed new glyphs into the atlas; re-upload before
         // drawing so the texture has them.
         if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
+
+        // Scrollbar (#73): an overlay thumb on the right edge marking the
+        // viewport's position within the scrollback. Appended after the grid so
+        // it draws on top; shown only when there is history to scroll. The thumb
+        // geometry comes from the VT core's authoritative row counts.
+        appendScrollbar(alloc, &quads, io.scrollbar(), sz.width, sz.height, cell_w, theme.fg) catch {};
         // Default-background cells show through the clear color, so it must track
         // the OSC 11 background override (falling back to the configured bg).
         const clear_bg = rgbf(io.backgroundColor(theme.bg));
@@ -523,6 +529,34 @@ fn copyToClipboard(ctx: KeybindCtx) void {
     defer ctx.alloc.free(text);
     if (text.len == 0) return;
     w.clipboardWrite(ctx.alloc, ctx.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
+}
+
+/// Append the scrollbar overlay (#73): a faint full-height track and a brighter,
+/// grabbable thumb on the right edge, sized and positioned from the VT viewport's
+/// scrollback counts (`scroll.scrollbarThumb`). Nothing is appended when the
+/// content fits the viewport (no history to scroll). The thumb color is derived
+/// from the foreground so it contrasts with any background. Drawn translucent so
+/// the cells beneath it remain legible (it overlays the rightmost column).
+fn appendScrollbar(
+    alloc: std.mem.Allocator,
+    quads: *std.ArrayList(gl.Quad),
+    sb: Termio.Scrollbar,
+    screen_w: u32,
+    screen_h: u32,
+    cell_w: u32,
+    fg: vt.color.RGB,
+) !void {
+    if (sb.total <= sb.len or screen_h == 0 or screen_w == 0) return;
+    const bar_w: u32 = @max(4, cell_w / 3);
+    const bar_x: i32 = @intCast(screen_w -| bar_w);
+    const thumb = scroll.scrollbarThumb(sb.total, sb.len, sb.offset, @floatFromInt(screen_h));
+    const c = rgbf(fg);
+    // Faint full-height track.
+    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = 0, .w = bar_w, .h = screen_h, .r = c[0], .g = c[1], .b = c[2], .a = 0.12 } });
+    // The thumb, clamped so it never spills past the track bottom on rounding.
+    const off: u32 = @intFromFloat(@round(thumb.offset));
+    const size: u32 = @min(@max(1, @as(u32, @intFromFloat(@round(thumb.size)))), screen_h -| off);
+    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = @intCast(off), .w = bar_w, .h = size, .r = c[0], .g = c[1], .b = c[2], .a = 0.5 } });
 }
 
 /// Translate the terminal viewport into renderable quads, honoring SGR colors
