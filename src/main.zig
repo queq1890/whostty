@@ -113,6 +113,7 @@ test {
     _ = @import("font/discovery.zig");
     _ = @import("font/shaper.zig");
     _ = @import("input/Binding.zig");
+    _ = @import("apprt/action.zig");
     _ = @import("apprt/win32/keymap.zig");
     _ = @import("os/windows.zig");
     _ = @import("mouse.zig");

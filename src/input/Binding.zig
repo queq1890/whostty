@@ -77,6 +77,10 @@ pub const Direction = enum { left, right, up, down };
 /// to what whostty implements today: surface management (#18) and scrollback
 /// (#16).
 pub const Action = union(enum) {
+    /// Open a new top-level window (#86). Multi-window via thread-per-window; the
+    /// apprt spawns a fresh, fully independent window thread. Void-payload,
+    /// mirroring ghostty's `new_window`.
+    new_window,
     new_split: Direction,
     goto_split: Direction,
     new_tab,
@@ -202,6 +206,7 @@ pub fn parseAction(input: []const u8) ParseError!Action {
         arg = std.mem.trim(u8, trimmed[c + 1 ..], " \t");
     }
 
+    if (eqlIgnoreCase(name, "new_window")) return .new_window;
     if (eqlIgnoreCase(name, "new_split")) return .{ .new_split = try dir(arg) };
     if (eqlIgnoreCase(name, "goto_split")) return .{ .goto_split = try dir(arg) };
     if (eqlIgnoreCase(name, "new_tab")) return .new_tab;
@@ -279,6 +284,7 @@ pub const Set = struct {
 /// applying any user `keybind` lines, which then override per trigger.
 pub fn addDefaults(set: *Set, alloc: std.mem.Allocator) !void {
     const lines = [_][]const u8{
+        "ctrl+shift+n=new_window",
         "ctrl+shift+t=new_tab",
         "ctrl+shift+w=close_surface",
         "ctrl+pagedown=next_tab",
@@ -336,6 +342,9 @@ test "binding: malformed triggers error" {
 test "binding: parse actions with and without arguments" {
     try testing.expectEqual(Action{ .new_split = .right }, try parseAction("new_split:right"));
     try testing.expectEqual(Action{ .goto_split = .up }, try parseAction("goto_split:up"));
+    // Multi-window (#86): a void-payload action like new_tab.
+    try testing.expectEqual(Action.new_window, try parseAction("new_window"));
+    try testing.expectEqual(Action.new_window, try parseAction("New_Window")); // case-insensitive
     try testing.expectEqual(Action.new_tab, try parseAction("new_tab"));
     try testing.expectEqual(Action.next_tab, try parseAction("next_tab"));
     try testing.expectEqual(Action{ .goto_tab = 3 }, try parseAction("goto_tab:3"));
@@ -395,6 +404,12 @@ test "binding: defaults populate a usable set" {
 
     // Window-state defaults (#91): the exact chords the apprt dispatches on.
     const cs: Mods = .{ .ctrl = true, .shift = true };
+
+    // new_window (#86): the default chord is ctrl+shift+n. keymap.keyFromVk(0x4E)
+    // maps the 'N' virtual key to codepoint 'n', so WM_KEYDOWN routes this exact
+    // trigger; assert the default binds it.
+    const new_window: Trigger = .{ .key = .{ .codepoint = 'n' }, .mods = cs };
+    try testing.expectEqual(Action.new_window, set.get(new_window).?);
     const fullscreen: Trigger = .{ .key = .{ .named = .enter }, .mods = cs };
     try testing.expectEqual(Action.toggle_fullscreen, set.get(fullscreen).?);
     const maximize: Trigger = .{ .key = .{ .codepoint = 'm' }, .mods = cs };
