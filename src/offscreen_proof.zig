@@ -877,10 +877,11 @@ pub fn main() !void {
         out.print("[proof] PASS: per-codepoint fallback rasterized a CJK glyph the primary lacks (#75)\n", .{});
     }
 
-    // --- Sprite glyph proof (#76): block elements drawn procedurally ----------
-    // U+2588 FULL BLOCK is rasterized by the built-in sprite renderer (not the
-    // font) and must fill the cell; a quadrant must fill only a quarter. Proves
-    // the procedural sprite reaches the framebuffer through the atlas/shader.
+    // --- Sprite glyph proof (#76): block + box-drawing drawn procedurally -----
+    // U+2588 FULL BLOCK fills the cell; a quadrant fills a quarter; the light
+    // cross U+253C (box-drawing) draws thin lines (a partial fill). All are
+    // rasterized by the built-in sprite renderer (not the font) and must reach
+    // the framebuffer through the atlas/shader.
     {
         var cache = try GlyphCache.init(alloc, font_path, 24, 512);
         defer cache.deinit();
@@ -888,13 +889,14 @@ pub fn main() !void {
         const chei = cache.cell_h;
         const full = cache.get(0x2588, false, false) orelse return error.NoFullBlock;
         const quad = cache.get(0x2598, false, false) orelse return error.NoQuadrant; // upper-left
+        const cross = cache.get(0x253C, false, false) orelse return error.NoCross; // light cross
 
         g.bindTexture(GL_TEXTURE_2D, tex);
         g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
         g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
 
-        var counts: [2]usize = .{ 0, 0 };
-        for ([_]Atlas.Placement{ full, quad }, 0..) |place, idx| {
+        var counts: [3]usize = .{ 0, 0, 0 };
+        for ([_]Atlas.Placement{ full, quad, cross }, 0..) |place, idx| {
             var sgv: std.ArrayList(gl.Vertex) = .empty;
             defer sgv.deinit(alloc);
             try gl.pushQuad(&sgv, alloc, .{
@@ -922,7 +924,7 @@ pub fn main() !void {
             counts[idx] = slit;
         }
         const cell_area = cwid * chei;
-        out.print("[proof] sprite: full-block lit={d} (cell area={d}), quadrant lit={d}\n", .{ counts[0], cell_area, counts[1] });
+        out.print("[proof] sprite: full-block lit={d} (cell area={d}), quadrant lit={d}, box-cross lit={d}\n", .{ counts[0], cell_area, counts[1], counts[2] });
         // The full block should cover ~the whole cell; the quadrant about a quarter.
         if (counts[0] < (cell_area * 9) / 10) {
             out.print("[proof] FAIL: full block did not fill the cell\n", .{});
@@ -932,6 +934,11 @@ pub fn main() !void {
             out.print("[proof] FAIL: quadrant did not render as a partial fill\n", .{});
             return error.QuadrantWrong;
         }
-        out.print("[proof] PASS: built-in sprites rasterized procedurally (full block fills cell, quadrant a quarter)\n", .{});
+        // The box-drawing cross is thin lines: lit, but far less than a full cell.
+        if (counts[2] == 0 or counts[2] >= counts[0]) {
+            out.print("[proof] FAIL: box-drawing cross did not render as thin lines\n", .{});
+            return error.BoxCrossWrong;
+        }
+        out.print("[proof] PASS: built-in sprites rasterized procedurally (full block, quadrant, box-drawing cross)\n", .{});
     }
 }
