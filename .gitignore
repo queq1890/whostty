@@ -9,3 +9,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Claude Code session worktrees / local state
+.claude/worktrees/
