@@ -90,6 +90,13 @@ pub const Action = union(enum) {
     scroll_to_bottom,
     copy_to_clipboard,
     paste_from_clipboard,
+    /// Window-state actions (#91). Borderless windowed fullscreen, maximize/
+    /// restore, and show/hide the titlebar+resize border. Each acts on the
+    /// current window (the apprt's single surface). Void-payload, mirroring
+    /// ghostty's `toggle_fullscreen`/`toggle_maximize`/`toggle_window_decorations`.
+    toggle_fullscreen,
+    toggle_maximize,
+    toggle_window_decorations,
 };
 
 /// A parsed `trigger = action` binding.
@@ -211,6 +218,9 @@ pub fn parseAction(input: []const u8) ParseError!Action {
     if (eqlIgnoreCase(name, "scroll_to_bottom")) return .scroll_to_bottom;
     if (eqlIgnoreCase(name, "copy_to_clipboard")) return .copy_to_clipboard;
     if (eqlIgnoreCase(name, "paste_from_clipboard")) return .paste_from_clipboard;
+    if (eqlIgnoreCase(name, "toggle_fullscreen")) return .toggle_fullscreen;
+    if (eqlIgnoreCase(name, "toggle_maximize")) return .toggle_maximize;
+    if (eqlIgnoreCase(name, "toggle_window_decorations")) return .toggle_window_decorations;
     return error.InvalidAction;
 }
 
@@ -285,6 +295,9 @@ pub fn addDefaults(set: *Set, alloc: std.mem.Allocator) !void {
         "shift+pagedown=scroll_page_down",
         "ctrl+shift+c=copy_to_clipboard",
         "ctrl+shift+v=paste_from_clipboard",
+        "ctrl+shift+enter=toggle_fullscreen",
+        "ctrl+shift+m=toggle_maximize",
+        "ctrl+shift+b=toggle_window_decorations",
     };
     for (lines) |line| try set.putLine(alloc, line);
 }
@@ -329,6 +342,12 @@ test "binding: parse actions with and without arguments" {
     try testing.expectEqual(Action.scroll_to_bottom, try parseAction("scroll_to_bottom"));
     try testing.expectEqual(Action.copy_to_clipboard, try parseAction("copy_to_clipboard"));
     try testing.expectEqual(Action.paste_from_clipboard, try parseAction("paste_from_clipboard"));
+    // Window-state actions (#91), void-payload.
+    try testing.expectEqual(Action.toggle_fullscreen, try parseAction("toggle_fullscreen"));
+    try testing.expectEqual(Action.toggle_maximize, try parseAction("toggle_maximize"));
+    try testing.expectEqual(Action.toggle_window_decorations, try parseAction("toggle_window_decorations"));
+    // Case-insensitive, like the other action names.
+    try testing.expectEqual(Action.toggle_fullscreen, try parseAction("Toggle_Fullscreen"));
 }
 
 test "binding: bad actions error" {
@@ -373,4 +392,13 @@ test "binding: defaults populate a usable set" {
 
     const split_right: Trigger = .{ .key = .{ .named = .right }, .mods = .{ .ctrl = true, .shift = true } };
     try testing.expectEqual(Action{ .new_split = .right }, set.get(split_right).?);
+
+    // Window-state defaults (#91): the exact chords the apprt dispatches on.
+    const cs: Mods = .{ .ctrl = true, .shift = true };
+    const fullscreen: Trigger = .{ .key = .{ .named = .enter }, .mods = cs };
+    try testing.expectEqual(Action.toggle_fullscreen, set.get(fullscreen).?);
+    const maximize: Trigger = .{ .key = .{ .codepoint = 'm' }, .mods = cs };
+    try testing.expectEqual(Action.toggle_maximize, set.get(maximize).?);
+    const decorations: Trigger = .{ .key = .{ .codepoint = 'b' }, .mods = cs };
+    try testing.expectEqual(Action.toggle_window_decorations, set.get(decorations).?);
 }

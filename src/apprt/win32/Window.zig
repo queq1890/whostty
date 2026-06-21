@@ -79,6 +79,30 @@ pub const Window = struct {
     tail: usize = 0,
     should_close: bool = false,
 
+    // --- Window-state (#91) ---
+    /// True while in borderless windowed fullscreen. Flipped ONLY by
+    /// toggleFullscreen() — never in the window proc — so a normal user
+    /// drag-resize (which fires WM_SIZE) can't corrupt the saved geometry/style.
+    fullscreen: bool = false,
+    /// The window placement (size/pos + normal/maximized show state) captured
+    /// the moment fullscreen was entered, restored verbatim on exit.
+    saved_placement: w.WINDOWPLACEMENT = undefined,
+    /// The exact GWL_STYLE captured at fullscreen-enter (so a decoration-hidden
+    /// window round-trips to its decoration-hidden state, not to a default one).
+    saved_style: w.LONG_PTR = 0,
+    /// Whether the titlebar + resize border are currently shown. Toggled by
+    /// toggleDecorations(); the window is created decorated.
+    decorations: bool = true,
+    /// The shell child's process id, set by the apprt after spawn (#91). Used by
+    /// the close-confirmation probe to detect a running descendant. 0 = unknown
+    /// (probe is skipped, so a confirmation never blocks shutdown spuriously).
+    shell_pid: w.DWORD = 0,
+    /// True while the close-confirmation dialog is modal. MessageBoxW runs its
+    /// own message pump that re-enters wndProc, so a second WM_CLOSE (the X
+    /// mashed again) would queue another `.close` and re-prompt after the user
+    /// answers; wndProc drops WM_CLOSE while this is set.
+    close_pending: bool = false,
+
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttyWindowClass");
 
     pub const CreateError = error{
@@ -235,6 +259,126 @@ pub const Window = struct {
         _ = w.SetWindowTextW(self.hwnd, title_z.ptr);
     }
 
+    /// Record the shell child's pid for the close-confirmation probe (#91). The
+    /// apprt calls this after spawning the shell. Until set, the probe is skipped.
+    pub fn setShellPid(self: *Window, pid: w.DWORD) void {
+        self.shell_pid = pid;
+    }
+
+    /// Toggle borderless windowed fullscreen (#91), the Raymond-Chen pattern:
+    /// entering saves the current placement + style, drops the overlapped frame,
+    /// and stretches the window over the nearest monitor's full rect; leaving
+    /// restores the saved style then the saved placement (size/pos + max state).
+    /// The resulting size change fires WM_SIZE, which the apprt's existing resize
+    /// path consumes — no extra grid/pty wiring needed.
+    pub fn toggleFullscreen(self: *Window) void {
+        const style = w.GetWindowLongPtrW(self.hwnd, w.GWL_STYLE);
+        if (!self.fullscreen) {
+            // Capture exact prior state. Guard so a double-enter (shouldn't
+            // happen, but be safe) can't overwrite the good saved snapshot.
+            self.saved_style = style;
+            self.saved_placement.length = @sizeOf(w.WINDOWPLACEMENT);
+            if (w.GetWindowPlacement(self.hwnd, &self.saved_placement) == w.FALSE) return;
+
+            const mon = w.MonitorFromWindow(self.hwnd, w.MONITOR_DEFAULTTONEAREST) orelse return;
+            var mi: w.MONITORINFO = undefined;
+            mi.cbSize = @sizeOf(w.MONITORINFO);
+            if (w.GetMonitorInfoW(mon, &mi) == w.FALSE) return;
+
+            // Drop the titlebar + resize border so the client area can cover the
+            // whole monitor (a bordered window can't reach the screen edges).
+            _ = w.SetWindowLongPtrW(self.hwnd, w.GWL_STYLE, style & ~@as(w.LONG_PTR, @intCast(w.WS_OVERLAPPEDWINDOW)));
+            const r = mi.rcMonitor;
+            _ = w.SetWindowPos(
+                self.hwnd,
+                null,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                w.SWP_NOZORDER | w.SWP_FRAMECHANGED,
+            );
+            self.fullscreen = true;
+        } else {
+            // Restore the saved style FIRST so the frame recomputes, then the
+            // saved placement (size/pos + normal-vs-maximized show state).
+            _ = w.SetWindowLongPtrW(self.hwnd, w.GWL_STYLE, self.saved_style);
+            _ = w.SetWindowPlacement(self.hwnd, &self.saved_placement);
+            _ = w.SetWindowPos(
+                self.hwnd,
+                null,
+                0,
+                0,
+                0,
+                0,
+                w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOZORDER | w.SWP_FRAMECHANGED,
+            );
+            self.fullscreen = false;
+        }
+    }
+
+    /// Maximize or restore the window (#91). Uses the OS maximize state directly
+    /// (IsZoomed) rather than tracking our own bool, so it stays correct even if
+    /// the user maximized via the titlebar button. Restoring from a maximized
+    /// fullscreen edge case is handled by toggleFullscreen's placement save.
+    pub fn toggleMaximize(self: *Window) void {
+        // No-op while borderless fullscreen: the window has WS_OVERLAPPEDWINDOW
+        // cleared and is stretched to the monitor, so SW_MAXIMIZE here would
+        // corrupt the fullscreen geometry/show-state (mirrors toggleDecorations).
+        if (self.fullscreen) return;
+        const cmd: w.INT = if (w.IsZoomed(self.hwnd) != w.FALSE) w.SW_RESTORE else w.SW_MAXIMIZE;
+        _ = w.ShowWindow(self.hwnd, cmd);
+    }
+
+    /// Show/hide the titlebar + resize border (#91) by flipping exactly the
+    /// WS_CAPTION | WS_THICKFRAME bits — leaving WS_SYSMENU/min/max-box intact —
+    /// then SetWindowPos(SWP_FRAMECHANGED) so the non-client frame recomputes
+    /// immediately (without it a ghost titlebar lingers until the next resize).
+    /// A borderless (decoration-hidden) window can't be user-resized; that's the
+    /// intended effect. No-op while fullscreen (the frame is already gone).
+    pub fn toggleDecorations(self: *Window) void {
+        if (self.fullscreen) return;
+        const deco_bits: w.LONG_PTR = @intCast(w.WS_CAPTION | w.WS_THICKFRAME);
+        const style = w.GetWindowLongPtrW(self.hwnd, w.GWL_STYLE);
+        const new_style = if (self.decorations) style & ~deco_bits else style | deco_bits;
+        _ = w.SetWindowLongPtrW(self.hwnd, w.GWL_STYLE, new_style);
+        _ = w.SetWindowPos(
+            self.hwnd,
+            null,
+            0,
+            0,
+            0,
+            0,
+            w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOZORDER | w.SWP_FRAMECHANGED,
+        );
+        self.decorations = !self.decorations;
+    }
+
+    /// Close-confirmation gate (#91), mirroring ghostty's `needsConfirmQuit`
+    /// semantics for the `.true` default: prompt ONLY when a foreground command
+    /// is running, i.e. the shell has a live child process. Returns true if the
+    /// window should proceed to close, false if the user chose to keep it open.
+    /// When nothing is running (bare prompt), or the pid is unknown, it returns
+    /// true with no dialog so shutdown is never blocked spuriously. The dialog is
+    /// modal on the UI thread; the apprt calls this from its `.close` handling
+    /// (where the shell pid was wired in), NOT from the window proc.
+    pub fn confirmClose(self: *Window) bool {
+        if (self.shell_pid == 0) return true;
+        if (!w.shellHasRunningChild(self.shell_pid)) return true;
+
+        // The dialog runs a modal pump that re-enters wndProc; flag so a second
+        // WM_CLOSE during it is dropped (not queued into a repeat prompt).
+        self.close_pending = true;
+        defer self.close_pending = false;
+
+        const text = std.unicode.utf8ToUtf16LeStringLiteral(
+            "A process is still running in this terminal. Close anyway?",
+        );
+        const caption = std.unicode.utf8ToUtf16LeStringLiteral("whostty");
+        const r = w.MessageBoxW(self.hwnd, text, caption, w.MB_YESNO | w.MB_ICONQUESTION);
+        return r == w.IDYES;
+    }
+
     pub fn swapBuffers(self: *Window) void {
         _ = w.SwapBuffers(self.hdc);
     }
@@ -317,7 +461,10 @@ pub const Window = struct {
         const self = fromHwnd(hwnd);
         switch (msg) {
             w.WM_CLOSE => {
-                if (self) |s| s.push(.close);
+                // Drop close requests arriving while a close-confirmation dialog
+                // is modal (its pump re-enters here) — else they'd queue and
+                // re-prompt after the user answers.
+                if (self) |s| if (!s.close_pending) s.push(.close);
                 return 0;
             },
             w.WM_DESTROY => {

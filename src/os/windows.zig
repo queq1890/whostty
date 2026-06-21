@@ -77,6 +77,12 @@ pub extern "kernel32" fn WriteFile(
 
 pub extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
 
+/// Cancel outstanding I/O on a handle issued by any thread (lpOverlapped null =
+/// all). Used to unblock the reader thread's blocking ReadFile during teardown:
+/// after the shell is killed, ConPTY keeps the output pipe open (conhost holds
+/// it), so the read never returns on its own and a plain join() would hang.
+pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
+
 pub extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 
 pub extern "kernel32" fn TerminateProcess(
@@ -144,6 +150,61 @@ pub const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5; // (DWORD)-11
 pub extern "kernel32" fn AttachConsole(dwProcessId: DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
 
+// --- Process-descendant detection (close-confirmation, #91) ------------------
+// Walk a process snapshot for any process whose parent is the shell pid, to tell
+// "a foreground command is running" from "sitting at a bare prompt". The shell's
+// pid is derived from the child HANDLE via GetProcessId.
+
+/// CreateToolhelp32Snapshot dwFlags: snapshot all processes.
+pub const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
+
+/// PROCESSENTRY32W: one process in a toolhelp snapshot. `dwSize` MUST be set to
+/// @sizeOf before Process32FirstW. We only read th32ProcessID/th32ParentProcessID.
+pub const PROCESSENTRY32W = extern struct {
+    dwSize: DWORD,
+    cntUsage: DWORD,
+    th32ProcessID: DWORD,
+    th32DefaultHeapID: usize, // ULONG_PTR
+    th32ModuleID: DWORD,
+    cntThreads: DWORD,
+    th32ParentProcessID: DWORD,
+    pcPriClassBase: LONG,
+    dwFlags: DWORD,
+    szExeFile: [260]u16,
+};
+
+pub extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
+pub extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn Process32FirstW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+pub extern "kernel32" fn Process32NextW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+
+/// Return true if `shell_pid` has at least one direct child process still alive
+/// in the snapshot. This is whostty's substitute for ghostty's
+/// `cursorIsAtPrompt()` ("a foreground command is running") — without OSC133
+/// shell integration we can't read the prompt state, so we ask the OS instead:
+/// an idle `cmd.exe` prompt has zero children; running `vim`/`ping`/etc. forks a
+/// child of the shell. On any snapshot failure we return false so a broken probe
+/// never blocks shutdown (the caller then closes without prompting). Win32-only;
+/// link-checked, reached only from the Windows apprt.
+pub fn shellHasRunningChild(shell_pid: DWORD) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (shell_pid == 0) return false;
+    const snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    defer _ = CloseHandle(snap);
+
+    var entry: PROCESSENTRY32W = undefined;
+    entry.dwSize = @sizeOf(PROCESSENTRY32W);
+    if (Process32FirstW(snap, &entry) == FALSE) return false;
+    while (true) {
+        // Ignore the System Idle Process (pid 0), which lists pid 0 as its own
+        // parent; only a real, distinct child counts.
+        if (entry.th32ParentProcessID == shell_pid and entry.th32ProcessID != 0) return true;
+        if (Process32NextW(snap, &entry) == FALSE) break;
+    }
+    return false;
+}
+
 // --- GUI types (not in std.os.windows) -------------------------------------
 
 pub const HWND = windows.HWND;
@@ -163,6 +224,31 @@ pub const INT = c_int;
 pub const POINT = windows.POINT;
 pub const RECT = windows.RECT;
 pub const LONG_PTR = isize;
+pub const LONG = windows.LONG;
+/// Monitor handle (HMONITOR), used by MonitorFromWindow/GetMonitorInfoW (#91).
+pub const HMONITOR = windows.HANDLE;
+
+/// Window placement (normal/min/max rects + show state). The public field set
+/// is these six; `length` MUST be set to @sizeOf before GetWindowPlacement or
+/// the call fails silently. Used to save/restore exact geometry across a
+/// fullscreen toggle (#91).
+pub const WINDOWPLACEMENT = extern struct {
+    length: UINT,
+    flags: UINT,
+    showCmd: UINT,
+    ptMinPosition: POINT,
+    ptMaxPosition: POINT,
+    rcNormalPosition: RECT,
+};
+
+/// Monitor geometry. `cbSize` MUST be set to @sizeOf before GetMonitorInfoW.
+/// `rcMonitor` is the full monitor rect the borderless fullscreen covers (#91).
+pub const MONITORINFO = extern struct {
+    cbSize: DWORD,
+    rcMonitor: RECT,
+    rcWork: RECT,
+    dwFlags: DWORD,
+};
 
 pub const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 
@@ -228,9 +314,40 @@ pub const CS_VREDRAW: UINT = 0x0001;
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
+/// The titlebar and the sizing (resize) border — the two style bits the
+/// decoration toggle (#91) clears/restores. WS_OVERLAPPEDWINDOW already
+/// contains both, so the toggle flips exactly these two sub-bits and leaves
+/// WS_SYSMENU/WS_MINIMIZEBOX/WS_MAXIMIZEBOX intact.
+pub const WS_CAPTION: DWORD = 0x00C00000;
+pub const WS_THICKFRAME: DWORD = 0x00040000;
 pub const CW_USEDEFAULT: INT = @bitCast(@as(u32, 0x80000000));
 
 pub const SW_SHOW: INT = 5;
+/// ShowWindow nCmdShow values used by the window-state actions (#91).
+pub const SW_SHOWNORMAL: INT = 1;
+pub const SW_MAXIMIZE: INT = 3;
+pub const SW_RESTORE: INT = 9;
+
+/// GetWindowLongPtrW/SetWindowLongPtrW indices (#91).
+pub const GWL_STYLE: INT = -16;
+pub const GWL_EXSTYLE: INT = -20;
+
+/// SetWindowPos uFlags (#91).
+pub const SWP_NOSIZE: UINT = 0x0001;
+pub const SWP_NOMOVE: UINT = 0x0002;
+pub const SWP_NOZORDER: UINT = 0x0004;
+pub const SWP_NOACTIVATE: UINT = 0x0010;
+pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SWP_SHOWWINDOW: UINT = 0x0040;
+
+/// MonitorFromWindow dwFlags: pick the nearest monitor (#91).
+pub const MONITOR_DEFAULTTONEAREST: DWORD = 2;
+
+/// MessageBoxW uType flags + return values for the close-confirmation (#91).
+pub const MB_YESNO: UINT = 0x00000004;
+pub const MB_ICONQUESTION: UINT = 0x00000020;
+pub const IDYES: INT = 6;
+pub const IDNO: INT = 7;
 
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
@@ -342,6 +459,29 @@ pub extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: INT, dwNewLong: LON
 pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.winapi) LONG_PTR;
 pub extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+
+// --- Window state: fullscreen / maximize / decorations (#91) ----------------
+pub extern "user32" fn SetWindowPos(
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    X: INT,
+    Y: INT,
+    cx: INT,
+    cy: INT,
+    uFlags: UINT,
+) callconv(.winapi) BOOL;
+pub extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetWindowPlacement(hWnd: HWND, lpwndpl: *WINDOWPLACEMENT) callconv(.winapi) BOOL;
+pub extern "user32" fn SetWindowPlacement(hWnd: HWND, lpwndpl: *const WINDOWPLACEMENT) callconv(.winapi) BOOL;
+pub extern "user32" fn IsZoomed(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winapi) ?HMONITOR;
+pub extern "user32" fn GetMonitorInfoW(hMonitor: HMONITOR, lpmi: *MONITORINFO) callconv(.winapi) BOOL;
+pub extern "user32" fn MessageBoxW(
+    hWnd: ?HWND,
+    lpText: [*:0]const u16,
+    lpCaption: [*:0]const u16,
+    uType: UINT,
+) callconv(.winapi) INT;
 
 // --- Window flash (visual bell) ------------------------------------------------
 pub const FLASHW_STOP: DWORD = 0;
