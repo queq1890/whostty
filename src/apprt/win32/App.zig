@@ -366,6 +366,17 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             w.clipboardWrite(alloc, win.handle(), text) catch {};
         }
 
+        // Out-of-band terminal events (BEL / OSC 9 / 777). A bell flashes the
+        // window (visual bell); a desktop notification is logged for now — the
+        // Windows toast / tray surfacing is host-only work (#43). Both are
+        // captured on the reader thread and acted on here, on the UI thread.
+        if (io.takeBellCount() > 0) w.flashWindow(win.handle());
+        if (io.takeNotification()) |note| {
+            var n = note;
+            defer n.deinit(alloc);
+            log.info("desktop notification: {s}: {s}", .{ n.title, n.body });
+        }
+
         const sz = win.clientSize();
         const blink_visible = blk: {
             if (blink_timer) |*t| break :blk (t.read() / blink_interval_ns) % 2 == 0;

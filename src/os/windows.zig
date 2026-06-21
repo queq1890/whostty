@@ -308,6 +308,38 @@ pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.wina
 pub extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 
+// --- Window flash (visual bell) ------------------------------------------------
+pub const FLASHW_STOP: DWORD = 0;
+pub const FLASHW_CAPTION: DWORD = 0x1;
+pub const FLASHW_TRAY: DWORD = 0x2;
+pub const FLASHW_ALL: DWORD = FLASHW_CAPTION | FLASHW_TRAY;
+/// Keep flashing until the window comes to the foreground.
+pub const FLASHW_TIMERNOFG: DWORD = 0xC;
+
+pub const FLASHWINFO = extern struct {
+    cbSize: UINT,
+    hwnd: HWND,
+    dwFlags: DWORD,
+    uCount: UINT,
+    dwTimeout: DWORD,
+};
+pub extern "user32" fn FlashWindowEx(pfwi: *const FLASHWINFO) callconv(.winapi) BOOL;
+
+/// Visual bell: flash the caption + taskbar button until the window is focused.
+/// A no-op visually if the window already has the foreground (Windows suppresses
+/// the flash), which is the desired behavior — you only want to be alerted to a
+/// bell in a window you aren't looking at.
+pub fn flashWindow(hwnd: HWND) void {
+    var info: FLASHWINFO = .{
+        .cbSize = @sizeOf(FLASHWINFO),
+        .hwnd = hwnd,
+        .dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG,
+        .uCount = 0,
+        .dwTimeout = 0,
+    };
+    _ = FlashWindowEx(&info);
+}
+
 pub const SHORT = i16;
 pub extern "user32" fn GetKeyState(nVirtKey: INT) callconv(.winapi) SHORT;
 

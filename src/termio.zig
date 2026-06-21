@@ -13,6 +13,47 @@ const mouse = @import("mouse.zig");
 /// name shadows the `vt` module import within the struct's scope.
 const gvt = vt;
 
+/// A desktop notification captured from OSC 9 / OSC 777, owned by `alloc`.
+/// The app raises it out-of-band (a Windows toast / tray balloon); the OS
+/// surfacing is tracked under the windows-host work (#43).
+pub const Notification = struct {
+    title: []u8,
+    body: []u8,
+
+    pub fn deinit(self: *Notification, alloc: std.mem.Allocator) void {
+        alloc.free(self.title);
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
+/// Out-of-band terminal events the app consumes off the reply path — they don't
+/// owe the pty a response, but the *app* (not the VT core) must act on them:
+/// ring the bell, track the shell's working directory (OSC 7), raise desktop
+/// notifications (OSC 9 / 777) and drive the taskbar progress bar (OSC 9;4).
+/// `ReadonlyHandler` drops all of these (they have no terminal-modifying
+/// effect), so `ResponseHandler` captures them here. Written on the reader
+/// thread, drained on the UI thread; guarded by `Termio.mutex`.
+const SideChannel = struct {
+    /// Bells rung since the last drain. The app flashes the window once per
+    /// drain regardless of count; the count just records that one happened.
+    bell_count: u32 = 0,
+    /// Latest OSC 7 working directory (the raw `file://` URL), owned by `alloc`.
+    /// An empty OSC 7 url clears it (ghostty's "forget the pwd" behavior).
+    cwd: ?[]u8 = null,
+    /// Latest desktop notification, owned; latest wins until drained.
+    notification: ?Notification = null,
+    /// Latest taskbar progress state (OSC 9;4). A *state*, not an event: it
+    /// persists until the app changes it. `.remove` (no bar) is the idle default.
+    progress: gvt.osc.Command.ProgressReport = .{ .state = .remove },
+
+    fn deinit(self: *SideChannel, alloc: std.mem.Allocator) void {
+        if (self.cwd) |c| alloc.free(c);
+        if (self.notification) |*n| n.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 /// The stream handler. libghostty-vt's `ReadonlyStream` applies every
 /// state-modifying action to the terminal but deliberately drops the queries
 /// that require a reply (DSR / DA / DECRQM / ENQ) — it is meant for replay
@@ -31,18 +72,23 @@ const ResponseHandler = struct {
     /// Pending OSC 52 clipboard write (decoded, owned); points into `Termio`.
     /// The UI thread drains it because clipboard access needs the window.
     clipboard_write: *?[]u8,
+    /// Out-of-band events (bell / cwd / notification / progress); points into
+    /// `Termio`, drained on the UI thread.
+    side: *SideChannel,
     alloc: std.mem.Allocator,
 
     fn init(
         terminal: *gvt.Terminal,
         response: *std.ArrayListUnmanaged(u8),
         clipboard_write: *?[]u8,
+        side: *SideChannel,
         alloc: std.mem.Allocator,
     ) ResponseHandler {
         return .{
             .inner = gvt.ReadonlyHandler.init(terminal),
             .response = response,
             .clipboard_write = clipboard_write,
+            .side = side,
             .alloc = alloc,
         };
     }
@@ -65,11 +111,19 @@ const ResponseHandler = struct {
             .request_mode_unknown => try self.requestModeUnknown(value),
             .color_operation => try self.colorOperation(value),
             .clipboard_contents => self.clipboardContents(value),
+            .kitty_keyboard_query => try self.queryKittyKeyboard(),
+
+            // Out-of-band events the app consumes (not pty replies). The readonly
+            // handler drops these, so we capture them into the side channel.
+            .bell => self.side.bell_count +|= 1,
+            .report_pwd => try self.reportPwd(value.url),
+            .show_desktop_notification => try self.showNotification(value),
+            .progress_report => self.side.progress = value,
 
             // ENQ falls through: ghostty's default `enquiry-response` is the
             // empty string, so replying with nothing (the readonly handler's
-            // no-op) is the faithful default. xtversion / size-report /
-            // kitty-keyboard-query replies belong to later sub-issues (#82).
+            // no-op) is the faithful default. xtversion / size-report replies
+            // belong to later work.
             else => try self.inner.vt(action, value),
         }
     }
@@ -216,6 +270,42 @@ const ResponseHandler = struct {
         if (self.clipboard_write.*) |old| self.alloc.free(old);
         self.clipboard_write.* = buf;
     }
+
+    /// Kitty keyboard query (`CSI ? u`) — report the active screen's current
+    /// kitty keyboard flags as `CSI ? <flags> u`. ghostty answers this whether
+    /// or not the WM_CHAR key path uses the flags, so a probing app (e.g. nvim)
+    /// learns the protocol is understood. (Encoding *output* in kitty form is
+    /// the WM_CHAR-pipeline part of #82, still deferred.)
+    fn queryKittyKeyboard(self: *ResponseHandler) !void {
+        const flags = self.inner.terminal.screens.active.kitty_keyboard.current().int();
+        var buf: [32]u8 = undefined;
+        try self.reply(try std.fmt.bufPrint(&buf, "\x1b[?{d}u", .{flags}));
+    }
+
+    /// OSC 7 — record the shell's reported working directory (the raw url). An
+    /// empty url resets it (ghostty treats that as "the pwd is unknown"). The
+    /// consumers (window title #89, new-window inheritance #87) read it later;
+    /// here we just capture it. The url slice is only valid during the call, so
+    /// it is duplicated into the side channel.
+    fn reportPwd(self: *ResponseHandler, url: []const u8) !void {
+        if (self.side.cwd) |old| {
+            self.alloc.free(old);
+            self.side.cwd = null;
+        }
+        if (url.len == 0) return;
+        self.side.cwd = try self.alloc.dupe(u8, url);
+    }
+
+    /// OSC 9 / OSC 777 — capture a desktop notification (title may be empty for
+    /// the OSC 9 form). Both fields are valid only during the call, so they are
+    /// duplicated; the latest notification wins until the app drains it.
+    fn showNotification(self: *ResponseHandler, n: gvt.StreamAction.Value(.show_desktop_notification)) !void {
+        const title = try self.alloc.dupe(u8, n.title);
+        errdefer self.alloc.free(title);
+        const body = try self.alloc.dupe(u8, n.body);
+        if (self.side.notification) |*old| old.deinit(self.alloc);
+        self.side.notification = .{ .title = title, .body = body };
+    }
 };
 
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
@@ -237,6 +327,10 @@ pub const Termio = struct {
     /// by the handler and drained by `takeClipboardWrite` on the UI thread.
     /// Latest write wins. Guarded by `mutex`.
     clipboard_write: ?[]u8,
+    /// Out-of-band events (bell / OSC 7 cwd / OSC 9-777 notification / OSC 9;4
+    /// progress) captured by the handler and drained on the UI thread. Guarded
+    /// by `mutex`.
+    side: SideChannel,
     /// Guards `terminal`: the reader thread mutates it via `process`, the
     /// renderer reads it. Lock with `lock`/`unlock` around grid access.
     mutex: std.Thread.Mutex,
@@ -257,6 +351,7 @@ pub const Termio = struct {
         self.mutex = .{};
         self.response = .empty;
         self.clipboard_write = null;
+        self.side = .{};
         self.sel_anchor = null;
         self.sel_anchor_screen = null;
         self.terminal = try vt.Terminal.init(alloc, .{
@@ -267,10 +362,10 @@ pub const Termio = struct {
         errdefer self.terminal.deinit(alloc);
 
         // The handler holds pointers into `self` (terminal, response,
-        // clipboard_write), all stable because `self` is heap-allocated.
+        // clipboard_write, side), all stable because `self` is heap-allocated.
         self.stream = vt.Stream(ResponseHandler).initAlloc(
             alloc,
-            ResponseHandler.init(&self.terminal, &self.response, &self.clipboard_write, alloc),
+            ResponseHandler.init(&self.terminal, &self.response, &self.clipboard_write, &self.side, alloc),
         );
         return self;
     }
@@ -280,6 +375,7 @@ pub const Termio = struct {
         self.stream.deinit();
         self.response.deinit(alloc);
         if (self.clipboard_write) |c| alloc.free(c);
+        self.side.deinit(alloc);
         self.terminal.deinit(alloc);
         alloc.destroy(self);
     }
@@ -293,6 +389,46 @@ pub const Termio = struct {
         const c = self.clipboard_write;
         self.clipboard_write = null;
         return c;
+    }
+
+    /// Number of bells rung since the last call, then reset to 0. The app rings
+    /// the bell (flashes the window) when this is non-zero. Thread-safe.
+    pub fn takeBellCount(self: *Termio) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.side.bell_count;
+        self.side.bell_count = 0;
+        return n;
+    }
+
+    /// The shell's last-reported working directory (OSC 7), duplicated into
+    /// `alloc` for the caller to own, or null if none has been reported (or it
+    /// was reset). Thread-safe.
+    pub fn cwdAlloc(self: *Termio, alloc: std.mem.Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const c = self.side.cwd orelse return null;
+        return try alloc.dupe(u8, c);
+    }
+
+    /// Take the pending desktop notification (OSC 9 / 777), transferring
+    /// ownership to the caller (free with `Notification.deinit`), or null if
+    /// none is pending. Thread-safe.
+    pub fn takeNotification(self: *Termio) ?Notification {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = self.side.notification;
+        self.side.notification = null;
+        return n;
+    }
+
+    /// The current taskbar progress state (OSC 9;4). Unlike the other side
+    /// channels this is a persistent *state* (not drained): the app reads it to
+    /// drive the taskbar. Thread-safe.
+    pub fn progressReport(self: *Termio) vt.osc.Command.ProgressReport {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.side.progress;
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -371,8 +507,9 @@ pub const Termio = struct {
     /// application mode (DECCKM), keypad mode, modify-other-keys, and the
     /// alt-esc prefix. Kitty keyboard output is forced **off**: the Win32 layer
     /// still emits raw UTF-8 for printable keys via WM_CHAR, so routing special
-    /// keys through the kitty encoder would be inconsistent. Full kitty output
-    /// and the `CSI ? u` reply are deferred (#82). Thread-safe.
+    /// keys through the kitty encoder would be inconsistent. The `CSI ? u` query
+    /// is answered (`ResponseHandler.queryKittyKeyboard`); only kitty-form key
+    /// *output* (the WM_CHAR-pipeline rework) stays deferred (#82). Thread-safe.
     pub fn keyEncodeOptions(self: *Termio) vt.input.KeyEncodeOptions {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -828,6 +965,100 @@ test "termio: focus reporting follows DEC mode 1004" {
     // Disabling stops the reports.
     try io.process("\x1b[?1004l");
     try std.testing.expect(io.focusReport(true) == null);
+}
+
+test "termio: kitty keyboard query reports the current flags (CSI ?u)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    var buf: [64]u8 = undefined;
+    // No flags pushed yet -> 0.
+    try std.testing.expectEqualStrings("\x1b[?0u", try replyTo(io, "\x1b[?u", &buf));
+    // App pushes flags 1 (disambiguate escape codes); the query now reports 1.
+    try std.testing.expectEqualStrings("\x1b[?1u", try replyTo(io, "\x1b[>1u\x1b[?u", &buf));
+}
+
+test "termio: BEL increments the bell count, drained once" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Plain output rings no bell.
+    try io.process("hi");
+    try std.testing.expectEqual(@as(u32, 0), io.takeBellCount());
+
+    // Two BELs -> count 2, then draining clears it.
+    try io.process("\x07ab\x07");
+    try std.testing.expectEqual(@as(u32, 2), io.takeBellCount());
+    try std.testing.expectEqual(@as(u32, 0), io.takeBellCount());
+}
+
+test "termio: OSC 7 records and resets the working directory" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // None reported yet.
+    try std.testing.expect((try io.cwdAlloc(alloc)) == null);
+
+    try io.process("\x1b]7;file://host/home/user\x1b\\");
+    const cwd = (try io.cwdAlloc(alloc)) orelse return error.NoCwd;
+    defer alloc.free(cwd);
+    try std.testing.expectEqualStrings("file://host/home/user", cwd);
+
+    // An empty OSC 7 forgets the pwd.
+    try io.process("\x1b]7;\x1b\\");
+    try std.testing.expect((try io.cwdAlloc(alloc)) == null);
+}
+
+test "termio: OSC 9 / OSC 777 desktop notifications, latest wins" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // OSC 9: body only, empty title.
+    try io.process("\x1b]9;Build finished\x07");
+    {
+        var n = io.takeNotification() orelse return error.NoNotification;
+        defer n.deinit(alloc);
+        try std.testing.expectEqualStrings("", n.title);
+        try std.testing.expectEqualStrings("Build finished", n.body);
+    }
+    // Draining clears it.
+    try std.testing.expect(io.takeNotification() == null);
+
+    // OSC 777: title + body, and a later one overwrites an undrained earlier one.
+    try io.process("\x1b]777;notify;First;A\x07");
+    try io.process("\x1b]777;notify;Second;B\x07");
+    {
+        var n = io.takeNotification() orelse return error.NoNotification;
+        defer n.deinit(alloc);
+        try std.testing.expectEqualStrings("Second", n.title);
+        try std.testing.expectEqualStrings("B", n.body);
+    }
+}
+
+test "termio: OSC 9;4 progress report is captured as persistent state" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Idle default: no bar.
+    try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.remove, io.progressReport().state);
+
+    // Set 50%.
+    try io.process("\x1b]9;4;1;50\x07");
+    const p = io.progressReport();
+    try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.set, p.state);
+    try std.testing.expectEqual(@as(?u8, 50), p.progress);
+
+    // It persists (a state, not an event): a second read still reports it.
+    try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.set, io.progressReport().state);
+
+    // Remove clears the bar.
+    try io.process("\x1b]9;4;0;\x07");
+    try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.remove, io.progressReport().state);
 }
 
 test "termio: takeResponse drains and clears the queue" {
