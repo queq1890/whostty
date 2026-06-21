@@ -15,8 +15,17 @@
 //! This module is free of the `freetype`/`harfbuzz` imports and of any platform
 //! types, so it compiles and unit-tests on the host.
 const std = @import("std");
+const build_options = @import("build_options");
 
 const discovery = @import("discovery.zig");
+
+/// The Harfbuzz binding only exists in the `-Dfreetype` build (it's a lazy,
+/// freetype-gated dependency — see build.zig). In the no-freetype CI build the
+/// module is absent, so the import is comptime-gated and the shaper degrades to
+/// the seam (`shape` returns `error.Unimplemented`). Everything below that
+/// touches `harfbuzz` sits behind `build_options.freetype`.
+const harfbuzz = if (build_options.freetype) @import("harfbuzz") else void;
+const font = if (build_options.freetype) @import("main.zig") else void;
 
 /// The face style of a cell, reused from discovery so the two layers agree on
 /// the regular/bold/italic/bold-italic split.
@@ -39,6 +48,11 @@ pub const Cell = struct {
     style: Style = .regular,
     presentation: Presentation = .text,
     width: Width = .narrow,
+    /// SGR 8 (invisible). Carried so the renderer keeps an invisible cell off the
+    /// shaped path — invisible text must not render, and shaping (which only
+    /// splits runs on style/presentation) would otherwise draw it. A run holding
+    /// one falls back to the per-cell path, which already honors invisible.
+    invisible: bool = false,
 };
 
 /// A maximal sequence of cells that can be shaped together: same face style,
@@ -162,18 +176,153 @@ pub const ShapedGlyph = struct {
 /// verify the binding, neither of which is available in this environment, so it
 /// is not landed blind. Until then the renderer keeps its per-cell glyph path
 /// (no ligatures). The run segmentation above is the part that's ready.
+/// The Harfbuzz shaper. In the `-Dfreetype` build it owns an `hb_font_t`
+/// wrapping the primary FreeType face (created via `hb_ft_font_create_referenced`,
+/// which refcounts the FT face so the face must outlive the shaper) plus a reused
+/// buffer and the configured OpenType feature list. In the no-freetype build it
+/// holds nothing and `shape` returns `error.Unimplemented` (the renderer keeps
+/// its per-cell glyph path). A default-constructed `Shaper{}` has no font and
+/// also returns `error.Unimplemented`, so the seam stays valid in both builds.
 pub const Shaper = struct {
+    /// The shaper's OWN FreeType face, opened from the same font file as the
+    /// renderer's primary face — NOT shared. Harfbuzz shaping mutates the FT face
+    /// (loads glyphs, may change the active size), so sharing the rasterizer's
+    /// face corrupts glyph rasterization mid-frame (every glyph comes out empty).
+    /// Same file => identical glyph indices, so `GlyphCache.getByIndex` resolves
+    /// the shaped indices against its own face correctly.
+    own_face: if (build_options.freetype) ?font.Face else void =
+        if (build_options.freetype) null else {},
+    /// The hb font wrapping `own_face`. `null` until `init` runs (or always in
+    /// no-freetype). When null, `shape` is the seam.
+    hb_font: if (build_options.freetype) ?harfbuzz.Font else void =
+        if (build_options.freetype) null else {},
+    /// A buffer reused across runs (reset per shape). Only valid when `hb_font`
+    /// is set.
+    hb_buf: if (build_options.freetype) ?harfbuzz.Buffer else void =
+        if (build_options.freetype) null else {},
+    /// The OpenType features applied to every run (e.g. `liga`, `calt`). Empty
+    /// means "use the font's defaults" (Cascadia Code's ligatures are `calt`,
+    /// on by default, so even an empty list yields `-> => != ===`).
+    features: if (build_options.freetype) []const harfbuzz.Feature else void =
+        if (build_options.freetype) &.{} else {},
+
+    /// Build a shaper from the primary face. `features` are converted from the
+    /// project's `Feature` list (4-byte tag + value) into `hb_feature_t[]`; the
+    /// caller owns the converted slice and must keep it alive (or pass an
+    /// allocator-owned one freed by `deinit`). The FT face wrapped here must
+    /// outlive the shaper (Harfbuzz holds a counted reference, but the bytes
+    /// stay owned by `font.Face`).
+    pub fn init(
+        alloc: std.mem.Allocator,
+        lib: font.Library,
+        path: [:0]const u8,
+        px: u32,
+        features: []const Feature,
+    ) !Shaper {
+        comptime std.debug.assert(build_options.freetype);
+        // Open a SEPARATE face for Harfbuzz (see `own_face`): shaping mutates the
+        // FT face, so it must not be the one the GlyphCache rasterizes with.
+        var own_face = try font.Face.init(lib, path, px);
+        errdefer own_face.deinit();
+        var hb_font = try harfbuzz.freetype.createFont(own_face.inner.handle);
+        errdefer hb_font.destroy();
+        var hb_buf = try harfbuzz.Buffer.create();
+        errdefer hb_buf.destroy();
+
+        // Convert each project Feature into an hb_feature_t spanning the whole
+        // run (HB_FEATURE_GLOBAL_START..END). The tag is a big-endian pack of
+        // the 4-byte OpenType tag, matching hb_tag_t.
+        const hb_feats = try alloc.alloc(harfbuzz.Feature, features.len);
+        errdefer alloc.free(hb_feats);
+        for (features, 0..) |f, i| {
+            const tag: u32 = (@as(u32, f.tag[0]) << 24) |
+                (@as(u32, f.tag[1]) << 16) |
+                (@as(u32, f.tag[2]) << 8) |
+                @as(u32, f.tag[3]);
+            hb_feats[i] = .{
+                .tag = tag,
+                .value = f.value,
+                .start = 0,
+                .end = std.math.maxInt(c_uint),
+            };
+        }
+
+        return .{ .own_face = own_face, .hb_font = hb_font, .hb_buf = hb_buf, .features = hb_feats };
+    }
+
+    pub fn deinit(self: *Shaper, alloc: std.mem.Allocator) void {
+        if (build_options.freetype) {
+            if (self.hb_buf) |*b| b.destroy();
+            if (self.hb_font) |*f| f.destroy();
+            // Destroy hb_font (which holds a counted ref to own_face) BEFORE the
+            // face, then free our own face.
+            if (self.own_face) |*f| f.deinit();
+            alloc.free(self.features);
+            self.* = .{};
+        }
+    }
+
+    /// Shape a run into positioned glyphs. The caller owns the returned slice
+    /// (`alloc.free`). Cluster values are run-relative (`run.column(cluster)`
+    /// maps back to the grid). Advances/offsets are converted from Harfbuzz's
+    /// 26.6 fixed-point to whole pixels (`>> 6`). Returns `error.Unimplemented`
+    /// when there is no font (no-freetype, or a default-constructed shaper).
     pub fn shape(
         self: *Shaper,
         alloc: std.mem.Allocator,
         run: Run,
         cells: []const Cell,
     ) ![]ShapedGlyph {
-        _ = self;
-        _ = alloc;
-        _ = run;
-        _ = cells;
-        return error.Unimplemented;
+        if (!build_options.freetype) return error.Unimplemented;
+
+        const hb_font = self.hb_font orelse return error.Unimplemented;
+        const buf = self.hb_buf orelse return error.Unimplemented;
+
+        buf.reset();
+        // After reset the buffer's content type is INVALID; mark it as Unicode
+        // input so `guessSegmentProperties`/`hb_shape` accept it (they assert the
+        // buffer holds Unicode before shaping).
+        buf.setContentType(.unicode);
+        // Feed the run's cells with the cluster = run-relative cell index, so a
+        // shaped glyph maps back to its starting column via `run.column`.
+        // Spacer-tail cells carry no codepoint of their own (the wide char owns
+        // both cells); skip them so Harfbuzz doesn't see a stray U+0000.
+        var added: usize = 0;
+        var i: usize = 0;
+        while (i < run.len) : (i += 1) {
+            const cell = cells[run.start + i];
+            // Skip spacer tails AND empty cells (cp 0 — unwritten grid cells such
+            // as a row's trailing blanks); feeding U+0000 would shape to .notdef
+            // and draw a box. Spaces (0x20) ARE fed (real space glyphs, no ink).
+            if (cell.width == .spacer_tail or cell.codepoint == 0) continue;
+            buf.add(cell.codepoint, @intCast(i));
+            added += 1;
+        }
+        // An all-blank run feeds nothing; shaping an empty buffer makes
+        // hb_buffer_get_glyph_infos return null (a panic). Emit no glyphs.
+        if (added == 0) return alloc.alloc(ShapedGlyph, 0);
+
+        buf.guessSegmentProperties();
+        buf.setDirection(.ltr);
+        harfbuzz.shape(hb_font, buf, if (self.features.len > 0) self.features else null);
+
+        const infos = buf.getGlyphInfos();
+        const pos = buf.getGlyphPositions() orelse return error.ShapeFailed;
+        std.debug.assert(infos.len == pos.len);
+
+        const out = try alloc.alloc(ShapedGlyph, infos.len);
+        errdefer alloc.free(out);
+        for (infos, pos, 0..) |info, p, j| {
+            out[j] = .{
+                .glyph_index = info.codepoint, // a glyph index after shaping
+                .cluster = info.cluster,
+                .x_advance = p.x_advance >> 6,
+                .y_advance = p.y_advance >> 6,
+                .x_offset = p.x_offset >> 6,
+                .y_offset = p.y_offset >> 6,
+            };
+        }
+        return out;
     }
 };
 
@@ -276,10 +425,42 @@ test "shaper: empty input yields no runs" {
     try testing.expect(it.next() == null);
 }
 
-test "shaper: shape is seamed until the harfbuzz binding lands" {
+test "shaper: a default-constructed shaper is seamed (no font)" {
+    // A shaper with no font (no-freetype, or before init) returns Unimplemented,
+    // so the renderer falls back to its per-cell glyph path.
     const cells = [_]Cell{.{ .codepoint = 'x' }};
     var sh: Shaper = .{};
     try testing.expectError(error.Unimplemented, sh.shape(testing.allocator, .{ .start = 0, .len = 1, .style = .regular }, &cells));
+}
+
+test "shaper: a font-backed shaper shapes a run into glyphs (#79)" {
+    if (!build_options.freetype) return error.SkipZigTest;
+    const path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+    std.fs.accessAbsolute(path, .{}) catch return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var lib = try font.Library.init();
+    defer lib.deinit();
+
+    // The shaper opens its OWN face from `path` (separate from any rasterizer
+    // face), so pass the library + path + size, not a face.
+    var sh = try Shaper.init(alloc, lib, path, 24, &.{});
+    defer sh.deinit(alloc);
+
+    // "Hi" — two narrow ASCII cells, one run, no ligature: two glyphs whose
+    // clusters are the two cell indices, each with a positive advance.
+    const cells = [_]Cell{ .{ .codepoint = 'H' }, .{ .codepoint = 'i' } };
+    const run: Run = .{ .start = 0, .len = 2, .style = .regular };
+    const glyphs = try sh.shape(alloc, run, &cells);
+    defer alloc.free(glyphs);
+
+    try testing.expectEqual(@as(usize, 2), glyphs.len);
+    try testing.expectEqual(@as(u32, 0), glyphs[0].cluster);
+    try testing.expectEqual(@as(u32, 1), glyphs[1].cluster);
+    for (glyphs) |g| {
+        try testing.expect(g.glyph_index != 0); // a real glyph, not .notdef
+        try testing.expect(g.x_advance > 0); // monospace advance in pixels
+    }
 }
 
 test "shaper: Feature.parse forms" {

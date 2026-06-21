@@ -28,6 +28,14 @@ const w = @import("../../os/windows.zig");
 /// exactly as before.
 const ft = build_options.freetype;
 const GlyphCache = if (ft) @import("../../font/GlyphCache.zig") else void;
+/// Text shaping (#79). The run iterator + `Cell`/`Run`/`ShapedGlyph` types are
+/// host-portable; the `Shaper` itself only carries a Harfbuzz font under
+/// `-Dfreetype`. Imported unconditionally (it compiles without harfbuzz), but
+/// only *used* when `ft` is set.
+const shaper = @import("../../font/shaper.zig");
+/// Built-in sprite codepoints (#76) — used to exclude a run from shaping so the
+/// procedural sprite path keeps drawing them. Only referenced under `ft`.
+const fsprite = @import("../../font/sprite.zig");
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
@@ -245,6 +253,27 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         try GlyphCache.init(alloc, primary_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
     else {};
     defer if (ft) cache.deinit();
+
+    // Text shaper (#79): owns a Harfbuzz font over the primary FT face plus the
+    // configured OpenType features. Constructed only when freetype is enabled
+    // AND the primary face opened; otherwise `null` and the renderer keeps its
+    // per-cell glyph path. Shaping any run also requires the primary face to
+    // cover it, so a null shaper simply means "never shape".
+    var shaper_inst: if (ft) ?shaper.Shaper else void = if (ft) null else {};
+    defer if (ft) {
+        if (shaper_inst) |*s| s.deinit(alloc);
+    };
+    if (ft) {
+        // Only when the primary face opened (so the path is loadable). The shaper
+        // opens its OWN face from the same path/size — a SEPARATE FT face, so
+        // Harfbuzz shaping can't corrupt the rasterizer's face (see shaper.zig).
+        if (cache.face != null) {
+            shaper_inst = shaper.Shaper.init(alloc, cache.lib, primary_path, cache.px, cfg.font_features.items) catch |err| blk: {
+                log.warn("shaper init failed ({s}); ligatures disabled", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
 
     var cell_w: u32 = 8;
     var cell_h: u32 = 16;
@@ -487,7 +516,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             .opacity = cfg.cursor_opacity,
             .thickness = cursor_thickness,
         };
-        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, sfc.origin_x, sfc.origin_y, &theme, cursor_render);
+        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, if (ft) &shaper_inst else {}, cell_w, cell_h, ascent, sfc.origin_x, sfc.origin_y, &theme, cursor_render);
         // buildQuads may have packed new glyphs into the atlas; re-upload before
         // drawing so the texture has them. The color (emoji) atlas re-uploads
         // independently (#78).
@@ -674,6 +703,10 @@ fn buildQuads(
     quads: *std.ArrayList(gl.Quad),
     io: *Termio,
     cache: anytype,
+    /// `*?shaper.Shaper` when freetype is enabled (null inside it = no shaping),
+    /// `void` otherwise. Foreground runs the primary face fully covers and that
+    /// contain no sprites are shaped; all else falls back to the per-cell path.
+    shaper_opt: anytype,
     cell_w: u32,
     cell_h: u32,
     ascent: u32,
@@ -711,8 +744,58 @@ fn buildQuads(
     const line_h: u32 = @max(1, cell_h / 16);
     const ascent_i: i32 = @intCast(ascent);
 
+    // Shaping (#79): when a Harfbuzz shaper is available, project each row into
+    // shaper.Cell[] and split it into runs. A run that the PRIMARY face fully
+    // covers and contains no sprite cells is shaped (so ligatures merge); its
+    // columns are flagged in `shaped_mask` and their foreground is emitted from
+    // the shaped glyphs below — the per-cell loop then SKIPS those columns' fg.
+    // Every other run, and any shaping error, falls back to the per-cell glyph
+    // path (sprites #76, fallback #75, color emoji #78 untouched). Background,
+    // decorations and the cursor stay per-cell regardless. The shaper is null
+    // (so `do_shape` is false) when freetype is off or the primary face is
+    // absent — then this whole block is comptime-elided / a no-op.
+    const do_shape = if (ft) shaper_opt.* != null else false;
+    // Per-row scratch reused across rows (amortized like `deco_rects`).
+    var row_cells: if (ft) std.ArrayList(shaper.Cell) else void = if (ft) .empty else {};
+    defer if (ft) row_cells.deinit(alloc);
+    var shaped_mask: if (ft) std.ArrayList(bool) else void = if (ft) .empty else {};
+    defer if (ft) shaped_mask.deinit(alloc);
+
     var row: u32 = 0;
     while (row < rows) : (row += 1) {
+        if (ft) {
+            // Reset the per-row foreground-ownership mask; default false (the
+            // per-cell path owns the foreground unless shaping claims a column).
+            shaped_mask.clearRetainingCapacity();
+            try shaped_mask.appendNTimes(alloc, false, cols);
+        }
+        if (ft) {
+            if (do_shape) {
+                try shapeRow(
+                    alloc,
+                    quads,
+                    cache,
+                    &(shaper_opt.*.?),
+                    &row_cells,
+                    shaped_mask.items,
+                    screen,
+                    row,
+                    cols,
+                    cell_w,
+                    cell_h,
+                    origin_x,
+                    origin_y,
+                    ascent_i,
+                    eff_fg,
+                    eff_bg,
+                    palette,
+                    bold_opt,
+                    theme,
+                    sel,
+                );
+            }
+        }
+
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
             const gc = screen.pages.getCell(.{ .viewport = .{
@@ -778,8 +861,10 @@ fn buildQuads(
             // Foreground glyph (invisible attribute suppresses it). The glyph is
             // rasterized on demand and packed into the atlas the first time its
             // codepoint is seen. Faint/dim (SGR 2) text is drawn at reduced
-            // opacity via the per-quad alpha.
-            if (ft and !style.flags.invisible) {
+            // opacity via the per-quad alpha. Columns claimed by a shaped run
+            // (#79) already emitted their foreground above, so skip them here.
+            const col_shaped = if (ft) shaped_mask.items[col] else false;
+            if (ft and !style.flags.invisible and !col_shaped) {
                 const cp = cell.codepoint();
                 if (cp >= first_drawable) {
                     if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
@@ -928,4 +1013,193 @@ fn buildQuads(
             }
         }
     }
+}
+
+/// The shaper's foreground pass for one row (#79). Projects the row into
+/// `shaper.Cell[]`, splits it into runs, and for each run that the primary face
+/// fully covers and that contains no sprite cells, shapes it and emits one quad
+/// per shaped glyph (so a ligature spanning N cells emits ONE glyph) — flagging
+/// each shaped column in `shaped_mask` so the per-cell loop skips its
+/// foreground. Runs that don't qualify, and any shaping error, are left to the
+/// per-cell path (mask stays false). Background/decorations/cursor are handled
+/// entirely by the per-cell loop and are untouched here.
+///
+/// Only ever called under `-Dfreetype` with a non-null shaper (see `do_shape`);
+/// `cache`/`screen` are `anytype` to avoid naming the freetype-only / VT types.
+fn shapeRow(
+    alloc: std.mem.Allocator,
+    quads: *std.ArrayList(gl.Quad),
+    cache: anytype,
+    shaper_inst: *shaper.Shaper,
+    row_cells: *std.ArrayList(shaper.Cell),
+    shaped_mask: []bool,
+    screen: anytype,
+    row: u32,
+    cols: u32,
+    cell_w: u32,
+    cell_h: u32,
+    origin_x: u32,
+    origin_y: u32,
+    ascent_i: i32,
+    eff_fg: vt.color.RGB,
+    eff_bg: vt.color.RGB,
+    palette: *const vt.color.Palette,
+    bold_opt: ?BoldColor,
+    theme: *const Theme,
+    sel: anytype,
+) !void {
+    // --- Project the row into host-portable shaper cells. ---
+    row_cells.clearRetainingCapacity();
+    try row_cells.ensureTotalCapacity(alloc, cols);
+    var col: u32 = 0;
+    while (col < cols) : (col += 1) {
+        const gc = screen.pages.getCell(.{ .viewport = .{
+            .x = @intCast(col),
+            .y = @intCast(row),
+        } });
+        if (gc == null) {
+            // A missing cell can't be projected faithfully; treat it as a blank
+            // narrow cell so the run iterator still produces aligned columns.
+            row_cells.appendAssumeCapacity(.{ .codepoint = 0 });
+            continue;
+        }
+        const cell = gc.?.cell;
+        const style = gc.?.style();
+        const width: shaper.Width = switch (cell.wide) {
+            .wide => .wide,
+            .spacer_tail => .spacer_tail,
+            else => .narrow, // narrow + spacer_head (rare; treated as narrow)
+        };
+        const sty: shaper.Style = if (style.flags.bold and style.flags.italic)
+            .bold_italic
+        else if (style.flags.bold)
+            .bold
+        else if (style.flags.italic)
+            .italic
+        else
+            .regular;
+        row_cells.appendAssumeCapacity(.{
+            .codepoint = cell.codepoint(),
+            .style = sty,
+            .presentation = .text,
+            .width = width,
+            .invisible = style.flags.invisible,
+        });
+    }
+
+    // --- Split into runs and shape the eligible ones. ---
+    var it = shaper.RunIterator.init(row_cells.items);
+    while (it.next()) |srun| {
+        if (!shapeEligible(cache, srun, row_cells.items)) continue;
+
+        const glyphs = shaper_inst.shape(alloc, srun, row_cells.items) catch {
+            // Any shaping error -> leave this run to the per-cell path.
+            continue;
+        };
+        defer alloc.free(glyphs);
+
+        // The run is uniform in style by construction; bold/italic come from the
+        // first cell.
+        const run_sty = srun.style;
+        const bold = run_sty == .bold or run_sty == .bold_italic;
+        const italic = run_sty == .italic or run_sty == .bold_italic;
+
+        // Claim every column of the run so the per-cell loop skips its fg (even
+        // columns a ligature collapsed away — they must not double-draw).
+        var c: usize = 0;
+        while (c < srun.len) : (c += 1) shaped_mask[srun.start + c] = true;
+
+        for (glyphs) |g| {
+            const gcol = srun.column(g.cluster);
+            if (gcol >= cols) continue;
+            const placement = cache.getByIndex(g.glyph_index, bold, italic) orelse continue;
+            const colors = resolveFg(screen, @intCast(gcol), row, eff_fg, eff_bg, palette, bold_opt, theme, sel);
+            const cell_x: i32 = @intCast(origin_x + @as(u32, @intCast(gcol)) * cell_w);
+            const cell_y: i32 = @intCast(origin_y + row * cell_h);
+            const gcell: gl.Cell = .{
+                .px = cell_x + placement.bearing_x + g.x_offset,
+                .py = cell_y + ascent_i - placement.bearing_y - g.y_offset,
+                .sx = placement.region.x,
+                .sy = placement.region.y,
+                .sw = placement.region.width,
+                .sh = placement.region.height,
+                .r = colors.fg[0],
+                .g = colors.fg[1],
+                .b = colors.fg[2],
+                .a = if (colors.faint) theme.faint_opacity else 1,
+            };
+            // Shaped glyphs from the primary face are always alpha outlines
+            // (the eligibility gate excludes color/sprite cells).
+            try quads.append(alloc, .{ .glyph = gcell });
+        }
+    }
+}
+
+/// Whether a run qualifies for shaping (#79): the PRIMARY face must carry every
+/// non-spacer cell (`glyphIndex(cp) != null`) AND no cell may be a built-in
+/// sprite codepoint. This is the conservative gate that keeps sprites (#76),
+/// per-codepoint fallback (#75) and color emoji (#78) on their verified per-cell
+/// path — only plain, fully-covered text runs are shaped.
+fn shapeEligible(cache: anytype, srun: shaper.Run, cells: []const shaper.Cell) bool {
+    if (srun.presentation != .text) return false;
+    const face = if (cache.face) |*f| f else return false;
+    var has_content = false;
+    var i: usize = 0;
+    while (i < srun.len) : (i += 1) {
+        const cell = cells[srun.start + i];
+        if (cell.width == .spacer_tail) continue; // no codepoint of its own
+        if (cell.invisible) return false; // SGR 8 invisible: keep it on the hiding per-cell path
+        const cp = cell.codepoint;
+        // Empty (0) and space (0x20) are shapeable blanks — they carry no ink and
+        // never form sprites, so don't reject the run for them (real text rows are
+        // full of spaces + trailing empties; rejecting made nothing ever shape).
+        if (cp == 0 or cp == 0x20) continue;
+        if (cp < first_drawable) return false; // other controls: per-cell path
+        if (fsprite.isSprite(cp)) return false; // sprite: keep it procedural
+        if (face.glyphIndex(cp) == null) return false; // not covered by primary
+        has_content = true;
+    }
+    // An all-blank run (spaces / empties only) has nothing to shape; leave it to
+    // the per-cell path so the shaper never sees an empty buffer.
+    return has_content;
+}
+
+/// Foreground color + faint flag for a single column, mirroring the per-cell
+/// resolution in `buildQuads` (theme fg, inverse video, minimum-contrast, then
+/// the selection override) so a shaped glyph (#79) is colored identically to the
+/// per-cell path it replaces.
+fn resolveFg(
+    screen: anytype,
+    col: u32,
+    row: u32,
+    eff_fg: vt.color.RGB,
+    eff_bg: vt.color.RGB,
+    palette: *const vt.color.Palette,
+    bold_opt: ?BoldColor,
+    theme: *const Theme,
+    sel: anytype,
+) struct { fg: [3]f32, faint: bool } {
+    const gc = screen.pages.getCell(.{ .viewport = .{
+        .x = @intCast(col),
+        .y = @intCast(row),
+    } }) orelse return .{ .fg = rgbf(eff_fg), .faint = false };
+    const cell = gc.cell;
+    const style = gc.style();
+
+    var fg = rgbf(style.fg(.{ .default = eff_fg, .palette = palette, .bold = bold_opt }));
+    var bg: ?[3]f32 = if (style.bg(cell, palette)) |c| rgbf(c) else null;
+    if (style.flags.inverse) {
+        const old_fg = fg;
+        fg = bg orelse rgbf(eff_bg);
+        bg = old_fg;
+    }
+    if (theme.min_contrast > 1) {
+        fg = rcolor.contrastedColor(fg, bg orelse rgbf(eff_bg), theme.min_contrast);
+    }
+    if (sel) |s| {
+        if (screen.pages.pin(.{ .viewport = .{ .x = @intCast(col), .y = @intCast(row) } })) |p| {
+            if (s.contains(screen, p)) fg = theme.sel_fg;
+        }
+    }
+    return .{ .fg = fg, .faint = style.flags.faint };
 }

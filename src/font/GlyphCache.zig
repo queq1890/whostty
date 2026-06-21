@@ -18,10 +18,14 @@ const sprite = @import("sprite.zig");
 const GlyphCache = @This();
 const log = std.log.scoped(.font);
 
-/// Cache key: a codepoint plus its synthetic style. The same codepoint in
-/// regular / bold / italic / bold-italic packs four distinct atlas entries.
+/// Cache key: an id (a codepoint, or a shaped glyph index when `by_index`) plus
+/// its synthetic style. The same id in regular / bold / italic / bold-italic
+/// packs four distinct atlas entries. `by_index` keeps shaped-glyph entries (#79)
+/// from colliding with codepoint entries that happen to share the numeric value
+/// (a glyph index is not a codepoint).
 pub const Key = struct {
-    cp: u21,
+    id: u32,
+    by_index: bool = false,
     bold: bool = false,
     italic: bool = false,
 };
@@ -130,7 +134,7 @@ pub fn deinit(self: *GlyphCache) void {
 /// a missing glyph, or the atlas being full). Packing a new glyph marks the
 /// atlas dirty.
 pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placement {
-    const key: Key = .{ .cp = cp, .bold = bold, .italic = italic };
+    const key: Key = .{ .id = cp, .by_index = false, .bold = bold, .italic = italic };
     if (self.map.get(key)) |cached| return cached;
     // Secure the map slot BEFORE packing, so a glyph we rasterize can always be
     // cached. Otherwise an out-of-memory `put` would drop the entry and the next
@@ -178,10 +182,13 @@ fn faceFor(self: *GlyphCache, cp: u21) ?*font.Face {
 }
 
 fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
+    // This is the codepoint path; `key.id` is a Unicode codepoint (never a glyph
+    // index — those go through `rasterizeIndexAndPack`).
+    const cp: u21 = @intCast(key.id);
     // Built-in sprite glyphs (block elements, braille) are drawn procedurally so
     // they are crisp and present regardless of the font (#76), filling the whole
     // cell. Tried before the font face; style (bold/italic) doesn't apply.
-    if (sprite.rasterize(self.alloc, key.cp, self.cell_w, self.cell_h) catch null) |pixels| {
+    if (sprite.rasterize(self.alloc, cp, self.cell_w, self.cell_h) catch null) |pixels| {
         defer self.alloc.free(pixels);
         const region = self.atlas.reserve(self.cell_w, self.cell_h) catch return null;
         self.atlas.set(region, pixels);
@@ -190,13 +197,13 @@ fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
         return .{ .region = region, .bearing_x = 0, .bearing_y = @intCast(self.ascent) };
     }
 
-    const face = self.faceFor(key.cp) orelse return null;
+    const face = self.faceFor(cp) orelse return null;
 
     // Color glyphs (emoji) from a color-capable face are packed into the RGBA
     // color atlas, filling the cell and drawn untinted (#78). Only attempted for
     // color faces, so normal text pays nothing.
     if (face.hasColor()) {
-        if (face.rasterizeColor(self.alloc, key.cp, self.cell_w, self.cell_h) catch null) |cg_const| {
+        if (face.rasterizeColor(self.alloc, cp, self.cell_w, self.cell_h) catch null) |cg_const| {
             var cg = cg_const;
             defer cg.deinit(self.alloc);
             const region = self.color_atlas.reserve(cg.width, cg.height) catch return null;
@@ -205,9 +212,38 @@ fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
         }
     }
 
-    var g = face.rasterize(self.alloc, key.cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
+    var g = face.rasterize(self.alloc, cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
     defer g.deinit(self.alloc);
     // A zero-area bitmap (space, control) has no quad.
+    if (g.width == 0 or g.height == 0) return null;
+    const region = self.atlas.reserve(g.width, g.height) catch return null;
+    self.atlas.set(region, g.pixels);
+    return .{ .region = region, .bearing_x = g.bearing_x, .bearing_y = g.bearing_y };
+}
+
+/// The atlas placement for a shaped glyph index (#79), rasterizing and packing
+/// it on first sight. Distinct from `get`: the input is a FreeType glyph index
+/// from `Shaper.shape`, not a codepoint, so it is rendered via the PRIMARY face
+/// by index (`rasterizeIndex`) into the ALPHA atlas. Sprites and color glyphs do
+/// NOT take this path — the renderer only shapes runs with no sprite cells and
+/// fully covered by the primary face, so shaped glyphs are always plain alpha
+/// outlines. A null result means "draw nothing" (no primary face, or a zero-area
+/// bitmap). Packing marks the alpha atlas dirty.
+pub fn getByIndex(self: *GlyphCache, glyph_index: u32, bold: bool, italic: bool) ?Atlas.Placement {
+    const key: Key = .{ .id = glyph_index, .by_index = true, .bold = bold, .italic = italic };
+    if (self.map.get(key)) |cached| return cached;
+    self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
+    const placed = self.rasterizeIndexAndPack(key);
+    self.map.putAssumeCapacity(key, placed);
+    if (placed != null) self.dirty = true;
+    return placed;
+}
+
+fn rasterizeIndexAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
+    const face = if (self.face) |*f| f else return null;
+    var g = face.rasterizeIndex(self.alloc, key.id, .{ .bold = key.bold, .italic = key.italic }) catch return null;
+    defer g.deinit(self.alloc);
+    // A zero-area bitmap (e.g. a space glyph in a ligature run) has no quad.
     if (g.width == 0 or g.height == 0) return null;
     const region = self.atlas.reserve(g.width, g.height) catch return null;
     self.atlas.set(region, g.pixels);
@@ -385,6 +421,41 @@ test "glyphcache: a color-emoji fallback packs into the color atlas (#78)" {
     try std.testing.expect(!a.color);
     try std.testing.expect(cache.takeDirty());
     try std.testing.expect(!cache.takeColorDirty());
+}
+
+test "glyphcache: getByIndex packs a shaped glyph keyed distinctly from codepoints (#79)" {
+    std.fs.accessAbsolute(test_font, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, test_font, 24, 512);
+    defer cache.deinit();
+    const face = &cache.face.?;
+
+    // The glyph index for 'A'. getByIndex packs it into the alpha atlas.
+    const idx = face.glyphIndex('A') orelse return error.NoIndex;
+    const by_idx = cache.getByIndex(idx, false, false) orelse return error.NoGlyph;
+    try std.testing.expect(by_idx.region.width > 0 and by_idx.region.height > 0);
+    try std.testing.expect(!by_idx.color); // alpha atlas, not color
+    try std.testing.expect(cache.takeDirty());
+
+    // A second call hits the cache: same region, no re-dirty.
+    const by_idx2 = cache.getByIndex(idx, false, false) orelse return error.NoGlyph;
+    try std.testing.expectEqual(by_idx.region.x, by_idx2.region.x);
+    try std.testing.expectEqual(by_idx.region.y, by_idx2.region.y);
+    try std.testing.expect(!cache.takeDirty());
+
+    // The index key is distinct from the codepoint key even when the numeric
+    // value collides: get(idx-as-codepoint) packs its OWN region, untouched by
+    // the by-index entry above.
+    const cp_same_num = cache.get(@intCast(idx), false, false);
+    if (cp_same_num) |p| {
+        try std.testing.expect(p.region.x != by_idx.region.x or p.region.y != by_idx.region.y);
+    }
+
+    // A missing-face cache returns null from getByIndex (no primary face).
+    var blank = try GlyphCache.init(alloc, "Z:\\nope.ttf", 16, 64);
+    defer blank.deinit();
+    try std.testing.expect(blank.face == null);
+    try std.testing.expect(blank.getByIndex(1, false, false) == null);
 }
 
 test "glyphcache: sprites render even when the primary font is missing" {

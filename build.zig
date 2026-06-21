@@ -59,6 +59,20 @@ pub fn build(b: *std.Build) void {
             // freetype C library so the FT_* symbols resolve.
             exe.root_module.linkLibrary(dep.artifact("freetype"));
         }
+        // Harfbuzz (built from source) for text shaping / ligatures (#79). It
+        // wraps the same FreeType FT_Face, so it lives inside the freetype
+        // block and is only consumed with -Dfreetype. The package builds its
+        // own freetype with `enable-libpng` (matching ours), so the freetype
+        // artifact is shared/consistent. Lazy + freetype-gated, so CI's
+        // no-freetype builds never fetch or build it.
+        if (b.lazyDependency("harfbuzz", .{
+            .target = target,
+            .optimize = optimize,
+            .@"enable-freetype" = true,
+        })) |hb| {
+            exe.root_module.addImport("harfbuzz", hb.module("harfbuzz"));
+            exe.root_module.linkLibrary(hb.artifact("harfbuzz"));
+        }
     }
     b.installArtifact(exe);
 

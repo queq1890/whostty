@@ -124,6 +124,16 @@ pub const Face = struct {
     /// outline) before rendering.
     pub fn rasterize(self: Face, alloc: std.mem.Allocator, codepoint: u32, style: Style) !Glyph {
         const idx = self.inner.getCharIndex(codepoint) orelse 0;
+        return self.rasterizeIndex(alloc, idx, style);
+    }
+
+    /// Rasterize a glyph by its FreeType glyph index (not a codepoint),
+    /// optionally synthesizing bold/italic. This is the shaping path (#79):
+    /// Harfbuzz outputs glyph indices for a shaped run (e.g. a ligature glyph
+    /// that has no single codepoint), so they must be rendered by index rather
+    /// than by codepoint. Identical to `rasterize` except it skips the
+    /// codepoint -> index lookup.
+    pub fn rasterizeIndex(self: Face, alloc: std.mem.Allocator, idx: u32, style: Style) !Glyph {
         // Load the outline WITHOUT rendering so synthetic styling can transform
         // it; then render. (`render = true` would rasterize the plain glyph.)
         try self.inner.loadGlyph(idx, .{});
@@ -280,6 +290,32 @@ test "font: rasterize an ASCII glyph to a non-empty bitmap" {
         }
     }
     try std.testing.expect(any);
+}
+
+test "font: rasterizeIndex renders the same glyph as rasterize by codepoint (#79)" {
+    const path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+    std.fs.accessAbsolute(path, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var lib = try Library.init();
+    defer lib.deinit();
+    var face = try Face.init(lib, path, 24);
+    defer face.deinit();
+
+    // The glyph index for 'A', looked up the same way rasterize does.
+    const idx = face.glyphIndex('A') orelse return error.NoIndex;
+    var by_cp = try face.rasterize(alloc, 'A', .{});
+    defer by_cp.deinit(alloc);
+    var by_idx = try face.rasterizeIndex(alloc, idx, .{});
+    defer by_idx.deinit(alloc);
+
+    // Same dimensions, bearings, advance and pixels — it's the same glyph.
+    try std.testing.expectEqual(by_cp.width, by_idx.width);
+    try std.testing.expectEqual(by_cp.height, by_idx.height);
+    try std.testing.expectEqual(by_cp.bearing_x, by_idx.bearing_x);
+    try std.testing.expectEqual(by_cp.bearing_y, by_idx.bearing_y);
+    try std.testing.expectEqual(by_cp.advance, by_idx.advance);
+    try std.testing.expectEqualSlices(u8, by_cp.pixels, by_idx.pixels);
 }
 
 test "font: space glyph has zero-area bitmap but positive advance" {
