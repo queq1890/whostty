@@ -39,6 +39,9 @@ px: u32,
 /// instead of drawing blank. Empty by default (behaves exactly as before).
 fallbacks: std.ArrayListUnmanaged(font.Face),
 atlas: Atlas,
+/// RGBA atlas for color glyphs (emoji, #78). Separate from `atlas` because color
+/// glyphs are 4 bytes/texel and sampled untinted.
+color_atlas: Atlas,
 /// (codepoint, style) -> placement, or a cached null meaning "draw nothing" (a
 /// blank glyph such as space, a codepoint the face lacks, or the atlas being
 /// full) so we don't re-attempt it every frame.
@@ -46,9 +49,11 @@ map: std.AutoHashMapUnmanaged(Key, ?Atlas.Placement),
 cell_w: u32,
 cell_h: u32,
 ascent: u32,
-/// The atlas changed since the last GL upload; the caller re-uploads and clears
-/// this via `takeDirty`.
+/// The alpha atlas changed since the last GL upload; the caller re-uploads and
+/// clears this via `takeDirty`.
 dirty: bool,
+/// The color atlas changed since the last GL upload (`takeColorDirty`).
+color_dirty: bool,
 
 /// Open `path` at `px` pixels and prepare an empty `atlas_size`-square atlas.
 /// A missing/unreadable face is not fatal: the cache keeps working with a null
@@ -57,6 +62,8 @@ dirty: bool,
 pub fn init(alloc: std.mem.Allocator, path: [:0]const u8, px: u32, atlas_size: u32) !GlyphCache {
     var atlas = try Atlas.init(alloc, atlas_size);
     errdefer atlas.deinit(alloc);
+    var color_atlas = try Atlas.initBpp(alloc, atlas_size, 4);
+    errdefer color_atlas.deinit(alloc);
     var lib = try font.Library.init();
     errdefer lib.deinit();
 
@@ -82,11 +89,13 @@ pub fn init(alloc: std.mem.Allocator, path: [:0]const u8, px: u32, atlas_size: u
         .px = px,
         .fallbacks = .empty,
         .atlas = atlas,
+        .color_atlas = color_atlas,
         .map = .empty,
         .cell_w = cell_w,
         .cell_h = cell_h,
         .ascent = ascent,
         .dirty = false,
+        .color_dirty = false,
     };
 }
 
@@ -112,6 +121,7 @@ pub fn deinit(self: *GlyphCache) void {
     self.fallbacks.deinit(self.alloc);
     self.lib.deinit();
     self.atlas.deinit(self.alloc);
+    self.color_atlas.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -131,7 +141,9 @@ pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placemen
     self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
     const placed = self.rasterizeAndPack(key);
     self.map.putAssumeCapacity(key, placed);
-    if (placed != null) self.dirty = true;
+    if (placed) |p| {
+        if (p.color) self.color_dirty = true else self.dirty = true;
+    }
     return placed;
 }
 
@@ -162,6 +174,20 @@ fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
     }
 
     const face = self.faceFor(key.cp) orelse return null;
+
+    // Color glyphs (emoji) from a color-capable face are packed into the RGBA
+    // color atlas, filling the cell and drawn untinted (#78). Only attempted for
+    // color faces, so normal text pays nothing.
+    if (face.hasColor()) {
+        if (face.rasterizeColor(self.alloc, key.cp, self.cell_w, self.cell_h) catch null) |cg_const| {
+            var cg = cg_const;
+            defer cg.deinit(self.alloc);
+            const region = self.color_atlas.reserve(cg.width, cg.height) catch return null;
+            self.color_atlas.set(region, cg.pixels);
+            return .{ .region = region, .bearing_x = 0, .bearing_y = @intCast(self.ascent), .color = true };
+        }
+    }
+
     var g = face.rasterize(self.alloc, key.cp, .{ .bold = key.bold, .italic = key.italic }) catch return null;
     defer g.deinit(self.alloc);
     // A zero-area bitmap (space, control) has no quad.
@@ -171,11 +197,19 @@ fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
     return .{ .region = region, .bearing_x = g.bearing_x, .bearing_y = g.bearing_y };
 }
 
-/// Whether the atlas changed since the last call, clearing the flag. The caller
-/// re-uploads the atlas texture (`Renderer.setAtlas`) when this returns true.
+/// Whether the alpha atlas changed since the last call, clearing the flag. The
+/// caller re-uploads the glyph texture (`Renderer.setAtlas`) when true.
 pub fn takeDirty(self: *GlyphCache) bool {
     const d = self.dirty;
     self.dirty = false;
+    return d;
+}
+
+/// Whether the color (emoji) atlas changed since the last call, clearing the
+/// flag. The caller re-uploads it (`Renderer.setColorAtlas`) when true (#78).
+pub fn takeColorDirty(self: *GlyphCache) bool {
+    const d = self.color_dirty;
+    self.color_dirty = false;
     return d;
 }
 
@@ -307,6 +341,33 @@ test "glyphcache: sprite glyphs are drawn procedurally, cell-sized, font-indepen
     // A braille pattern is likewise a sprite, cell-sized.
     const br = cache.get(0x28FF, false, false) orelse return error.NoBraille;
     try std.testing.expectEqual(cache.cell_w, br.region.width);
+}
+
+const emoji_font = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+test "glyphcache: a color-emoji fallback packs into the color atlas (#78)" {
+    std.fs.accessAbsolute(test_font, .{}) catch return error.SkipZigTest;
+    std.fs.accessAbsolute(emoji_font, .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var cache = try GlyphCache.init(alloc, test_font, 24, 512);
+    defer cache.deinit();
+    cache.addFallback(emoji_font);
+
+    // U+1F600 (😀): the primary lacks it; the color fallback packs a cell-sized
+    // region into the COLOR atlas, flagged color=true, dirtying the color atlas.
+    const e = cache.get(0x1F600, false, false) orelse return error.NoEmoji;
+    try std.testing.expect(e.color);
+    try std.testing.expectEqual(cache.cell_w, e.region.width);
+    try std.testing.expectEqual(cache.cell_h, e.region.height);
+    try std.testing.expect(cache.takeColorDirty()); // color atlas dirtied
+    try std.testing.expect(!cache.takeColorDirty()); // and cleared
+    try std.testing.expect(!cache.takeDirty()); // the alpha atlas was untouched
+
+    // A plain ASCII glyph still goes to the alpha atlas (not color).
+    const a = cache.get('A', false, false) orelse return error.NoA;
+    try std.testing.expect(!a.color);
+    try std.testing.expect(cache.takeDirty());
+    try std.testing.expect(!cache.takeColorDirty());
 }
 
 test "glyphcache: sprites render even when the primary font is missing" {

@@ -59,6 +59,7 @@ const GL_FLOAT: u32 = 0x1406;
 const GL_TRIANGLES: u32 = 0x0004;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE1: u32 = 0x84C1;
 const GL_RED: u32 = 0x1903;
 const GL_R8: i32 = 0x8229;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
@@ -306,6 +307,7 @@ pub fn main() !void {
     defer verts.deinit(alloc);
     for (quads.items) |q| switch (q) {
         .glyph => |cell| try gl.pushQuad(&verts, alloc, cell, screen_w, screen_h, atlas.size),
+        .color_glyph => |cell| try gl.pushColorQuad(&verts, alloc, cell, screen_w, screen_h, atlas.size),
         .solid => |rect| try gl.pushSolid(&verts, alloc, rect, screen_w, screen_h),
     };
 
@@ -380,6 +382,7 @@ pub fn main() !void {
         defer cverts.deinit(alloc);
         for (cq.items) |q| switch (q) {
             .glyph => |c| try gl.pushQuad(&cverts, alloc, c, screen_w, screen_h, atlas.size),
+            .color_glyph => |c| try gl.pushColorQuad(&cverts, alloc, c, screen_w, screen_h, atlas.size),
             .solid => |rect| try gl.pushSolid(&cverts, alloc, rect, screen_w, screen_h),
         };
 
@@ -940,5 +943,80 @@ pub fn main() !void {
             return error.BoxCrossWrong;
         }
         out.print("[proof] PASS: built-in sprites rasterized procedurally (full block, quadrant, box-drawing cross)\n", .{});
+    }
+
+    // --- Color emoji proof (#78): a color glyph reaches the framebuffer in color
+    // An emoji (U+1F600) from a color fallback packs into the RGBA color atlas;
+    // drawn through the color-glyph shader path (a 2nd texture, mode 2) it must
+    // produce actually-COLORED pixels — not the flat foreground tint a normal
+    // (alpha) glyph would. Skipped if the color-emoji font isn't installed.
+    emoji: {
+        const emoji_path = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+        std.fs.accessAbsolute(emoji_path, .{}) catch {
+            out.print("[proof] SKIP: color-emoji font not installed\n", .{});
+            break :emoji;
+        };
+
+        var cache = try GlyphCache.init(alloc, font_path, 24, 512);
+        defer cache.deinit();
+        cache.addFallback(emoji_path);
+        const place = cache.get(0x1F600, false, false) orelse return error.NoEmojiGlyph;
+        if (!place.color) return error.EmojiNotColor;
+
+        // Upload the alpha atlas to unit 0 and the RGBA color atlas to unit 1.
+        g.activeTexture(GL_TEXTURE0);
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
+
+        var ctex: u32 = 0;
+        g.genTextures(1, @ptrCast(&ctex));
+        g.activeTexture(GL_TEXTURE1);
+        g.bindTexture(GL_TEXTURE_2D, ctex);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, @intCast(cache.color_atlas.size), @intCast(cache.color_atlas.size), 0, GL_RGBA, GL_UNSIGNED_BYTE, cache.color_atlas.data.ptr);
+        g.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        var ev: std.ArrayList(gl.Vertex) = .empty;
+        defer ev.deinit(alloc);
+        try gl.pushColorQuad(&ev, alloc, .{
+            .px = 4,
+            .py = 4,
+            .sx = place.region.x,
+            .sy = place.region.y,
+            .sw = place.region.width,
+            .sh = place.region.height,
+            .r = 0,
+            .g = 0,
+            .b = 0,
+        }, screen_w, screen_h, cache.color_atlas.size);
+
+        g.useProgram(program);
+        g.uniform1i(g.getUniformLocation(program, "u_atlas"), 0);
+        g.uniform1i(g.getUniformLocation(program, "u_color_atlas"), 1);
+        g.clearColor(clear[0], clear[1], clear[2], 1.0);
+        g.clear(GL_COLOR_BUFFER_BIT);
+        g.bufferData(GL_ARRAY_BUFFER, @intCast(ev.items.len * @sizeOf(gl.Vertex)), ev.items.ptr, GL_DYNAMIC_DRAW);
+        g.drawArrays(GL_TRIANGLES, 0, @intCast(ev.items.len));
+        g.finish();
+        g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+
+        var colorful: usize = 0;
+        var ei: usize = 0;
+        while (ei < n) : (ei += 1) {
+            const r: i16 = buf[ei * 4];
+            const gg: i16 = buf[ei * 4 + 1];
+            const b: i16 = buf[ei * 4 + 2];
+            // A pixel that differs from the (grey) clear AND has real channel
+            // spread is genuine emoji color, not a flat tint.
+            const spread = @max(r, @max(gg, b)) - @min(r, @min(gg, b));
+            if (spread > 40) colorful += 1;
+        }
+        out.print("[proof] color-emoji: colorful pixels = {d}\n", .{colorful});
+        if (colorful == 0) {
+            out.print("[proof] FAIL: color emoji did not reach the framebuffer in color\n", .{});
+            return error.EmojiNotRendered;
+        }
+        out.print("[proof] PASS: color emoji rasterized through the RGBA atlas + color shader (#78)\n", .{});
     }
 }

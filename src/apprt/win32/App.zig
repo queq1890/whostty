@@ -58,6 +58,7 @@ const default_fallback_fonts = [_][:0]const u8{
     "C:\\Windows\\Fonts\\malgun.ttf", // Malgun Gothic (KR)
     "C:\\Windows\\Fonts\\simsun.ttc", // SimSun (Simplified Chinese)
     "C:\\Windows\\Fonts\\seguisym.ttf", // Segoe UI Symbol
+    "C:\\Windows\\Fonts\\seguiemj.ttf", // Segoe UI Emoji (color, #78)
 };
 
 /// Atlas dimension (square, texels). Holds a few hundred packed glyphs; styled
@@ -458,8 +459,10 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         };
         try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, sfc.origin_x, sfc.origin_y, &theme, cursor_render);
         // buildQuads may have packed new glyphs into the atlas; re-upload before
-        // drawing so the texture has them.
+        // drawing so the texture has them. The color (emoji) atlas re-uploads
+        // independently (#78).
         if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
+        if (ft and cache.takeColorDirty()) renderer.setColorAtlas(cache.color_atlas.data, cache.color_atlas.size);
 
         // Scrollbar (#73): an overlay thumb on the right edge marking the
         // viewport's position within the scrollback. Appended after the grid so
@@ -751,7 +754,7 @@ fn buildQuads(
                 if (cp >= first_drawable) {
                     if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
                         const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
-                        try quads.append(alloc, .{ .glyph = .{
+                        const gcell: gl.Cell = .{
                             .px = cell_x + gi.bearing_x,
                             .py = cell_y + ascent_i - gi.bearing_y,
                             .sx = gi.region.x,
@@ -762,7 +765,10 @@ fn buildQuads(
                             .g = fg[1],
                             .b = fg[2],
                             .a = glyph_alpha,
-                        } });
+                        };
+                        // Color glyphs (emoji, #78) come from the RGBA atlas and
+                        // are drawn untinted; everything else is alpha-tinted.
+                        try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
                     }
                 }
             }
@@ -871,7 +877,7 @@ fn buildQuads(
                         if (cache.get(cp, cs_style.flags.bold, cs_style.flags.italic)) |gi| {
                             const cur_bg = if (cs_style.bg(gc.cell, palette)) |c| c else eff_bg;
                             const text_color = cursor_render.text orelse rgbf(cur_bg);
-                            try quads.append(alloc, .{ .glyph = .{
+                            const gcell: gl.Cell = .{
                                 .px = ccx + gi.bearing_x,
                                 .py = ccy + ascent_i - gi.bearing_y,
                                 .sx = gi.region.x,
@@ -881,7 +887,11 @@ fn buildQuads(
                                 .r = text_color[0],
                                 .g = text_color[1],
                                 .b = text_color[2],
-                            } });
+                            };
+                            // A color glyph (emoji) under a block cursor shows
+                            // through untinted; a normal glyph uses the cursor
+                            // text color.
+                            try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
                         }
                     }
                 }

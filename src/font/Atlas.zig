@@ -21,13 +21,19 @@ pub const Placement = struct {
     region: Region,
     bearing_x: i32 = 0,
     bearing_y: i32 = 0,
+    /// The region lives in the RGBA color-glyph atlas (emoji), not the alpha
+    /// atlas, and is drawn untinted (#78). The renderer routes it to the color
+    /// texture + shader mode.
+    color: bool = false,
 };
 
 pub const Error = error{AtlasFull};
 
-/// Square, single-channel pixel store (row-major, 1 byte per texel).
+/// Square pixel store (row-major). `bpp` bytes per texel: 1 for the alpha
+/// coverage atlas, 4 for the RGBA color-glyph atlas (#78).
 data: []u8,
 size: u32,
+bpp: u32 = 1,
 
 // Shelf-packing cursor.
 cursor_x: u32 = 0,
@@ -37,10 +43,16 @@ shelf_height: u32 = 0,
 /// 1px padding between glyphs to avoid sampling bleed.
 const padding: u32 = 1;
 
+/// A single-channel (8-bit alpha) atlas.
 pub fn init(alloc: std.mem.Allocator, size: u32) !Atlas {
-    const data = try alloc.alloc(u8, size * size);
+    return initBpp(alloc, size, 1);
+}
+
+/// An atlas with `bpp` bytes per texel (1 = alpha, 4 = RGBA color glyphs).
+pub fn initBpp(alloc: std.mem.Allocator, size: u32, bpp: u32) !Atlas {
+    const data = try alloc.alloc(u8, size * size * bpp);
     @memset(data, 0);
-    return .{ .data = data, .size = size };
+    return .{ .data = data, .size = size, .bpp = bpp };
 }
 
 pub fn deinit(self: *Atlas, alloc: std.mem.Allocator) void {
@@ -74,11 +86,13 @@ pub fn reserve(self: *Atlas, width: u32, height: u32) Error!Region {
 
 /// Copy a tightly-packed `width*height` coverage bitmap into a region.
 pub fn set(self: *Atlas, region: Region, pixels: []const u8) void {
-    std.debug.assert(pixels.len == region.width * region.height);
+    const bpp = self.bpp;
+    std.debug.assert(pixels.len == region.width * region.height * bpp);
+    const row_bytes = region.width * bpp;
     var row: u32 = 0;
     while (row < region.height) : (row += 1) {
-        const dst = (region.y + row) * self.size + region.x;
-        @memcpy(self.data[dst..][0..region.width], pixels[row * region.width ..][0..region.width]);
+        const dst = ((region.y + row) * self.size + region.x) * bpp;
+        @memcpy(self.data[dst..][0..row_bytes], pixels[row * row_bytes ..][0..row_bytes]);
     }
 }
 
@@ -113,6 +127,21 @@ test "atlas: set writes coverage at the region origin" {
     const r = try atlas.reserve(2, 2);
     atlas.set(r, &[_]u8{ 255, 255, 255, 255 });
     try std.testing.expectEqual(@as(u8, 255), atlas.data[r.y * atlas.size + r.x]);
+}
+
+test "atlas: a 4-bpp (RGBA) atlas stores 4 bytes per texel by row" {
+    const alloc = std.testing.allocator;
+    var atlas = try Atlas.initBpp(alloc, 16, 4);
+    defer atlas.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 16 * 16 * 4), atlas.data.len);
+
+    const r = try atlas.reserve(2, 1);
+    // Two RGBA texels: red then green.
+    atlas.set(r, &[_]u8{ 255, 0, 0, 255, 0, 255, 0, 255 });
+    const base = (r.y * atlas.size + r.x) * 4;
+    try std.testing.expectEqual(@as(u8, 255), atlas.data[base + 0]); // texel0 R
+    try std.testing.expectEqual(@as(u8, 0), atlas.data[base + 1]); // texel0 G
+    try std.testing.expectEqual(@as(u8, 255), atlas.data[base + 5]); // texel1 G
 }
 
 test "atlas: reports full when out of space" {

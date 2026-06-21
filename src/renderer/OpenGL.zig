@@ -58,11 +58,15 @@ pub const SolidRect = struct {
 pub const Quad = union(enum) {
     glyph: Cell,
     solid: SolidRect,
+    /// A color glyph (emoji): same geometry as `glyph`, but its source region is
+    /// in the RGBA color atlas and it is drawn untinted (#78).
+    color_glyph: Cell,
 };
 
 /// Per-vertex draw mode discriminator (see the fragment shader).
 const mode_glyph: f32 = 0;
 const mode_solid: f32 = 1;
+const mode_color_glyph: f32 = 2;
 
 /// Interleaved vertex: position (NDC) + atlas uv + color + alpha + draw mode.
 pub const Vertex = extern struct {
@@ -127,6 +131,30 @@ pub fn pushQuad(
     try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
 }
 
+/// Like `pushQuad` but for a color glyph (#78): the source region is in the RGBA
+/// color atlas (so UVs normalize by `color_atlas_size`) and the fragment is drawn
+/// straight from the texture, untinted (mode 2). Host-testable.
+pub fn pushColorQuad(
+    out: *std.ArrayList(Vertex),
+    alloc: std.mem.Allocator,
+    cell: Cell,
+    screen_w: u32,
+    screen_h: u32,
+    color_atlas_size: u32,
+) !void {
+    const as: f32 = @floatFromInt(color_atlas_size);
+    const n = ndcRect(cell.px, cell.py, cell.sw, cell.sh, screen_w, screen_h);
+    const su0: f32 = @as(f32, @floatFromInt(cell.sx)) / as;
+    const su1: f32 = @as(f32, @floatFromInt(cell.sx + cell.sw)) / as;
+    const sv0: f32 = @as(f32, @floatFromInt(cell.sy)) / as;
+    const sv1: f32 = @as(f32, @floatFromInt(cell.sy + cell.sh)) / as;
+    const tl: Vertex = .{ .x = n.x0, .y = n.y0, .u = su0, .v = sv0, .r = 0, .g = 0, .b = 0, .a = cell.a, .m = mode_color_glyph };
+    const tr: Vertex = .{ .x = n.x1, .y = n.y0, .u = su1, .v = sv0, .r = 0, .g = 0, .b = 0, .a = cell.a, .m = mode_color_glyph };
+    const bl: Vertex = .{ .x = n.x0, .y = n.y1, .u = su0, .v = sv1, .r = 0, .g = 0, .b = 0, .a = cell.a, .m = mode_color_glyph };
+    const br: Vertex = .{ .x = n.x1, .y = n.y1, .u = su1, .v = sv1, .r = 0, .g = 0, .b = 0, .a = cell.a, .m = mode_color_glyph };
+    try out.appendSlice(alloc, &.{ tl, bl, br, tl, br, tr });
+}
+
 /// Append the 6 vertices for one solid filled rect into `out`. uv is unused
 /// (the fragment shader ignores the atlas in solid mode). Host-testable.
 pub fn pushSolid(
@@ -161,8 +189,10 @@ const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 const GL_TRIANGLES: GLenum = 0x0004;
 const GL_TEXTURE_2D: GLenum = 0x0DE1;
 const GL_TEXTURE0: GLenum = 0x84C0;
+const GL_TEXTURE1: GLenum = 0x84C1;
 const GL_RED: GLenum = 0x1903;
 const GL_R8: GLenum = 0x8229;
+const GL_RGBA8: GLenum = 0x8058;
 const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_FLOAT: GLenum = 0x1406;
 const GL_FALSE: GLboolean = 0;
@@ -302,12 +332,19 @@ pub const fragment_shader_src: [:0]const u8 =
     \\in float v_alpha;
     \\out vec4 frag;
     \\uniform sampler2D u_atlas;
+    \\uniform sampler2D u_color_atlas;
     \\void main() {
-    \\    // mode 0: glyph (coverage from the atlas); mode 1: solid fill. The
-    \\    // per-vertex alpha multiplies the result so cursor-opacity / dim fills
-    \\    // blend over what is already drawn.
-    \\    float base = (v_mode > 0.5) ? 1.0 : texture(u_atlas, v_uv).r;
-    \\    frag = vec4(v_color, base * v_alpha);
+    \\    // mode 0: glyph (alpha coverage tinted by v_color); mode 1: solid fill;
+    \\    // mode 2: color glyph (emoji) sampled straight from the RGBA atlas,
+    \\    // untinted. The per-vertex alpha multiplies the result so cursor-opacity
+    \\    // / dim fills blend over what is already drawn.
+    \\    if (v_mode > 1.5) {
+    \\        vec4 t = texture(u_color_atlas, v_uv);
+    \\        frag = vec4(t.rgb, t.a * v_alpha);
+    \\    } else {
+    \\        float base = (v_mode > 0.5) ? 1.0 : texture(u_atlas, v_uv).r;
+    \\        frag = vec4(v_color, base * v_alpha);
+    \\    }
     \\}
 ;
 
@@ -320,6 +357,9 @@ pub const Renderer = struct {
     vbo: GLuint,
     atlas_tex: GLuint,
     atlas_size: u32,
+    /// RGBA color-glyph atlas (emoji, #78); `color_atlas_size == 0` until set.
+    color_atlas_tex: GLuint,
+    color_atlas_size: u32,
     verts: std.ArrayList(Vertex),
     alloc: std.mem.Allocator,
 
@@ -365,6 +405,8 @@ pub const Renderer = struct {
 
         var tex: GLuint = 0;
         glGenTextures(1, @ptrCast(&tex));
+        var color_tex: GLuint = 0;
+        glGenTextures(1, @ptrCast(&color_tex));
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -376,6 +418,8 @@ pub const Renderer = struct {
             .vbo = vbo,
             .atlas_tex = tex,
             .atlas_size = 0,
+            .color_atlas_tex = color_tex,
+            .color_atlas_size = 0,
             .verts = .empty,
             .alloc = alloc,
         };
@@ -400,6 +444,19 @@ pub const Renderer = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
+    /// Upload an RGBA8 color-glyph atlas (emoji, #78). `data` is `size*size*4`
+    /// straight-alpha RGBA bytes.
+    pub fn setColorAtlas(self: *Renderer, data: []const u8, size: u32) void {
+        self.color_atlas_size = size;
+        glBindTexture(GL_TEXTURE_2D, self.color_atlas_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA8), @intCast(size), @intCast(size), 0, GL_RGBA, GL_UNSIGNED_BYTE, data.ptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
     /// Clear and draw all quads in order. `clear` is the background fill (the
     /// default cell background), `screen_w/h` are the framebuffer pixels. Quads
     /// are emitted in slice order so the caller controls layering (background
@@ -413,6 +470,7 @@ pub const Renderer = struct {
         for (quads) |q| switch (q) {
             .glyph => |cell| try pushQuad(&self.verts, self.alloc, cell, screen_w, screen_h, self.atlas_size),
             .solid => |rect| try pushSolid(&self.verts, self.alloc, rect, screen_w, screen_h),
+            .color_glyph => |cell| try pushColorQuad(&self.verts, self.alloc, cell, screen_w, screen_h, self.color_atlas_size),
         };
         if (self.verts.items.len == 0) return;
 
@@ -429,6 +487,12 @@ pub const Renderer = struct {
         self.gl.activeTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, self.atlas_tex);
         self.gl.uniform1i(self.gl.getUniformLocation(self.program, "u_atlas"), 0);
+
+        // The color-glyph atlas (emoji) on a second unit; the shader samples it
+        // for mode-2 quads (#78).
+        self.gl.activeTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, self.color_atlas_tex);
+        self.gl.uniform1i(self.gl.getUniformLocation(self.program, "u_color_atlas"), 1);
 
         glDrawArrays(GL_TRIANGLES, 0, @intCast(self.verts.items.len));
     }
