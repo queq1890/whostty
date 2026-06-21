@@ -426,6 +426,67 @@ pub const SplitTree = struct {
     fn inRect(x: f32, y: f32, r: Rect) bool {
         return x >= r.x and x < r.x + r.width and y >= r.y and y < r.y + r.height;
     }
+
+    /// The first (left/top-most) leaf surface in the tree. Always present (a tree
+    /// has at least one leaf). Used to pick a focus target after a structural
+    /// change (tab switch / pane close) when no better candidate is known.
+    pub fn anyLeaf(self: *const SplitTree) SurfaceId {
+        var node = self.root;
+        while (true) switch (node.*) {
+            .leaf => |id| return id,
+            .split => |s| node = s.a,
+        };
+    }
+
+    /// Append a thin divider rect for every internal split, laid out over
+    /// `bounds` with the same split math as `layout`. `thickness` is the divider
+    /// width in pixels, centered on the split boundary. The apprt draws these on
+    /// top of the panes so the seam between panes is visible.
+    pub fn dividers(
+        self: *const SplitTree,
+        bounds: Rect,
+        thickness: f32,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(Rect),
+    ) !void {
+        try dividerNode(self.root, bounds, thickness, alloc, out);
+    }
+
+    fn dividerNode(
+        node: *const Node,
+        bounds: Rect,
+        t: f32,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(Rect),
+    ) !void {
+        switch (node.*) {
+            .leaf => {},
+            .split => |s| switch (s.orientation) {
+                .horizontal => {
+                    const aw = bounds.width * s.ratio;
+                    try out.append(alloc, .{
+                        .x = bounds.x + aw - t / 2,
+                        .y = bounds.y,
+                        .width = t,
+                        .height = bounds.height,
+                    });
+                    try dividerNode(s.a, .{ .x = bounds.x, .y = bounds.y, .width = aw, .height = bounds.height }, t, alloc, out);
+                    try dividerNode(s.b, .{ .x = bounds.x + aw, .y = bounds.y, .width = bounds.width - aw, .height = bounds.height }, t, alloc, out);
+                },
+                .vertical => {
+                    const ah = bounds.height * s.ratio;
+                    try out.append(alloc, .{
+                        .x = bounds.x,
+                        .y = bounds.y + ah - t / 2,
+                        .width = bounds.width,
+                        .height = t,
+                    });
+                    try dividerNode(s.a, .{ .x = bounds.x, .y = bounds.y, .width = bounds.width, .height = ah }, t, alloc, out);
+                    try dividerNode(s.b, .{ .x = bounds.x, .y = bounds.y + ah, .width = bounds.width, .height = bounds.height - ah }, t, alloc, out);
+                },
+            },
+        }
+    }
 };
 
 /// An ordered list of tabs, each owning a `SplitTree`, with one active tab.
@@ -745,6 +806,48 @@ test "SplitTree: surfaceAt hit-tests the layout" {
     // Outside the bounds.
     try testing.expectEqual(@as(?SurfaceId, null), tree.surfaceAt(900, 300, b));
     try testing.expectEqual(@as(?SurfaceId, null), tree.surfaceAt(100, 700, b));
+}
+
+test "SplitTree: anyLeaf returns the left/top-most leaf" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    try testing.expectEqual(@as(SurfaceId, 1), tree.anyLeaf());
+    try tree.split(1, .right, 2); // [1 | 2]
+    try tree.split(1, .down, 3); // [(1 over 3) | 2]
+    // Leftmost path is a-children: the first leaf reached is pane 1.
+    try testing.expectEqual(@as(SurfaceId, 1), tree.anyLeaf());
+}
+
+test "SplitTree: dividers mark each split boundary" {
+    var tree = try SplitTree.init(testing.allocator, 1);
+    defer tree.deinit();
+    const b: Rect = .{ .width = 800, .height = 600 };
+
+    // A single pane has no dividers.
+    var out: std.ArrayList(Rect) = .empty;
+    defer out.deinit(testing.allocator);
+    try tree.dividers(b, 2, testing.allocator, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // One horizontal split -> one vertical divider centered on x=400.
+    try tree.split(1, .right, 2);
+    out.clearRetainingCapacity();
+    try tree.dividers(b, 2, testing.allocator, &out);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectApproxEqAbs(@as(f32, 399), out.items[0].x, 0.01); // 400 - 2/2
+    try testing.expectApproxEqAbs(@as(f32, 2), out.items[0].width, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 600), out.items[0].height, 0.01);
+
+    // Nesting a vertical split on the right adds a horizontal divider in that half.
+    try tree.split(2, .down, 3);
+    out.clearRetainingCapacity();
+    try tree.dividers(b, 2, testing.allocator, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    // The inner horizontal divider spans the right half (x>=400) at y≈300.
+    const inner = out.items[1];
+    try testing.expectApproxEqAbs(@as(f32, 400), inner.x, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 400), inner.width, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 299), inner.y, 0.01); // 300 - 2/2
 }
 
 test "TabList: add, switch, and close tabs" {
