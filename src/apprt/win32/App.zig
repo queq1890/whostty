@@ -49,9 +49,12 @@ const first_drawable: u21 = 0x21;
 const default_font_path = "C:\\Windows\\Fonts\\consola.ttf";
 
 /// Fallback fonts tried (in order) for codepoints the primary font lacks (#75) —
-/// CJK first, then symbols. Each missing path is skipped, so this is a sensible
-/// Windows default; per-family discovery and a configurable chain via DirectWrite
-/// are #74. (Color emoji needs the 4-byte atlas of #78; these are monochrome.)
+/// CJK, then a monochrome symbol font, then the color emoji font. The cache
+/// prefers a color-capable face for emoji-presentation codepoints regardless of
+/// order (see `GlyphCache.faceFor`/`wantsEmoji`), so Segoe UI Emoji renders true
+/// color emoji even though Segoe UI Symbol also carries monochrome versions (#78).
+/// Each missing path is skipped; per-family discovery + a configurable chain via
+/// DirectWrite are #74.
 const default_fallback_fonts = [_][:0]const u8{
     "C:\\Windows\\Fonts\\YuGothM.ttc", // Yu Gothic Medium (JP, Win10+)
     "C:\\Windows\\Fonts\\msgothic.ttc", // MS Gothic (JP/CJK)
