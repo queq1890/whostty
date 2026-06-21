@@ -17,6 +17,7 @@ const GlyphCache = @import("font/GlyphCache.zig");
 const font = @import("font/main.zig");
 const Atlas = @import("font/Atlas.zig");
 const Termio = @import("termio.zig").Termio;
+const surface = @import("Surface.zig");
 const vtcolor = @import("ghostty-vt").color;
 
 // --- dynamic loader --------------------------------------------------------
@@ -579,5 +580,74 @@ pub fn main() !void {
             return error.BoldNotBolder;
         }
         out.print("[proof] PASS: synthetic bold rasterized through the atlas/shader with more ink than regular\n", .{});
+    }
+
+    // --- Window padding proof (#71): the origin offset shifts the render ----
+    // Two halves verify padding: `surface.layout` (the math — origin from the
+    // configured padding) is covered by host unit tests in Surface.zig, and the
+    // GL pipeline honoring an x-origin is shown here by drawing the SAME glyph at
+    // origin 0 vs the padded origin and asserting its lit pixels move right by
+    // exactly the padding. (buildQuads — which feeds `origin` into every
+    // cell/cursor path in the live loop — is Win32-only and not exercised here;
+    // its per-path wiring is covered by review and tracked for a host test when
+    // buildQuads is extracted into a testable renderer module.)
+    {
+        var cache = try GlyphCache.init(alloc, font_path, 16, 256);
+        defer cache.deinit();
+        const h = cache.get('H', false, false) orelse return error.NoPadH;
+        g.bindTexture(GL_TEXTURE_2D, tex);
+        g.pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        g.texImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(cache.atlas.size), @intCast(cache.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, cache.atlas.data.ptr);
+
+        const pad_x: u32 = 20;
+        const lay = surface.layout(screen_w, screen_h, 16, 16, .{ .x = @intCast(pad_x), .y = 8 });
+        if (lay.origin_x != pad_x) return error.PadOriginWrong; // no balance -> origin == pad
+
+        var mins: [2]usize = .{ screen_w, screen_w };
+        for ([_]u32{ 0, lay.origin_x }, 0..) |ox, pass| {
+            var gv: std.ArrayList(gl.Vertex) = .empty;
+            defer gv.deinit(alloc);
+            try gl.pushQuad(&gv, alloc, .{
+                .px = @as(i32, @intCast(ox)) + h.bearing_x,
+                .py = 20,
+                .sx = h.region.x,
+                .sy = h.region.y,
+                .sw = h.region.width,
+                .sh = h.region.height,
+                .r = 1,
+                .g = 1,
+                .b = 1,
+            }, screen_w, screen_h, cache.atlas.size);
+            g.clearColor(clear[0], clear[1], clear[2], 1.0);
+            g.clear(GL_COLOR_BUFFER_BIT);
+            g.bufferData(GL_ARRAY_BUFFER, @intCast(gv.items.len * @sizeOf(gl.Vertex)), gv.items.ptr, GL_DYNAMIC_DRAW);
+            g.drawArrays(GL_TRIANGLES, 0, @intCast(gv.items.len));
+            g.finish();
+            g.readPixels(0, 0, @intCast(screen_w), @intCast(screen_h), GL_RGBA, GL_UNSIGNED_BYTE, buf.ptr);
+            var mn: usize = screen_w;
+            var any = false;
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                const r: i16 = buf[k * 4];
+                const gg: i16 = buf[k * 4 + 1];
+                const b: i16 = buf[k * 4 + 2];
+                if (@abs(r - cr) > 2 or @abs(gg - cg) > 2 or @abs(b - cb) > 2) {
+                    mn = @min(mn, k % screen_w);
+                    any = true;
+                }
+            }
+            if (!any) return error.PadNothingLit;
+            mins[pass] = mn;
+        }
+        out.print("[proof] window-padding: leftmost lit x — no-pad={d}, pad(20)={d}\n", .{ mins[0], mins[1] });
+        // The SAME glyph drawn at origin 0 vs origin pad_x shifts its leftmost
+        // lit pixel by EXACTLY pad_x — the internal bearing/first-lit-column
+        // offset is identical in both, so it cancels. Asserting the exact shift
+        // is robust to any (even negative) bearing, unlike an absolute floor.
+        if (mins[1] != mins[0] + pad_x) {
+            out.print("[proof] FAIL: padding did not shift the glyph by exactly the configured pad\n", .{});
+            return error.PaddingNotApplied;
+        }
+        out.print("[proof] PASS: window padding shifted the rendered glyph right by exactly the configured pad\n", .{});
     }
 }

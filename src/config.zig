@@ -179,6 +179,17 @@ pub const Config = struct {
     /// Defaults to 10 MB. The VT core (libghostty-vt) enforces the limit.
     scrollback_limit: usize = 10_000_000,
 
+    /// Blank padding around the terminal grid, in pixels, applied on each side
+    /// (`window-padding-x` = left & right, `window-padding-y` = top & bottom).
+    /// Ported from ghostty (which measures in points; whostty has no DPI scaling
+    /// yet, so these are device pixels). The padding shows the background color.
+    window_padding_x: u16 = 0,
+    window_padding_y: u16 = 0,
+    /// When set, the pixels left over from a non-even division of the window
+    /// into cells are split into the padding so the grid is centered, instead
+    /// of all landing on the right/bottom edge (ghostty's `window-padding-balance`).
+    window_padding_balance: bool = false,
+
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
     /// `palette = <index>=<color>` lines (ghostty syntax).
@@ -271,6 +282,12 @@ pub const Config = struct {
             self.faint_opacity = std.math.clamp(try std.fmt.parseFloat(f32, value), 0, 1);
         } else if (std.mem.eql(u8, key, "scrollback-limit")) {
             self.scrollback_limit = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, key, "window-padding-x")) {
+            self.window_padding_x = try std.fmt.parseInt(u16, value, 10);
+        } else if (std.mem.eql(u8, key, "window-padding-y")) {
+            self.window_padding_y = try std.fmt.parseInt(u16, value, 10);
+        } else if (std.mem.eql(u8, key, "window-padding-balance")) {
+            self.window_padding_balance = try parseBool(value);
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -457,6 +474,25 @@ test "config: scrollback-limit parses; default otherwise" {
     var def = try Config.parse(testing.allocator, "\n");
     defer def.deinit();
     try testing.expectEqual(@as(usize, 10_000_000), def.scrollback_limit);
+}
+
+test "config: window padding parses x/y/balance; defaults to zero/off" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\window-padding-x = 12
+        \\window-padding-y = 8
+        \\window-padding-balance = true
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u16, 12), cfg.window_padding_x);
+    try testing.expectEqual(@as(u16, 8), cfg.window_padding_y);
+    try testing.expect(cfg.window_padding_balance);
+
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expectEqual(@as(u16, 0), def.window_padding_x);
+    try testing.expectEqual(@as(u16, 0), def.window_padding_y);
+    try testing.expect(!def.window_padding_balance);
 }
 
 test "config: color overrides default to null; bool flag form is true" {
