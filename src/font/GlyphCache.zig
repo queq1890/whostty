@@ -147,10 +147,27 @@ pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placemen
     return placed;
 }
 
+/// Whether `cp` defaults to emoji (color) presentation, so a color-capable
+/// fallback should be preferred even if an earlier monochrome face also carries
+/// the glyph (#78). Approximates the Unicode Emoji_Presentation property with the
+/// astral emoji/pictograph planes — virtually all emoji-presentation by default.
+/// Text-presentation BMP symbols (dingbats / misc-symbols without VS16) keep the
+/// normal monochrome order; full VS15/VS16 selector handling is future work.
+fn wantsEmoji(cp: u21) bool {
+    return cp >= 0x1F000 and cp <= 0x1FAFF;
+}
+
 /// The face to draw `cp` from: the primary if it has the glyph, else the first
 /// fallback that does (#75), else null (draw nothing — blank, not the .notdef
-/// box).
+/// box). For emoji-presentation codepoints a color-capable fallback is preferred
+/// over a monochrome face that merely also has the glyph, so emoji render in
+/// color rather than as a monochrome symbol-font glyph (#78).
 fn faceFor(self: *GlyphCache, cp: u21) ?*font.Face {
+    if (wantsEmoji(cp)) {
+        for (self.fallbacks.items) |*f| {
+            if (f.hasColor() and f.glyphIndex(cp) != null) return f;
+        }
+    }
     if (self.face) |*f| {
         if (f.glyphIndex(cp) != null) return f;
     }
