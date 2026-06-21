@@ -275,6 +275,9 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // --- ConPTY + shell ---
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
     var child = try pty.spawn(alloc, opts.command orelse shellCommandLine());
+    // Give the window the shell's pid so the WM_CLOSE confirmation (#91) can ask
+    // the OS whether a foreground command is still running before closing.
+    win.setShellPid(w.GetProcessId(child.process));
     const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
     // Prime the terminal's dynamic colors with the configured defaults so OSC
     // 10/11/12/4 changes and queries resolve against `terminal.colors` (#83).
@@ -289,6 +292,10 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     defer {
         stop.store(true, .monotonic);
         child.kill();
+        // Killing the shell does NOT break the ConPTY output pipe (conhost still
+        // holds it), so the reader's blocking ReadFile never returns on its own
+        // and join() would hang. Cancel it so the reader exits and we can close.
+        pty.cancelRead();
         reader.join();
         io.destroy();
         child.deinit();
@@ -462,7 +469,13 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
                         if (io.focusReport(f)) |r| _ = pty.write(r) catch {};
                     }
                 },
-                .close => closed = true,
+                // Close-confirmation (#91): the window proc swallowed the OS
+                // destroy and queued this event, so the window still exists. Only
+                // proceed to break the loop (which runs the shell/pty teardown
+                // defer) if the user confirms — or if nothing is running, in which
+                // case confirmClose returns true with no prompt. Choosing "No"
+                // leaves the window open with the shell intact.
+                .close => closed = win.confirmClose(),
             }
         }
         if (closed) break;
@@ -784,6 +797,10 @@ fn dispatchAction(action: binding.Action, ctx: KeybindCtx) void {
         .scroll_to_top => ctx.io.scrollViewport(-1_000_000), // clamps at the top of history
         .copy_to_clipboard => copyToClipboard(ctx),
         .paste_from_clipboard => pasteFromClipboard(ctx),
+        // Window-state actions (#91) act on the single current window.
+        .toggle_fullscreen => ctx.win.toggleFullscreen(),
+        .toggle_maximize => ctx.win.toggleMaximize(),
+        .toggle_window_decorations => ctx.win.toggleDecorations(),
         .new_split, .goto_split, .new_tab, .close_surface, .next_tab, .previous_tab, .goto_tab => {
             log.debug("keybind action '{s}' needs multi-surface support (not yet wired)", .{@tagName(std.meta.activeTag(action))});
         },

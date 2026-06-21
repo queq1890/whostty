@@ -120,6 +120,14 @@ const WindowsPty = struct {
         return @intCast(n);
     }
 
+    /// Cancel a blocking `read` in flight on another thread so it returns with an
+    /// error (the reader then exits). Needed at teardown: killing the shell does
+    /// NOT break the ConPTY output pipe (conhost still holds it), so the reader's
+    /// ReadFile would block forever and `reader.join()` would hang.
+    pub fn cancelRead(self: *WindowsPty) void {
+        _ = w.CancelIoEx(self.out_read, null);
+    }
+
     /// Write bytes to the child's input.
     pub fn write(self: *WindowsPty, bytes: []const u8) WriteError!usize {
         var n: w.DWORD = 0;
