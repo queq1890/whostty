@@ -102,6 +102,7 @@ test {
     _ = @import("input.zig");
     _ = @import("font/Atlas.zig");
     _ = @import("renderer/OpenGL.zig");
+    _ = @import("renderer/decoration.zig");
     _ = @import("renderer.zig");
     _ = @import("Surface.zig");
     _ = @import("config.zig");

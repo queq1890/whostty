@@ -17,6 +17,7 @@ const Window = @import("Window.zig").Window;
 const gl = @import("../../renderer/OpenGL.zig");
 const rcursor = @import("../../renderer/cursor.zig");
 const rcolor = @import("../../renderer/color.zig");
+const decoration = @import("../../renderer/decoration.zig");
 const input = @import("../../input.zig");
 const surface = @import("../../Surface.zig");
 const Atlas = @import("../../font/Atlas.zig");
@@ -636,6 +637,11 @@ fn buildQuads(
 ) !void {
     quads.clearRetainingCapacity();
 
+    // Reused across cells to hold an underline's decoration rects (#80); cleared
+    // per underlined cell, so its capacity amortizes over the frame.
+    var deco_rects: std.ArrayList(decoration.Rect) = .empty;
+    defer deco_rects.deinit(alloc);
+
     io.lock();
     defer io.unlock();
 
@@ -746,17 +752,29 @@ fn buildQuads(
             }
 
             // Decorations, drawn on top. Underlines use the explicit underline
-            // color when set; strikethrough/overline use the foreground.
+            // color when set; strikethrough/overline use the foreground. The
+            // underline style (single/double/dotted/dashed/curly) is drawn as a
+            // set of solid rects (#80) instead of always one line.
             if (style.flags.underline != .none) {
                 const uc = if (style.underline_color != .none)
                     rgbf(resolveColor(style.underline_color, palette, fg_rgb))
                 else
                     fg;
-                try quads.append(alloc, .{ .solid = .{
-                    .px = cell_x,
-                    .py = cell_y + ascent_i + 1,
-                    .w = cell_w,
-                    .h = line_h,
+                const dstyle: decoration.Underline = switch (style.flags.underline) {
+                    .none => .none,
+                    .single => .single,
+                    .double => .double,
+                    .dotted => .dotted,
+                    .dashed => .dashed,
+                    .curly => .curly,
+                };
+                deco_rects.clearRetainingCapacity();
+                try decoration.underlineRects(&deco_rects, alloc, dstyle, cell_w, ascent_i + 1, line_h);
+                for (deco_rects.items) |r| try quads.append(alloc, .{ .solid = .{
+                    .px = cell_x + r.x,
+                    .py = cell_y + r.y,
+                    .w = r.w,
+                    .h = r.h,
                     .r = uc[0],
                     .g = uc[1],
                     .b = uc[2],
