@@ -19,7 +19,8 @@ const Atlas = @import("font/Atlas.zig");
 const Termio = @import("termio.zig").Termio;
 const surface = @import("Surface.zig");
 const scroll = @import("scroll.zig");
-const vtcolor = @import("ghostty-vt").color;
+const vt = @import("ghostty-vt");
+const vtcolor = vt.color;
 
 // --- dynamic loader --------------------------------------------------------
 extern "c" fn dlopen(path: [*:0]const u8, flag: c_int) ?*anyopaque;
@@ -715,5 +716,35 @@ pub fn main() !void {
             return error.ScrollbarNotTracking;
         }
         out.print("[proof] PASS: scrollbar thumb tracks the viewport position (moves down toward the live bottom)\n", .{});
+    }
+
+    // --- bold-is-bright proof (#70): a bold palette cell uses the bright color
+    // Exercise the EXACT `Style.fg` options whostty's buildQuads passes: a bold
+    // cell with palette index 1 resolves to palette[1] normally, but to the
+    // bright counterpart palette[9] when `bold = .bright` (bold-is-bright). This
+    // proves the resolution effect + that the `.bright` literal whostty uses
+    // compiles. (buildQuads itself — which passes this option at both fg sites —
+    // is Win32-only and not reached here; that wiring is covered by review and
+    // tracked for a host test when buildQuads is extracted into a testable module.)
+    {
+        var pal = vtcolor.default;
+        var st: vt.Style = .{};
+        st.flags.bold = true;
+        st.fg_color = .{ .palette = 1 };
+        const white: vtcolor.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+        const normal = st.fg(.{ .default = white, .palette = &pal });
+        const bright = st.fg(.{ .default = white, .palette = &pal, .bold = .bright });
+        out.print("[proof] bold-is-bright: palette[1]=rgb({d},{d},{d}) bold=rgb({d},{d},{d}) palette[9]=rgb({d},{d},{d})\n", .{
+            normal.r, normal.g, normal.b, bright.r, bright.g, bright.b, pal[9].r, pal[9].g, pal[9].b,
+        });
+        if (normal.r == bright.r and normal.g == bright.g and normal.b == bright.b) {
+            out.print("[proof] FAIL: bold-is-bright did not change the color\n", .{});
+            return error.BoldNotBright;
+        }
+        if (bright.r != pal[9].r or bright.g != pal[9].g or bright.b != pal[9].b) {
+            out.print("[proof] FAIL: bold color is not the bright palette entry (9)\n", .{});
+            return error.BoldWrongColor;
+        }
+        out.print("[proof] PASS: bold-is-bright maps palette 1 -> 9 (Style.fg resolution; buildQuads wiring review-covered)\n", .{});
     }
 }

@@ -67,6 +67,8 @@ const Theme = struct {
     min_contrast: f32,
     /// Opacity applied to faint/dim (SGR 2) glyphs.
     faint_opacity: f32,
+    /// Render bold text with the bright (8–15) palette color (#70).
+    bold_is_bright: bool,
 
     fn fromConfig(cfg: *const config.Config) Theme {
         var palette: vt.color.Palette = vt.color.default;
@@ -83,9 +85,16 @@ const Theme = struct {
             .sel_fg = rgbf(if (cfg.selection_foreground) |c| toVtRgb(c) else bg),
             .min_contrast = cfg.minimum_contrast,
             .faint_opacity = cfg.faint_opacity,
+            .bold_is_bright = cfg.bold_is_bright,
         };
     }
 };
+
+/// libghostty-vt's bold-color option type for `Style.fg` (`union { color, bright }`),
+/// reached through the field so we don't depend on ghostty's config package being
+/// exported. We only use the `.bright` variant (`bold-is-bright`); a fixed
+/// `bold-color` would need ghostty's config Color and is deferred.
+const BoldColor = @typeInfo(@FieldType(vt.Style.Fg, "bold")).optional.child;
 
 /// Convert a config color to a libghostty-vt RGB (both are 8-bit per channel).
 fn toVtRgb(c: config.Color) vt.color.RGB {
@@ -602,6 +611,9 @@ fn buildQuads(
     const palette = &term.colors.palette.current;
     const eff_fg = term.colors.foreground.get() orelse theme.fg;
     const eff_bg = term.colors.background.get() orelse theme.bg;
+    // bold-is-bright (#70): when set, libghostty-vt's `Style.fg` maps a bold
+    // cell's palette color 0–7 to its bright 8–15 counterpart. Constant per frame.
+    const bold_opt: ?BoldColor = if (theme.bold_is_bright) .bright else null;
     const rows: u32 = term.rows;
     const cols: u32 = term.cols;
     const line_h: u32 = @max(1, cell_h / 16);
@@ -620,7 +632,7 @@ fn buildQuads(
 
             // Resolve fg/bg against the configured theme, then apply inverse
             // video by swapping them.
-            const fg_rgb = style.fg(.{ .default = eff_fg, .palette = palette });
+            const fg_rgb = style.fg(.{ .default = eff_fg, .palette = palette, .bold = bold_opt });
             var fg = rgbf(fg_rgb);
             var bg: ?[3]f32 = if (style.bg(cell, palette)) |c| rgbf(c) else null;
             if (style.flags.inverse) {
@@ -765,7 +777,7 @@ fn buildQuads(
         // both answers queries and renders), else the cell's foreground.
         var cur_fg = eff_fg;
         if (screen.pages.getCell(.{ .viewport = .{ .x = @intCast(cx), .y = @intCast(cy) } })) |gc| {
-            cur_fg = gc.style().fg(.{ .default = eff_fg, .palette = palette });
+            cur_fg = gc.style().fg(.{ .default = eff_fg, .palette = palette, .bold = bold_opt });
         }
         const fill = if (term.colors.cursor.get()) |c| rgbf(c) else rgbf(cur_fg);
 
