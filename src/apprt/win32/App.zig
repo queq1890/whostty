@@ -457,6 +457,13 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             log.info("desktop notification: {s}: {s}", .{ n.title, n.body });
         }
 
+        // Apply a pending OSC 0/2 window title to the live caption. Captured on
+        // the reader thread; SetWindowTextW must run on the UI thread.
+        if (io.takeTitle()) |title| {
+            defer alloc.free(title);
+            win.setTitle(title);
+        }
+
         const sz = win.clientSize();
         const blink_elapsed: u64 = if (blink_timer) |*t| t.read() else 0;
         const blink_visible = if (blink_timer != null)
