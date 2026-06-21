@@ -10,9 +10,12 @@
 const std = @import("std");
 
 /// Whether `cp` is a sprite codepoint this module rasterizes (so the cache draws
-/// it procedurally instead of from the font).
+/// it procedurally instead of from the font). Box-drawing codepoints we don't
+/// model (some mixed-weight / partial variants) report false and fall through to
+/// the font.
 pub fn isSprite(cp: u21) bool {
     return switch (cp) {
+        0x2500...0x257F => boxSegments(cp) != null, // box-drawing (handled subset)
         0x2580...0x259F => true, // block elements
         0x2800...0x28FF => true, // braille patterns
         else => false,
@@ -30,6 +33,7 @@ pub fn rasterize(alloc: std.mem.Allocator, cp: u21, w: u32, h: u32) std.mem.Allo
     errdefer alloc.free(pixels);
     const c: Canvas = .{ .px = pixels, .w = w, .h = h };
     switch (cp) {
+        0x2500...0x257F => boxDrawing(c, cp),
         0x2580...0x259F => blockElement(c, cp),
         0x2800...0x28FF => braille(c, cp),
         else => unreachable,
@@ -56,6 +60,21 @@ const Canvas = struct {
             const row = y * self.w;
             while (x < xb) : (x += 1) self.px[row + x] = val;
         }
+    }
+
+    /// Like `fill` but with signed coordinates clamped to the cell (negatives →
+    /// 0). Used by box-drawing, whose strokes are centered ± an offset and can
+    /// compute a negative left/top edge on a narrow cell.
+    fn fillI(self: Canvas, x0: i32, y0: i32, x1: i32, y1: i32, val: u8) void {
+        const w: i32 = @intCast(self.w);
+        const h: i32 = @intCast(self.h);
+        self.fill(
+            @intCast(std.math.clamp(x0, 0, w)),
+            @intCast(std.math.clamp(y0, 0, h)),
+            @intCast(std.math.clamp(x1, 0, w)),
+            @intCast(std.math.clamp(y1, 0, h)),
+            val,
+        );
     }
 
     fn all(self: Canvas, val: u8) void {
@@ -141,6 +160,102 @@ fn braille(c: Canvas, cp: u21) void {
     }
 }
 
+/// Box-drawing segment weights for `cp`: [up, down, left, right], each
+/// 0 none / 1 light / 2 heavy / 3 double, or null if we don't model it (it then
+/// falls through to the font). Covers the pure light / heavy / double lines,
+/// corners, tees and crosses, plus the dashed variants (approximated as their
+/// solid line of the same weight). Mixed-weight and partial-line variants are
+/// left to the font.
+fn boxSegments(cp: u21) ?[4]u2 {
+    return switch (cp) {
+        // Horizontals & verticals (dashed -> solid of the same weight).
+        0x2500, 0x2504, 0x2508 => .{ 0, 0, 1, 1 }, // light horizontal
+        0x2501, 0x2505, 0x2509 => .{ 0, 0, 2, 2 }, // heavy horizontal
+        0x2502, 0x2506, 0x250A => .{ 1, 1, 0, 0 }, // light vertical
+        0x2503, 0x2507, 0x250B => .{ 2, 2, 0, 0 }, // heavy vertical
+        // Light corners (down/up + right/left).
+        0x250C => .{ 0, 1, 0, 1 },
+        0x2510 => .{ 0, 1, 1, 0 },
+        0x2514 => .{ 1, 0, 0, 1 },
+        0x2518 => .{ 1, 0, 1, 0 },
+        // Heavy corners.
+        0x250F => .{ 0, 2, 0, 2 },
+        0x2513 => .{ 0, 2, 2, 0 },
+        0x2517 => .{ 2, 0, 0, 2 },
+        0x251B => .{ 2, 0, 2, 0 },
+        // Light tees.
+        0x251C => .{ 1, 1, 0, 1 },
+        0x2524 => .{ 1, 1, 1, 0 },
+        0x252C => .{ 0, 1, 1, 1 },
+        0x2534 => .{ 1, 0, 1, 1 },
+        // Heavy tees.
+        0x2523 => .{ 2, 2, 0, 2 },
+        0x252B => .{ 2, 2, 2, 0 },
+        0x2533 => .{ 0, 2, 2, 2 },
+        0x253B => .{ 2, 0, 2, 2 },
+        // Crosses.
+        0x253C => .{ 1, 1, 1, 1 },
+        0x254B => .{ 2, 2, 2, 2 },
+        // Double lines.
+        0x2550 => .{ 0, 0, 3, 3 },
+        0x2551 => .{ 3, 3, 0, 0 },
+        // Double corners.
+        0x2554 => .{ 0, 3, 0, 3 },
+        0x2557 => .{ 0, 3, 3, 0 },
+        0x255A => .{ 3, 0, 0, 3 },
+        0x255D => .{ 3, 0, 3, 0 },
+        // Double tees.
+        0x2560 => .{ 3, 3, 0, 3 },
+        0x2563 => .{ 3, 3, 3, 0 },
+        0x2566 => .{ 0, 3, 3, 3 },
+        0x2569 => .{ 3, 0, 3, 3 },
+        // Double cross.
+        0x256C => .{ 3, 3, 3, 3 },
+        else => null,
+    };
+}
+
+const Dir = enum { up, down, left, right };
+
+fn boxDrawing(c: Canvas, cp: u21) void {
+    const segs = boxSegments(cp) orelse return;
+    const w: i32 = @intCast(c.w);
+    const h: i32 = @intCast(c.h);
+    const cx = @divFloor(w, 2);
+    const cy = @divFloor(h, 2);
+    // Light stroke thickness; heavy is ~double, double is two light strokes.
+    const t: i32 = @max(1, @divFloor(@min(w, h), 8));
+
+    inline for (.{ Dir.up, Dir.down, Dir.left, Dir.right }, 0..) |dir, i| {
+        const wt = segs[i];
+        if (wt != 0) {
+            if (wt == 3) {
+                // Double: two light strokes straddling the center line.
+                stroke(c, dir, cx, cy, t, -t);
+                stroke(c, dir, cx, cy, t, t);
+            } else {
+                stroke(c, dir, cx, cy, if (wt == 2) 2 * t else t, 0);
+            }
+        }
+    }
+}
+
+/// Draw one half-segment from the cell center toward `dir`'s edge: a band of
+/// width `th` (perpendicular to the run), shifted `off` perpendicular (for the
+/// two strokes of a double line). Each band extends `th/2` past the center so
+/// the junction box where segments meet is filled.
+fn stroke(c: Canvas, comptime dir: Dir, cx: i32, cy: i32, th: i32, off: i32) void {
+    const w: i32 = @intCast(c.w);
+    const h: i32 = @intCast(c.h);
+    const hh = @divFloor(th, 2);
+    switch (dir) {
+        .up => c.fillI(cx + off - hh, 0, cx + off - hh + th, cy + hh, 255),
+        .down => c.fillI(cx + off - hh, cy - hh, cx + off - hh + th, h, 255),
+        .left => c.fillI(0, cy + off - hh, cx + hh, cy + off - hh + th, 255),
+        .right => c.fillI(cx - hh, cy + off - hh, w, cy + off - hh + th, 255),
+    }
+}
+
 const testing = std.testing;
 
 fn sumAlpha(px: []const u8) u64 {
@@ -149,17 +264,18 @@ fn sumAlpha(px: []const u8) u64 {
     return s;
 }
 
-test "sprite: isSprite covers blocks + braille, not letters" {
+test "sprite: isSprite covers blocks + braille + handled box chars, not letters" {
     try testing.expect(isSprite(0x2588)); // full block
     try testing.expect(isSprite(0x2580)); // upper half
     try testing.expect(isSprite(0x28FF)); // braille
+    try testing.expect(isSprite(0x2500)); // light horizontal box-drawing
     try testing.expect(!isSprite('A'));
-    try testing.expect(!isSprite(0x2500)); // box-drawing (follow-up)
+    try testing.expect(!isSprite(0x251E)); // mixed-weight box char — not modeled
 }
 
 test "sprite: non-sprite codepoints return null" {
     try testing.expect((try rasterize(testing.allocator, 'A', 10, 20)) == null);
-    try testing.expect((try rasterize(testing.allocator, 0x2500, 10, 20)) == null);
+    try testing.expect((try rasterize(testing.allocator, 0x251E, 10, 20)) == null);
 }
 
 test "sprite: full block fills the whole cell; upper/lower halves split it" {
@@ -221,6 +337,74 @@ test "sprite: a quadrant lights only its quarter" {
     try testing.expectEqual(@as(u8, 255), ul[0]); // top-left set
     try testing.expectEqual(@as(u8, 0), ul[w - 1]); // top-right clear
     try testing.expectEqual(@as(u8, 0), ul[(h - 1) * w]); // bottom-left clear
+}
+
+test "sprite: box-drawing only models a subset; the rest falls to the font" {
+    try testing.expect(isSprite(0x2500)); // light horizontal — handled
+    try testing.expect(isSprite(0x253C)); // light cross — handled
+    try testing.expect(isSprite(0x2550)); // double horizontal — handled
+    try testing.expect(!isSprite(0x251E)); // mixed-weight tee — not modeled
+    try testing.expect((try rasterize(testing.allocator, 0x251E, 12, 24)) == null);
+}
+
+test "sprite: light horizontal/vertical lines lie on the center axes" {
+    const alloc = testing.allocator;
+    const w: u32 = 12;
+    const h: u32 = 24;
+    const cx = w / 2;
+    const cy = h / 2;
+
+    const horiz = (try rasterize(alloc, 0x2500, w, h)).?;
+    defer alloc.free(horiz);
+    try testing.expect(horiz[cy * w + 0] == 255); // left edge, center row: lit
+    try testing.expect(horiz[cy * w + (w - 1)] == 255); // right edge, center row: lit
+    try testing.expect(horiz[0] == 0); // top-left corner: blank (no vertical)
+
+    const vert = (try rasterize(alloc, 0x2502, w, h)).?;
+    defer alloc.free(vert);
+    try testing.expect(vert[0 * w + cx] == 255); // top edge, center col: lit
+    try testing.expect(vert[(h - 1) * w + cx] == 255); // bottom edge, center col: lit
+    try testing.expect(vert[cy * w + 0] == 0); // center row, left edge: blank
+}
+
+test "sprite: a corner draws only its two arms" {
+    const alloc = testing.allocator;
+    const w: u32 = 12;
+    const h: u32 = 24;
+    const cx = w / 2;
+    const cy = h / 2;
+    // U+250C ┌ : down + right arms only (no up, no left).
+    const dr = (try rasterize(alloc, 0x250C, w, h)).?;
+    defer alloc.free(dr);
+    try testing.expect(dr[(h - 1) * w + cx] == 255); // down arm reaches bottom
+    try testing.expect(dr[cy * w + (w - 1)] == 255); // right arm reaches right edge
+    try testing.expect(dr[0 * w + cx] == 0); // no up arm at the top
+    try testing.expect(dr[cy * w + 0] == 0); // no left arm at the left edge
+}
+
+test "sprite: heavy lines have more ink than light; double has two strokes" {
+    const alloc = testing.allocator;
+    const w: u32 = 16;
+    const h: u32 = 32;
+
+    const light = (try rasterize(alloc, 0x2500, w, h)).?;
+    defer alloc.free(light);
+    const heavy = (try rasterize(alloc, 0x2501, w, h)).?;
+    defer alloc.free(heavy);
+    try testing.expect(sumAlpha(heavy) > sumAlpha(light));
+
+    // Double horizontal (U+2550): two separated bands -> the center row between
+    // them is blank while rows just above and below it are lit.
+    const dbl = (try rasterize(alloc, 0x2550, w, h)).?;
+    defer alloc.free(dbl);
+    const cy = h / 2;
+    var lit_above = false;
+    var lit_below = false;
+    for (0..w) |x| {
+        if (dbl[(cy - 2) * w + x] == 255) lit_above = true;
+        if (dbl[(cy + 2) * w + x] == 255) lit_below = true;
+    }
+    try testing.expect(lit_above and lit_below);
 }
 
 test "sprite: braille lights more dots as bits set; blank pattern is empty" {
