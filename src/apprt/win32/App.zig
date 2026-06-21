@@ -204,9 +204,15 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         renderer.setAtlas(cache.atlas.data, cache.atlas.size);
     }
 
-    // --- Initial grid from the client size ---
+    // --- Initial grid from the client size, honoring window padding (#71) ---
+    const pad: surface.Padding = .{
+        .x = cfg.window_padding_x,
+        .y = cfg.window_padding_y,
+        .balance = cfg.window_padding_balance,
+    };
     const size0 = win.clientSize();
-    const grid0 = surface.gridFromPixels(size0.width, size0.height, cell_w, cell_h);
+    const layout0 = surface.layout(size0.width, size0.height, cell_w, cell_h, pad);
+    const grid0: surface.GridSize = .{ .cols = layout0.cols, .rows = layout0.rows };
 
     // --- ConPTY + shell ---
     var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
@@ -238,6 +244,9 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
         .cell_h = cell_h,
         .cols = grid0.cols,
         .rows = grid0.rows,
+        .pad = pad,
+        .origin_x = layout0.origin_x,
+        .origin_y = layout0.origin_y,
     };
 
     // --- Main loop ---
@@ -389,7 +398,7 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             .opacity = cfg.cursor_opacity,
             .thickness = cursor_thickness,
         };
-        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, &theme, cursor_render);
+        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, sfc.origin_x, sfc.origin_y, &theme, cursor_render);
         // buildQuads may have packed new glyphs into the atlas; re-upload before
         // drawing so the texture has them.
         if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
@@ -538,6 +547,10 @@ fn buildQuads(
     cell_w: u32,
     cell_h: u32,
     ascent: u32,
+    /// Top-left pixel of cell (0,0): the window-padding offset (#71). Every cell
+    /// and the cursor are shifted by it; the padding region shows the clear color.
+    origin_x: u32,
+    origin_y: u32,
     theme: *const Theme,
     cursor_render: CursorRender,
 ) !void {
@@ -609,8 +622,8 @@ fn buildQuads(
                 }
             }
 
-            const cell_x: i32 = @intCast(col * cell_w);
-            const cell_y: i32 = @intCast(row * cell_h);
+            const cell_x: i32 = @intCast(origin_x + col * cell_w);
+            const cell_y: i32 = @intCast(origin_y + row * cell_h);
 
             // Background fill. The cleared framebuffer already provides the
             // default background, so only non-default backgrounds emit a quad.
@@ -711,8 +724,8 @@ fn buildQuads(
         .term_style = term_style,
     });
     if (cstyle) |cs| {
-        const ccx: i32 = @intCast(cx * cell_w);
-        const ccy: i32 = @intCast(cy * cell_h);
+        const ccx: i32 = @intCast(origin_x + cx * cell_w);
+        const ccy: i32 = @intCast(origin_y + cy * cell_h);
 
         // Cursor fill: the configured/OSC-12 cursor color if set (so OSC 12
         // both answers queries and renders), else the cell's foreground.
