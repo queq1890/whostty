@@ -12,8 +12,10 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const Pty = @import("../../pty.zig").Pty;
+const Child = @import("../../pty.zig").Child;
 const Termio = @import("../../termio.zig").Termio;
 const Window = @import("Window.zig").Window;
+const st = @import("SplitTree.zig");
 const gl = @import("../../renderer/OpenGL.zig");
 const rcursor = @import("../../renderer/cursor.zig");
 const rcolor = @import("../../renderer/color.zig");
@@ -273,6 +275,213 @@ const App = struct {
     }
 };
 
+/// One terminal pane inside a window (#87): a fully independent terminal — its
+/// own ConPTY + shell, libghostty-vt state, reader thread, and `Surface` (grid +
+/// mouse mapping). Heap-allocated so its address is stable (the reader thread and
+/// `sfc.pty`/`sfc.termio` hold pointers into it). The `SplitTree`/`TabList` models
+/// refer to a pane only by its opaque `id`; this maps that id to the live state.
+const Pane = struct {
+    id: st.SurfaceId,
+    pty: Pty,
+    child: Child,
+    io: *Termio,
+    stop: std.atomic.Value(bool),
+    reader: std.Thread,
+    sfc: surface.Surface,
+    wheel: scroll.WheelAccumulator = .{},
+    /// The pane's last OSC 0/2 title (owned), shown in the window caption while
+    /// this pane is focused. Null until the program sets one.
+    title: ?[]const u8 = null,
+};
+
+/// Divider line thickness between split panes, in pixels (drawn over the panes).
+const divider_px: f32 = 1;
+
+/// The per-window multi-pane state (#87). Owns the tab list (each tab is a
+/// `SplitTree` of pane ids) and the live `Pane` objects, tracks which pane is
+/// focused, and mints pane ids. This is the whostty stand-in for ghostty's
+/// per-window surface tree; every surface-scoped apprt action acts through it.
+/// All of it lives on, and is only ever touched by, the owning window thread.
+const WinState = struct {
+    alloc: std.mem.Allocator,
+    app: *App,
+    win: *Window,
+    opts: cli.Options,
+    cfg: *const config.Config,
+    theme: *const Theme,
+    binds: *const binding.Set,
+    cell_w: u32,
+    cell_h: u32,
+    pad: surface.Padding,
+
+    tabs: st.TabList,
+    panes: std.ArrayList(*Pane) = .empty,
+    /// The focused pane (in the active tab). Receives keyboard input; drawn with
+    /// a solid (vs. hollow) cursor.
+    focused_id: st.SurfaceId = 0,
+    /// Next pane id to mint (monotonic; ids are never reused within a window).
+    next_id: st.SurfaceId = 0,
+    /// The pane that owns the in-progress left-drag (selection), so moves and the
+    /// release route to it even if the cursor crosses into another pane.
+    drag_id: ?st.SurfaceId = null,
+    /// Set by `close_surface` on the last pane / by the WM_CLOSE path to break the
+    /// window loop next iteration.
+    close_requested: bool = false,
+    /// Window keyboard focus (drives the hollow-when-unfocused cursor).
+    win_focused: bool = true,
+
+    fn paneById(self: *WinState, id: st.SurfaceId) ?*Pane {
+        for (self.panes.items) |p| if (p.id == id) return p;
+        return null;
+    }
+
+    fn focusedPane(self: *WinState) ?*Pane {
+        return self.paneById(self.focused_id);
+    }
+
+    fn activeTree(self: *WinState) *st.SplitTree {
+        return self.tabs.activeTree().?;
+    }
+
+    /// Height reserved at the top for the tab strip (only when >1 tab).
+    fn tabBarHeight(self: *WinState) u32 {
+        return if (self.tabs.count() > 1) self.cell_h + 6 else 0;
+    }
+
+    /// The window region the active tab's panes are laid out in: the client area
+    /// minus the tab strip.
+    fn contentBounds(self: *WinState) st.Rect {
+        const sz = self.win.clientSize();
+        const tb: f32 = @floatFromInt(self.tabBarHeight());
+        const h: f32 = @floatFromInt(sz.height);
+        return .{ .x = 0, .y = tb, .width = @floatFromInt(sz.width), .height = @max(0, h - tb) };
+    }
+
+    /// Spawn a fresh pane: ConPTY + shell + Termio + reader thread + Surface.
+    /// The id is consumed only on success.
+    fn createPane(self: *WinState, cols: u16, rows: u16) !*Pane {
+        const alloc = self.alloc;
+        const pane = try alloc.create(Pane);
+        errdefer alloc.destroy(pane);
+
+        pane.id = self.next_id;
+        pane.wheel = .{};
+        pane.title = null;
+        pane.stop = std.atomic.Value(bool).init(false);
+
+        pane.pty = try Pty.open(.{ .ws_col = cols, .ws_row = rows });
+        errdefer pane.pty.deinit();
+        pane.child = try pane.pty.spawn(alloc, self.opts.command orelse shellCommandLine());
+        errdefer {
+            pane.child.kill();
+            pane.child.deinit();
+        }
+        pane.io = try Termio.create(alloc, cols, rows, self.cfg.scrollback_limit);
+        errdefer pane.io.destroy();
+        pane.io.seedColors(self.theme.fg, self.theme.bg, if (self.cfg.cursor_color) |c| toVtRgb(c) else null, &self.theme.palette);
+
+        pane.sfc = .{
+            .pty = &pane.pty,
+            .termio = pane.io,
+            .cell_w = self.cell_w,
+            .cell_h = self.cell_h,
+            .cols = cols,
+            .rows = rows,
+            .pad = self.pad,
+        };
+
+        // Spawn the reader LAST so no fallible step remains that could orphan it.
+        pane.reader = try std.Thread.spawn(.{}, readerLoop, .{ &pane.pty, pane.io, &pane.stop, self.win.handle() });
+
+        self.next_id += 1;
+        return pane;
+    }
+
+    /// Tear a pane down (stop + join its reader, kill the shell, free vt/pty),
+    /// then free the pane. Does NOT touch the tree or the pane list.
+    fn destroyPane(self: *WinState, pane: *Pane) void {
+        pane.stop.store(true, .monotonic);
+        pane.child.kill();
+        // Killing the shell doesn't unblock conhost's ReadFile; cancel it so the
+        // reader returns and join() doesn't hang (same as the single-pane path).
+        pane.pty.cancelRead();
+        pane.reader.join();
+        pane.io.destroy();
+        pane.child.deinit();
+        pane.pty.deinit();
+        if (pane.title) |t| self.alloc.free(t);
+        self.alloc.destroy(pane);
+    }
+
+    /// Remove a pane from the tracking list (by id) and return it (the caller
+    /// destroys it). Null if absent.
+    fn takePane(self: *WinState, id: st.SurfaceId) ?*Pane {
+        for (self.panes.items, 0..) |p, i| if (p.id == id) return self.panes.swapRemove(i);
+        return null;
+    }
+
+    /// Resize every pane in the active tab to its laid-out rect (origin + grid).
+    /// Called after any structural change (split / close / tab switch) and on a
+    /// window resize.
+    fn layoutActive(self: *WinState) void {
+        var list: std.ArrayList(st.Placement) = .empty;
+        defer list.deinit(self.alloc);
+        self.activeTree().layout(self.contentBounds(), self.alloc, &list) catch return;
+        for (list.items) |pl| {
+            if (self.paneById(pl.surface)) |pane| {
+                pane.sfc.resizeInRect(
+                    @intFromFloat(@max(0, pl.rect.x)),
+                    @intFromFloat(@max(0, pl.rect.y)),
+                    @intFromFloat(@max(1, pl.rect.width)),
+                    @intFromFloat(@max(1, pl.rect.height)),
+                ) catch {};
+            }
+        }
+    }
+
+    /// A pane adjacent to `id` in any direction, used to pick the next focus when
+    /// `id` is about to close.
+    fn neighborOf(self: *WinState, tree: *st.SplitTree, id: st.SurfaceId) ?st.SurfaceId {
+        const bounds = self.contentBounds();
+        for ([_]st.Direction{ .right, .left, .down, .up }) |d| {
+            if (tree.focusTarget(id, d, bounds, self.alloc) catch null) |t| return t;
+        }
+        return null;
+    }
+
+    /// Reflect the newly focused pane in window-global state: the caption tracks
+    /// the focused pane's title and the close-confirmation probe its shell pid.
+    /// A pane with no title yet resets the caption to the default rather than
+    /// leaving the previously focused pane's title showing.
+    fn syncWindowForFocus(self: *WinState) void {
+        if (self.focusedPane()) |p| {
+            self.win.setShellPid(w.GetProcessId(p.child.process));
+            self.win.setTitle(p.title orelse "whostty");
+        }
+    }
+
+    /// End any in-progress left-drag selection and forget the dragging pane.
+    /// Called when the active tab changes so a drag started in a now-hidden pane
+    /// can't keep extending its selection (Win32 capture stays on the HWND, so
+    /// moves keep arriving with no intervening button-up).
+    fn clearDrag(self: *WinState) void {
+        if (self.drag_id) |d| {
+            if (self.paneById(d)) |p| p.sfc.endDrag();
+            self.drag_id = null;
+        }
+    }
+};
+
+/// Map a keybind direction to the split-tree direction (same four values).
+fn toSplitDir(d: binding.Direction) st.Direction {
+    return switch (d) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+    };
+}
+
 /// whostty's entry point (called from `main`). The orchestrator for the
 /// multi-window, thread-per-window runtime (#86): build the shared `App`, spawn
 /// the FIRST window (which runs on its own thread exactly like every later one —
@@ -418,69 +627,53 @@ fn runSurface(app: *App) !void {
     const layout0 = surface.layout(size0.width, size0.height, cell_w, cell_h, pad);
     const grid0: surface.GridSize = .{ .cols = layout0.cols, .rows = layout0.rows };
 
-    // --- ConPTY + shell ---
-    var pty = try Pty.open(.{ .ws_col = grid0.cols, .ws_row = grid0.rows });
-    var child = try pty.spawn(alloc, opts.command orelse shellCommandLine());
-    // Give the window the shell's pid so the WM_CLOSE confirmation (#91) can ask
-    // the OS whether a foreground command is still running before closing.
-    win.setShellPid(w.GetProcessId(child.process));
-    const io = try Termio.create(alloc, grid0.cols, grid0.rows, cfg.scrollback_limit);
-    // Prime the terminal's dynamic colors with the configured defaults so OSC
-    // 10/11/12/4 changes and queries resolve against `terminal.colors` (#83).
-    io.seedColors(theme.fg, theme.bg, if (cfg.cursor_color) |c| toVtRgb(c) else null, &theme.palette);
-
-    // --- Reader thread: pty -> libghostty-vt ---
-    var stop = std.atomic.Value(bool).init(false);
-    const reader = try std.Thread.spawn(.{}, readerLoop, .{ &pty, io, &stop, win.handle() });
-
-    // Cleanup order: stop the shell so the reader's blocking read returns,
-    // join it, then tear down the pty/io.
-    defer {
-        stop.store(true, .monotonic);
-        child.kill();
-        // Killing the shell does NOT break the ConPTY output pipe (conhost still
-        // holds it), so the reader's blocking ReadFile never returns on its own
-        // and join() would hang. Cancel it so the reader exits and we can close.
-        pty.cancelRead();
-        reader.join();
-        io.destroy();
-        child.deinit();
-        pty.deinit();
-    }
-
-    var sfc: surface.Surface = .{
-        .pty = &pty,
-        .termio = io,
+    // --- Multi-pane window state (#87) ---
+    // The window hosts one tab list; each tab is a SplitTree of panes. Borrows
+    // cfg/theme/binds by pointer (all stable for the window's life). Start with a
+    // single tab holding one pane sized to the whole client area.
+    var ws: WinState = .{
+        .alloc = alloc,
+        .app = app,
+        .win = win,
+        .opts = opts,
+        .cfg = &cfg,
+        .theme = &theme,
+        .binds = &binds,
         .cell_w = cell_w,
         .cell_h = cell_h,
-        .cols = grid0.cols,
-        .rows = grid0.rows,
         .pad = pad,
-        .origin_x = layout0.origin_x,
-        .origin_y = layout0.origin_y,
+        .tabs = st.TabList.init(alloc),
     };
+    // Teardown: destroy every pane (stop + join its reader, kill its shell, free
+    // vt/pty), then the list + the tab models (which own only ids). This replaces
+    // the old single-pane pty/io/reader teardown.
+    defer {
+        for (ws.panes.items) |p| ws.destroyPane(p);
+        ws.panes.deinit(alloc);
+        ws.tabs.deinit();
+    }
 
-    // Set by performAction(.close_surface) (and the WM_CLOSE path) to break THIS
-    // window's loop on the next iteration. Closing breaks only this window; the
-    // process exits when the last window's loop ends (its thread decrements the
-    // shared live counter). Built once: every field is stable for the window's
-    // life (`sfc` is borrowed by pointer so `rows` stays live across resizes).
-    var close_requested = false;
-    const ctx: SurfaceCtx = .{
-        .app = app,
-        .binds = &binds,
-        .io = io,
-        .sfc = &sfc,
-        .alloc = alloc,
-        .win = win,
-        .pty = &pty,
-        .close_requested = &close_requested,
-    };
+    // The first pane + tab. On any failure here the partially-built state is
+    // unwound so the outer defer never sees a half-tracked pane.
+    {
+        const first = try ws.createPane(grid0.cols, grid0.rows);
+        ws.panes.append(alloc, first) catch |e| {
+            ws.destroyPane(first);
+            return e;
+        };
+        _ = ws.tabs.addTab(first.id) catch |e| {
+            _ = ws.takePane(first.id);
+            ws.destroyPane(first);
+            return e;
+        };
+        ws.focused_id = first.id;
+    }
+    ws.layoutActive();
+    ws.syncWindowForFocus();
 
     // --- Main loop ---
     var quads: std.ArrayList(gl.Quad) = .empty;
     defer quads.deinit(alloc);
-    var wheel: scroll.WheelAccumulator = .{};
 
     // One-shot render self-verification (WHOSTTY_RENDER_DEBUG=1) — counts lit
     // pixels a few frames in so a build that can't be screenshotted can confirm
@@ -498,10 +691,7 @@ fn runSurface(app: *App) !void {
     // still letting Ctrl+[ / Ctrl+M / etc. (which have no WM_KEYDOWN path) pass.
     var suppress_next_char = false;
 
-    // --- Cursor render state ---
-    // A freshly shown, foreground window has keyboard focus until told otherwise
-    // (WM_KILLFOCUS). Drives the hollow-when-unfocused cursor.
-    var focused = true;
+    // --- Cursor render state (window keyboard focus lives in ws.win_focused) ---
     // Blink phase. The interval matches ghostty's default (600ms); the timer is
     // reset on input so the cursor reappears immediately when the user types.
     // If no monotonic clock is available, the cursor is treated as always-on.
@@ -527,7 +717,8 @@ fn runSurface(app: *App) !void {
         while (win.poll()) |ev| {
             ui_event = true;
             switch (ev) {
-                // Typing snaps back to the bottom, matching common terminals.
+                // Typing snaps the FOCUSED pane back to the bottom and is written
+                // to its shell.
                 .char => |cp| {
                     // Drop the WM_CHAR that trails a handled Enter/Tab/Backspace/
                     // Escape WM_KEYDOWN (flagged below) so the key isn't sent twice.
@@ -535,14 +726,16 @@ fn runSurface(app: *App) !void {
                         suppress_next_char = false;
                         continue;
                     }
+                    const fp = ws.focusedPane() orelse continue;
                     if (blink_timer) |*t| t.reset();
-                    io.scrollToBottom();
-                    writeChar(&pty, cp);
+                    fp.io.scrollToBottom();
+                    writeChar(&fp.pty, cp);
                 },
                 .key => |k| {
+                    const fp = ws.focusedPane() orelse continue;
                     // Read the live key-encode options fresh per press: the reader
                     // thread can flip the kitty keyboard flags between keystrokes.
-                    const enc_opts = io.keyEncodeOptions();
+                    const enc_opts = fp.io.keyEncodeOptions();
                     const kitty = enc_opts.kitty_flags.int() != 0;
 
                     if (kitty) {
@@ -551,7 +744,7 @@ fn runSurface(app: *App) !void {
                         // which produces CSI-u (or passes text through, per flags).
                         // Keybinds still take priority, but only on a press.
                         if (blink_timer) |*t| t.reset();
-                        if (k.down and handleKeybind(k, ctx)) {
+                        if (k.down and handleKeybind(k, &ws)) {
                             // A consumed chord still posts a trailing WM_CHAR for
                             // a text key; drop it so the bound key isn't also typed.
                             suppress_next_char = switch (k.vk) {
@@ -560,9 +753,12 @@ fn runSurface(app: *App) !void {
                             };
                             continue;
                         }
-                        if (k.down) io.scrollToBottom();
+                        // The action may have changed the focused pane (split /
+                        // focus-nav / tab); re-fetch before writing the key.
+                        const tp = ws.focusedPane() orelse continue;
+                        if (k.down) tp.io.scrollToBottom();
                         const km = input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt);
-                        suppress_next_char = writeKeyKitty(&pty, k.vk, k.scancode, k.down, k.repeat, km, enc_opts);
+                        suppress_next_char = writeKeyKitty(&tp.pty, k.vk, k.scancode, k.down, k.repeat, km, enc_opts);
                         continue;
                     }
 
@@ -582,14 +778,16 @@ fn runSurface(app: *App) !void {
                     if (blink_timer) |*t| t.reset();
 
                     // A bound chord is consumed as an action; otherwise it's a
-                    // normal key written to the shell.
-                    if (handleKeybind(k, ctx)) continue;
-                    io.scrollToBottom();
-                    writeKey(&pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), enc_opts);
+                    // normal key written to the focused pane's shell.
+                    if (handleKeybind(k, &ws)) continue;
+                    const tp = ws.focusedPane() orelse continue;
+                    tp.io.scrollToBottom();
+                    writeKey(&tp.pty, k.vk, input.mods(k.mods.shift, k.mods.ctrl, k.mods.alt), enc_opts);
                 },
                 .scroll => |raw| {
-                    const delta = wheel.feed(raw);
-                    if (delta != 0) io.scrollViewport(delta);
+                    const fp = ws.focusedPane() orelse continue;
+                    const delta = fp.wheel.feed(raw);
+                    if (delta != 0) fp.io.scrollViewport(delta);
                 },
                 .mouse_button => |m| {
                     const btn: mouse.Button = switch (m.button) {
@@ -597,74 +795,115 @@ fn runSurface(app: *App) !void {
                         .middle => .middle,
                         .right => .right,
                     };
-                    sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
-                        .shift = m.mods.shift,
-                        .alt = m.mods.alt,
-                        .ctrl = m.mods.ctrl,
-                    });
+                    // A left click in the tab strip switches tabs (and never
+                    // reaches a pane). Segment math mirrors appendTabBar.
+                    const tab_h: i32 = @intCast(ws.tabBarHeight());
+                    if (m.down and m.button == .left and ws.tabs.count() > 1 and m.y >= 0 and m.y < tab_h) {
+                        const sz = ws.win.clientSize();
+                        const n = ws.tabs.count();
+                        const seg_w: u32 = @max(1, @as(u32, @intCast(sz.width)) / @as(u32, @intCast(n)));
+                        // Clamp to the last segment so the remainder pixels on the
+                        // right (which the last segment absorbs visually) still hit
+                        // the last tab.
+                        const idx: usize = @min(n - 1, @as(usize, @intCast(@divFloor(@as(u32, @intCast(@max(0, m.x))), seg_w))));
+                        if (idx != ws.tabs.active) {
+                            ws.clearDrag();
+                            ws.tabs.activate(idx);
+                            ws.focused_id = ws.activeTree().anyLeaf();
+                            ws.layoutActive();
+                            ws.syncWindowForFocus();
+                        }
+                        continue;
+                    }
+                    // Route to the pane under the cursor; a press also focuses it,
+                    // and a left-press claims the ensuing drag.
+                    const bounds = ws.contentBounds();
+                    var target_id: ?st.SurfaceId = ws.activeTree().surfaceAt(
+                        @floatFromInt(m.x),
+                        @floatFromInt(m.y),
+                        bounds,
+                    );
+                    if (m.down) {
+                        if (target_id) |id| if (id != ws.focused_id) {
+                            ws.focused_id = id;
+                            ws.syncWindowForFocus();
+                        };
+                        if (m.button == .left) ws.drag_id = target_id;
+                    } else if (m.button == .left) {
+                        // The release goes to the dragging pane even if the cursor
+                        // wandered out of it.
+                        if (ws.drag_id) |d| target_id = d;
+                        ws.drag_id = null;
+                    }
+                    if (target_id) |id| if (ws.paneById(id)) |pane| {
+                        pane.sfc.mouseButton(btn, if (m.down) .press else .release, m.x, m.y, .{
+                            .shift = m.mods.shift,
+                            .alt = m.mods.alt,
+                            .ctrl = m.mods.ctrl,
+                        });
+                    };
                 },
-                .mouse_move => |m| sfc.mouseDrag(m.x, m.y),
-                .mouse_capture_lost => sfc.endDrag(),
-                .resize => |r| sfc.resizePixels(r.width, r.height) catch {},
+                .mouse_move => |m| {
+                    if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.mouseDrag(m.x, m.y);
+                },
+                .mouse_capture_lost => {
+                    if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.endDrag();
+                    ws.drag_id = null;
+                },
+                // Re-grid every pane in the active tab to the new client size.
+                .resize => |_| ws.layoutActive(),
                 .focus => |f| {
                     // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
                     // can't emit a duplicate report.
-                    if (focused != f) {
-                        focused = f;
-                        // Report the change to apps that asked for it (mode 1004).
-                        if (io.focusReport(f)) |r| _ = pty.write(r) catch {};
+                    if (ws.win_focused != f) {
+                        ws.win_focused = f;
+                        // Report the change to the focused pane's app (mode 1004).
+                        if (ws.focusedPane()) |fp| {
+                            if (fp.io.focusReport(f)) |r| _ = fp.pty.write(r) catch {};
+                        }
                     }
                 },
                 // Close-confirmation (#91): the window proc swallowed the OS
                 // destroy and queued this event, so the window still exists. Only
-                // proceed to break the loop (which runs the shell/pty teardown
-                // defer) if the user confirms — or if nothing is running, in which
-                // case confirmClose returns true with no prompt. Choosing "No"
-                // leaves the window open with the shell intact. close_surface
-                // (ctrl+shift+w via performAction) sets the same flag, so the X
-                // and the keybind share one teardown path.
+                // proceed to break the loop (which runs the pane teardown defer) if
+                // the user confirms — or if nothing is running, in which case
+                // confirmClose returns true with no prompt. The probe is keyed on
+                // the focused pane's shell (set via syncWindowForFocus).
                 .close => if (win.confirmClose()) {
-                    close_requested = true;
+                    ws.close_requested = true;
                 },
             }
         }
-        if (close_requested) break;
+        if (ws.close_requested) break;
 
-        // Drain VT replies the terminal owes the pty (DSR/DA/DECRQM), generated
-        // on the reader thread as it parses queries. Writing them here keeps
-        // every pty write on this thread, so responses never interleave with
-        // keyboard input mid-sequence. The loop handles a reply set larger than
-        // the buffer; in practice each is well under 256 bytes.
+        // Drain each pane's side channels (VT replies, OSC 52 clipboard, bell,
+        // notification, title). Each pane's reader runs independently, so this
+        // services all of them — a background pane's DSR reply still gets written
+        // back, its bell still flashes the window, etc.
         var resp_buf: [256]u8 = undefined;
-        while (true) {
-            const n = io.takeResponse(&resp_buf);
-            if (n == 0) break;
-            _ = pty.write(resp_buf[0..n]) catch {};
-        }
-
-        // Drain a pending OSC 52 clipboard write (decoded on the reader thread)
-        // to the system clipboard, which is a UI-thread operation.
-        if (io.takeClipboardWrite()) |text| {
-            defer alloc.free(text);
-            w.clipboardWrite(alloc, win.handle(), text) catch {};
-        }
-
-        // Out-of-band terminal events (BEL / OSC 9 / 777). A bell flashes the
-        // window (visual bell); a desktop notification is logged for now — the
-        // Windows toast / tray surfacing is host-only work (#43). Both are
-        // captured on the reader thread and acted on here, on the UI thread.
-        if (io.takeBellCount() > 0) w.flashWindow(win.handle());
-        if (io.takeNotification()) |note| {
-            var n = note;
-            defer n.deinit(alloc);
-            log.info("desktop notification: {s}: {s}", .{ n.title, n.body });
-        }
-
-        // Apply a pending OSC 0/2 window title to the live caption. Captured on
-        // the reader thread; SetWindowTextW must run on the UI thread.
-        if (io.takeTitle()) |title| {
-            defer alloc.free(title);
-            win.setTitle(title);
+        for (ws.panes.items) |pane| {
+            while (true) {
+                const n = pane.io.takeResponse(&resp_buf);
+                if (n == 0) break;
+                _ = pane.pty.write(resp_buf[0..n]) catch {};
+            }
+            if (pane.io.takeClipboardWrite()) |text| {
+                defer alloc.free(text);
+                w.clipboardWrite(alloc, win.handle(), text) catch {};
+            }
+            if (pane.io.takeBellCount() > 0) w.flashWindow(win.handle());
+            if (pane.io.takeNotification()) |note| {
+                var n = note;
+                defer n.deinit(alloc);
+                log.info("desktop notification: {s}: {s}", .{ n.title, n.body });
+            }
+            // OSC 0/2 title: kept per-pane (so it survives a focus switch) and
+            // applied to the live caption while this pane is focused.
+            if (pane.io.takeTitle()) |title| {
+                if (pane.title) |old| alloc.free(old);
+                pane.title = title;
+                if (pane.id == ws.focused_id) win.setTitle(title);
+            }
         }
 
         const sz = win.clientSize();
@@ -674,15 +913,30 @@ fn runSurface(app: *App) !void {
         else
             true;
 
-        // Frame pacing (#72): redraw only when something changed. A *blinking*
-        // cursor's phase is folded in only while it's actually blinking, so a
-        // steady / hidden / unfocused cursor lets the loop go fully idle.
-        const cursor_blinks = io.cursorBlinks(focused);
+        // Lay out the active tab's panes for this frame (cheap; few panes). Reused
+        // for the dirty-gen sum, the render pass, dividers, and scrollbars.
+        var placements: std.ArrayList(st.Placement) = .empty;
+        defer placements.deinit(alloc);
+        ws.activeTree().layout(ws.contentBounds(), alloc, &placements) catch {};
+
+        // Frame pacing (#72): combine every visible pane's dirty generation with
+        // the structural state (focused pane, active tab, pane count) so a focus
+        // switch / split / tab change also forces a redraw. Wrapping multiplies
+        // (rather than shifts) fold the small structural ids in without any
+        // shift-overflow risk.
+        var gen: u64 = (@as(u64, ws.focused_id) *% 0x9E3779B97F4A7C15) ^
+            (@as(u64, @intCast(ws.tabs.active)) *% 0x100000001B3) ^
+            (@as(u64, @intCast(ws.panes.items.len)) *% 0xD1B54A32D192ED03);
+        for (placements.items) |pl| {
+            if (ws.paneById(pl.surface)) |pane| gen +%= pane.io.dirtyGen();
+        }
+        const fp = ws.focusedPane();
+        const cursor_blinks = if (fp) |p| p.io.cursorBlinks(ws.win_focused) else false;
         const eff_blink = if (cursor_blinks) blink_visible else true;
-        const fs_cur: frame.FrameState = .{ .gen = io.dirtyGen(), .blink = eff_blink, .focused = focused };
+        const fs_cur: frame.FrameState = .{ .gen = gen, .blink = eff_blink, .focused = ws.win_focused };
         if (!first_frame and !frame.needsRedraw(fs_prev, fs_cur, ui_event)) {
-            // Nothing changed: sleep until input, the reader's wake message, or
-            // the next blink toggle — instead of re-rendering every iteration.
+            // Nothing changed: sleep until input, a reader's wake message, or the
+            // next blink toggle — instead of re-rendering every iteration.
             const wait_blinking = cursor_blinks and blink_timer != null;
             w.waitForMessage(frame.idleWaitMs(wait_blinking, blink_elapsed, blink_interval_ns, 1000));
             continue;
@@ -690,28 +944,48 @@ fn runSurface(app: *App) !void {
         fs_prev = fs_cur;
         first_frame = false;
 
-        const cursor_render: CursorRender = .{
-            .focused = focused,
-            .blink_visible = blink_visible,
-            .text = cursor_text,
-            .opacity = cfg.cursor_opacity,
-            .thickness = cursor_thickness,
-        };
-        try buildQuads(alloc, &quads, io, if (ft) &cache else {}, cell_w, cell_h, ascent, sfc.origin_x, sfc.origin_y, &theme, cursor_render);
-        // buildQuads may have packed new glyphs into the atlas; re-upload before
-        // drawing so the texture has them. The color (emoji) atlas re-uploads
-        // independently (#78).
+        // --- Render: every pane in the active tab, then dividers + tab strip ---
+        quads.clearRetainingCapacity();
+        for (placements.items) |pl| {
+            const pane = ws.paneById(pl.surface) orelse continue;
+            // Fill the pane's rect with its own (OSC 11) background first, so each
+            // pane shows the correct bg even when panes differ and so default-bg
+            // cells read right regardless of the single window clear color.
+            const pbg = rgbf(pane.io.backgroundColor(theme.bg));
+            try quads.append(alloc, .{ .solid = .{
+                .px = @intFromFloat(pl.rect.x),
+                .py = @intFromFloat(pl.rect.y),
+                .w = @intFromFloat(@max(0, pl.rect.width)),
+                .h = @intFromFloat(@max(0, pl.rect.height)),
+                .r = pbg[0],
+                .g = pbg[1],
+                .b = pbg[2],
+            } });
+            const cursor_render: CursorRender = .{
+                // Only the focused pane (in a focused window) shows a solid cursor;
+                // others render hollow via resolveStyle's unfocused path.
+                .focused = (pane.id == ws.focused_id) and ws.win_focused,
+                .blink_visible = blink_visible,
+                .text = cursor_text,
+                .opacity = cfg.cursor_opacity,
+                .thickness = cursor_thickness,
+            };
+            try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render);
+            // Per-pane scrollbar within the pane's rect.
+            appendScrollbar(alloc, &quads, pane.io.scrollbar(), pl.rect, cell_w, theme.fg) catch {};
+        }
+        // buildQuads (across all panes) may have packed new glyphs into the shared
+        // atlas; re-upload once before drawing.
         if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
         if (ft and cache.takeColorDirty()) renderer.setColorAtlas(cache.color_atlas.data, cache.color_atlas.size);
 
-        // Scrollbar (#73): an overlay thumb on the right edge marking the
-        // viewport's position within the scrollback. Appended after the grid so
-        // it draws on top; shown only when there is history to scroll. The thumb
-        // geometry comes from the VT core's authoritative row counts.
-        appendScrollbar(alloc, &quads, io.scrollbar(), sz.width, sz.height, cell_w, theme.fg) catch {};
-        // Default-background cells show through the clear color, so it must track
-        // the OSC 11 background override (falling back to the configured bg).
-        const clear_bg = rgbf(io.backgroundColor(theme.bg));
+        // Split dividers, then (with >1 tab) the tab strip, both drawn on top.
+        appendDividers(&ws, &quads, alloc) catch {};
+        appendTabBar(&ws, &quads, alloc, if (ft) &cache else {}, ascent) catch {};
+
+        // Default-background cells show through the clear color, so it tracks the
+        // focused pane's OSC 11 background override (falling back to config bg).
+        const clear_bg = if (fp) |p| rgbf(p.io.backgroundColor(theme.bg)) else rgbf(theme.bg);
         try renderer.draw(quads.items, clear_bg, sz.width, sz.height);
 
         dbg_frame += 1;
@@ -910,32 +1184,12 @@ fn writeKeyKitty(
     };
 }
 
-/// The per-window context a surface-scoped action acts on (#86) — the whostty
-/// stand-in for ghostty's `Target.surface: *CoreSurface`. Holds everything an
-/// action reaches into for THIS window: the binding set, the terminal io, the
-/// surface (for its live `rows`), the window/pty/allocator clipboard + window-
-/// state actions use, plus the `close_requested` flag a `close_surface` sets to
-/// break this window's loop. `app` is the shared state, threaded through so the
-/// app-scoped `new_window` can spawn a sibling window thread. Stack-resident in
-/// `runSurface`; every field is owned by (or, for `app`/`alloc`, safely shared
-/// across) the window thread.
-const SurfaceCtx = struct {
-    app: *App,
-    binds: *const binding.Set,
-    io: *Termio,
-    sfc: *const surface.Surface,
-    alloc: std.mem.Allocator,
-    win: *Window,
-    pty: *Pty,
-    close_requested: *bool,
-};
-
 /// Look up a key event in the binding set and run the bound action. Returns true
 /// if a binding matched and was handled (so the key is not also sent to the pty).
 /// The matched `binding.Action` is translated to the formal `apprt.Action` and
 /// dispatched through `performAction`, mirroring ghostty's
 /// `Surface.performBindingAction`.
-fn handleKeybind(k: anytype, ctx: SurfaceCtx) bool {
+fn handleKeybind(k: anytype, ws: *WinState) bool {
     const key = keymap.keyFromVk(k.vk) orelse return false;
     const trigger: binding.Trigger = .{ .key = key, .mods = .{
         .ctrl = k.mods.ctrl,
@@ -943,153 +1197,358 @@ fn handleKeybind(k: anytype, ctx: SurfaceCtx) bool {
         .alt = k.mods.alt,
         .super = k.mods.super,
     } };
-    const action = ctx.binds.get(trigger) orelse return false;
-    _ = performAction(ctx.app, &ctx, apprt.fromBinding(action));
+    const action = ws.binds.get(trigger) orelse return false;
+    _ = performAction(ws, apprt.fromBinding(action));
     return true;
 }
 
-/// The formal apprt action dispatch (#86) — the whostty mirror of ghostty's
+/// The formal apprt action dispatch (#86/#87) — the whostty mirror of ghostty's
 /// `App.performAction` / the GTK `performAction` switch. Routes each `apprt.Action`
-/// to its effect: app-scoped actions act on the shared `app`; surface-scoped
-/// actions act on the calling window's `ctx`. Returns whether the action was
-/// handled (the still-stubbed tab/split actions return false). The split between
-/// app- and surface-scope follows `apprt.Action.target()`.
+/// to its effect: app-scoped actions spawn a sibling window; surface-scoped ones
+/// act on the calling window's `WinState` (its focused pane / tab tree). Returns
+/// whether the action was handled.
 ///
-/// Threading: every surface-scoped effect touches only THIS window's resources
-/// (its io/win/pty/sfc), so this always runs on the owning window thread.
-/// `.new_window` is the only cross-thread step — it spawns an independent window
-/// thread via `app.spawnWindow()` and touches nothing of the caller's window.
-fn performAction(app: *App, ctx: *const SurfaceCtx, action: apprt.Action) bool {
+/// Threading: every surface-scoped effect touches only THIS window's resources,
+/// so this always runs on the owning window thread. `.new_window` is the only
+/// cross-thread step (it spawns an independent window thread).
+fn performAction(ws: *WinState, action: apprt.Action) bool {
     switch (action) {
         // --- App-scoped ---
         .new_window => {
-            app.spawnWindow() catch |e| log.err("new_window: spawn failed: {}", .{e});
-            // Handled regardless: a failed spawn is logged, not propagated (the
-            // calling window keeps running), matching ghostty's best-effort
-            // new-window semantics.
+            ws.app.spawnWindow() catch |e| log.err("new_window: spawn failed: {}", .{e});
             return true;
         },
 
-        // --- Surface-scoped: the calling window ---
+        // --- In-window subdivision (#87) ---
+        .new_split => |d| {
+            splitFocused(ws, toSplitDir(d));
+            return true;
+        },
+        .goto_split => |d| {
+            const bounds = ws.contentBounds();
+            const target = ws.activeTree().focusTarget(ws.focused_id, toSplitDir(d), bounds, ws.alloc) catch null;
+            if (target) |t| {
+                ws.focused_id = t;
+                ws.syncWindowForFocus();
+            }
+            return true;
+        },
+        .new_tab => {
+            newTab(ws);
+            return true;
+        },
+        .next_tab => {
+            switchTab(ws, .next);
+            return true;
+        },
+        .previous_tab => {
+            switchTab(ws, .prev);
+            return true;
+        },
+        .goto_tab => |n| {
+            // 1-based; ignore 0, out-of-range, and a no-op jump to the current
+            // tab (otherwise focus would be yanked to the tab's first pane).
+            const idx: usize = if (n >= 1) @as(usize, n) - 1 else std.math.maxInt(usize);
+            if (idx < ws.tabs.count() and idx != ws.tabs.active) {
+                ws.clearDrag();
+                ws.tabs.activate(idx);
+                ws.focused_id = ws.activeTree().anyLeaf();
+                ws.layoutActive();
+                ws.syncWindowForFocus();
+            }
+            return true;
+        },
+
+        // --- Surface-scoped: the focused pane / calling window ---
         .close_surface => {
-            // Break only THIS window's loop next iteration; the process exits when
-            // the last window's thread decrements the shared live counter.
-            ctx.close_requested.* = true;
+            closeFocused(ws);
             return true;
         },
         .scroll_page_up => {
-            ctx.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(ctx.sfc.rows))));
+            if (ws.focusedPane()) |p| p.io.scrollViewport(-@as(isize, @intCast(scroll.pageRows(p.sfc.rows))));
             return true;
         },
         .scroll_page_down => {
-            ctx.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(ctx.sfc.rows))));
+            if (ws.focusedPane()) |p| p.io.scrollViewport(@as(isize, @intCast(scroll.pageRows(p.sfc.rows))));
             return true;
         },
         .scroll_to_bottom => {
-            ctx.io.scrollToBottom();
+            if (ws.focusedPane()) |p| p.io.scrollToBottom();
             return true;
         },
         .scroll_to_top => {
-            ctx.io.scrollViewport(-1_000_000); // clamps at the top of history
+            if (ws.focusedPane()) |p| p.io.scrollViewport(-1_000_000); // clamps at the top
             return true;
         },
         .copy_to_clipboard => {
-            copyToClipboard(ctx.*);
+            copyToClipboard(ws);
             return true;
         },
         .paste_from_clipboard => {
-            pasteFromClipboard(ctx.*);
+            pasteFromClipboard(ws);
             return true;
         },
-        // Window-state actions (#91) act on the calling window.
+        // Window-state actions (#91) act on the whole window.
         .toggle_fullscreen => {
-            ctx.win.toggleFullscreen();
+            ws.win.toggleFullscreen();
             return true;
         },
         .toggle_maximize => {
-            ctx.win.toggleMaximize();
+            ws.win.toggleMaximize();
             return true;
         },
         .toggle_window_decorations => {
-            ctx.win.toggleDecorations();
+            ws.win.toggleDecorations();
             return true;
-        },
-
-        // --- Still stubbed: in-window subdivision (#87) ---
-        .new_split, .goto_split, .new_tab, .next_tab, .previous_tab, .goto_tab => {
-            log.debug("apprt action '{s}' needs in-window subdivision (#87)", .{@tagName(std.meta.activeTag(action))});
-            return false;
         },
     }
 }
 
-/// Paste the system clipboard into the shell. Reads CF_UNICODETEXT, encodes via
-/// libghostty-vt's paste encoder (strips unsafe bytes, applies bracketed-paste
-/// fenceposts when mode 2004 is on), and writes the result to the pty.
-fn pasteFromClipboard(ctx: SurfaceCtx) void {
-    const text = (w.clipboardRead(ctx.alloc, ctx.win.handle()) catch return) orelse return;
-    defer ctx.alloc.free(text);
+/// Split the focused pane (#87): mint a new pane sized to the focused one, insert
+/// it into the active tree in `dir`, focus it, and re-grid the tab. Best-effort:
+/// any failure is logged and unwound, leaving the existing panes intact.
+fn splitFocused(ws: *WinState, dir: st.Direction) void {
+    const tree = ws.activeTree();
+    const fp = ws.focusedPane() orelse return;
+    const pane = ws.createPane(fp.sfc.cols, fp.sfc.rows) catch |e| {
+        log.err("new_split: create pane failed: {}", .{e});
+        return;
+    };
+    tree.split(ws.focused_id, dir, pane.id) catch |e| {
+        log.err("new_split: tree split failed: {}", .{e});
+        ws.destroyPane(pane);
+        return;
+    };
+    ws.panes.append(ws.alloc, pane) catch {
+        tree.close(pane.id) catch {};
+        ws.destroyPane(pane);
+        return;
+    };
+    ws.focused_id = pane.id;
+    ws.layoutActive();
+    ws.syncWindowForFocus();
+}
+
+/// Close the focused pane (#87). With siblings in the tab, the sibling takes its
+/// space and focus moves to a neighbor. As the tab's last pane, the tab closes
+/// (or, as the last tab's last pane, the whole window).
+fn closeFocused(ws: *WinState) void {
+    const tree = ws.activeTree();
+    if (tree.count() > 1) {
+        const closing = ws.focused_id;
+        const next = ws.neighborOf(tree, closing);
+        tree.close(closing) catch return;
+        if (ws.takePane(closing)) |p| ws.destroyPane(p);
+        ws.focused_id = next orelse tree.anyLeaf();
+        ws.layoutActive();
+        ws.syncWindowForFocus();
+        return;
+    }
+    // The tab's only pane.
+    if (ws.tabs.count() > 1) {
+        const closing = ws.focused_id;
+        _ = ws.tabs.closeActiveTab(); // frees that tab's (single-leaf) tree
+        if (ws.takePane(closing)) |p| ws.destroyPane(p);
+        ws.focused_id = ws.activeTree().anyLeaf();
+        ws.layoutActive();
+        ws.syncWindowForFocus();
+        return;
+    }
+    // Last pane of the last tab: close the window (teardown frees the pane).
+    ws.close_requested = true;
+}
+
+/// Open a new tab (#87): a fresh pane in its own tab, made active and focused.
+fn newTab(ws: *WinState) void {
+    const fp = ws.focusedPane();
+    const cols: u16 = if (fp) |p| p.sfc.cols else 80;
+    const rows: u16 = if (fp) |p| p.sfc.rows else 24;
+    const pane = ws.createPane(cols, rows) catch |e| {
+        log.err("new_tab: create pane failed: {}", .{e});
+        return;
+    };
+    ws.panes.append(ws.alloc, pane) catch {
+        ws.destroyPane(pane);
+        return;
+    };
+    _ = ws.tabs.addTab(pane.id) catch |e| {
+        log.err("new_tab: addTab failed: {}", .{e});
+        _ = ws.takePane(pane.id);
+        ws.destroyPane(pane);
+        return;
+    };
+    ws.focused_id = pane.id;
+    ws.layoutActive();
+    ws.syncWindowForFocus();
+}
+
+/// Activate the next/previous tab and focus a pane within it.
+fn switchTab(ws: *WinState, comptime which: enum { next, prev }) void {
+    if (ws.tabs.count() <= 1) return;
+    ws.clearDrag();
+    switch (which) {
+        .next => ws.tabs.nextTab(),
+        .prev => ws.tabs.prevTab(),
+    }
+    ws.focused_id = ws.activeTree().anyLeaf();
+    ws.layoutActive();
+    ws.syncWindowForFocus();
+}
+
+/// Paste the system clipboard into the focused pane's shell. Reads
+/// CF_UNICODETEXT, encodes via libghostty-vt's paste encoder (strips unsafe
+/// bytes, applies bracketed-paste fenceposts when mode 2004 is on), and writes
+/// the result to that pane's pty.
+fn pasteFromClipboard(ws: *WinState) void {
+    const pane = ws.focusedPane() orelse return;
+    const alloc = ws.alloc;
+    const text = (w.clipboardRead(alloc, ws.win.handle()) catch return) orelse return;
+    defer alloc.free(text);
     if (text.len == 0) return;
 
     const bracketed = blk: {
-        ctx.io.lock();
-        defer ctx.io.unlock();
-        break :blk ctx.io.terminal.modes.get(.bracketed_paste);
+        pane.io.lock();
+        defer pane.io.unlock();
+        break :blk pane.io.terminal.modes.get(.bracketed_paste);
     };
 
-    ctx.io.scrollToBottom();
+    pane.io.scrollToBottom();
 
     // encodePaste mutates the buffer in place (control-byte stripping / \n->\r),
     // so pass a mutable copy to use the infallible []u8 overload.
-    const buf = ctx.alloc.dupe(u8, text) catch return;
-    defer ctx.alloc.free(buf);
+    const buf = alloc.dupe(u8, text) catch return;
+    defer alloc.free(buf);
     const parts = vt.input.encodePaste(buf, .{ .bracketed = bracketed });
     for (parts) |part| {
-        if (part.len > 0) _ = ctx.pty.write(part) catch {};
+        if (part.len > 0) _ = pane.pty.write(part) catch {};
     }
 }
 
-/// Copy the current selection to the system clipboard. A no-op when there is no
-/// selection (selection is set by mouse-drag, #51).
-fn copyToClipboard(ctx: SurfaceCtx) void {
+/// Copy the focused pane's selection to the system clipboard. A no-op when there
+/// is no selection (selection is set by mouse-drag, #51).
+fn copyToClipboard(ws: *WinState) void {
+    const pane = ws.focusedPane() orelse return;
+    const alloc = ws.alloc;
     const text = blk: {
-        ctx.io.lock();
-        defer ctx.io.unlock();
-        const screen = ctx.io.terminal.screens.active; // *Screen
+        pane.io.lock();
+        defer pane.io.unlock();
+        const screen = pane.io.terminal.screens.active; // *Screen
         const sel = screen.selection orelse break :blk null;
-        break :blk screen.selectionString(ctx.alloc, .{ .sel = sel, .trim = true }) catch null;
+        break :blk screen.selectionString(alloc, .{ .sel = sel, .trim = true }) catch null;
     } orelse return;
-    defer ctx.alloc.free(text);
+    defer alloc.free(text);
     if (text.len == 0) return;
-    w.clipboardWrite(ctx.alloc, ctx.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
+    w.clipboardWrite(alloc, ws.win.handle(), text) catch |e| log.warn("clipboard write failed: {}", .{e});
 }
 
-/// Append the scrollbar overlay (#73): a faint full-height track and a brighter,
-/// grabbable thumb on the right edge, sized and positioned from the VT viewport's
-/// scrollback counts (`scroll.scrollbarThumb`). Nothing is appended when the
-/// content fits the viewport (no history to scroll). The thumb color is derived
-/// from the foreground so it contrasts with any background. Drawn translucent so
-/// the cells beneath it remain legible (it overlays the rightmost column).
+/// Append a pane's scrollbar overlay (#73): a faint track and a brighter,
+/// grabbable thumb on the pane's right edge, sized and positioned from the VT
+/// viewport's scrollback counts (`scroll.scrollbarThumb`). Nothing is appended
+/// when the content fits the viewport (no history to scroll). `rect` is the
+/// pane's pixel rect within the window; the bar is placed inside it so each split
+/// pane gets its own scrollbar.
 fn appendScrollbar(
     alloc: std.mem.Allocator,
     quads: *std.ArrayList(gl.Quad),
     sb: Termio.Scrollbar,
-    screen_w: u32,
-    screen_h: u32,
+    rect: st.Rect,
     cell_w: u32,
     fg: vt.color.RGB,
 ) !void {
-    if (sb.total <= sb.len or screen_h == 0 or screen_w == 0) return;
+    const rect_w: u32 = @intFromFloat(@max(0, rect.width));
+    const rect_h: u32 = @intFromFloat(@max(0, rect.height));
+    if (sb.total <= sb.len or rect_h == 0 or rect_w == 0) return;
+    const rect_x: i32 = @intFromFloat(rect.x);
+    const rect_y: i32 = @intFromFloat(rect.y);
     const bar_w: u32 = @max(4, cell_w / 3);
-    const bar_x: i32 = @intCast(screen_w -| bar_w);
-    const thumb = scroll.scrollbarThumb(sb.total, sb.len, sb.offset, @floatFromInt(screen_h));
+    const bar_x: i32 = rect_x + @as(i32, @intCast(rect_w -| bar_w));
+    const thumb = scroll.scrollbarThumb(sb.total, sb.len, sb.offset, @floatFromInt(rect_h));
     const c = rgbf(fg);
-    // Faint full-height track.
-    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = 0, .w = bar_w, .h = screen_h, .r = c[0], .g = c[1], .b = c[2], .a = 0.12 } });
+    // Faint full-height track over the pane.
+    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = rect_y, .w = bar_w, .h = rect_h, .r = c[0], .g = c[1], .b = c[2], .a = 0.12 } });
     // The thumb, clamped so it never spills past the track bottom on rounding.
     const off: u32 = @intFromFloat(@round(thumb.offset));
-    const size: u32 = @min(@max(1, @as(u32, @intFromFloat(@round(thumb.size)))), screen_h -| off);
-    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = @intCast(off), .w = bar_w, .h = size, .r = c[0], .g = c[1], .b = c[2], .a = 0.5 } });
+    const size: u32 = @min(@max(1, @as(u32, @intFromFloat(@round(thumb.size)))), rect_h -| off);
+    try quads.append(alloc, .{ .solid = .{ .px = bar_x, .py = rect_y + @as(i32, @intCast(off)), .w = bar_w, .h = size, .r = c[0], .g = c[1], .b = c[2], .a = 0.5 } });
+}
+
+/// Append the split-divider lines for the active tab over the content area, as
+/// thin solid quads in a color halfway between bg and fg so the seam reads on any
+/// theme. Nothing is appended for a single (unsplit) pane.
+fn appendDividers(ws: *WinState, quads: *std.ArrayList(gl.Quad), alloc: std.mem.Allocator) !void {
+    var ds: std.ArrayList(st.Rect) = .empty;
+    defer ds.deinit(alloc);
+    try ws.activeTree().dividers(ws.contentBounds(), divider_px, alloc, &ds);
+    if (ds.items.len == 0) return;
+    const bg = rgbf(ws.theme.bg);
+    const fg = rgbf(ws.theme.fg);
+    const c: [3]f32 = .{ (bg[0] + fg[0]) / 2, (bg[1] + fg[1]) / 2, (bg[2] + fg[2]) / 2 };
+    for (ds.items) |r| {
+        try quads.append(alloc, .{ .solid = .{
+            .px = @intFromFloat(r.x),
+            .py = @intFromFloat(r.y),
+            .w = @intFromFloat(@max(1, r.width)),
+            .h = @intFromFloat(@max(1, r.height)),
+            .r = c[0],
+            .g = c[1],
+            .b = c[2],
+        } });
+    }
+}
+
+/// Append a minimal tab strip at the top of the window (#87) when more than one
+/// tab is open: one segment per tab (the active one brighter) with its 1-based
+/// index drawn as a glyph. The strip occupies `tabBarHeight` px; the panes are
+/// laid out below it (see `contentBounds`). `cache` is the shared glyph cache
+/// (or `void` in the no-Freetype build, where only the segments draw).
+fn appendTabBar(
+    ws: *WinState,
+    quads: *std.ArrayList(gl.Quad),
+    alloc: std.mem.Allocator,
+    cache: anytype,
+    ascent: u32,
+) !void {
+    const n = ws.tabs.count();
+    if (n <= 1) return;
+    const h = ws.tabBarHeight();
+    const sz = ws.win.clientSize();
+    if (sz.width == 0 or h == 0) return;
+
+    const fg = rgbf(ws.theme.fg);
+    const bg = rgbf(ws.theme.bg);
+    const inactive: [3]f32 = .{ (bg[0] * 3 + fg[0]) / 4, (bg[1] * 3 + fg[1]) / 4, (bg[2] * 3 + fg[2]) / 4 };
+    const active: [3]f32 = .{ (bg[0] + fg[0]) / 2, (bg[1] + fg[1]) / 2, (bg[2] + fg[2]) / 2 };
+    const seg_w: u32 = @max(1, @as(u32, @intCast(sz.width)) / @as(u32, @intCast(n)));
+
+    const total_w: u32 = @intCast(sz.width);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const x0: u32 = @as(u32, @intCast(i)) * seg_w;
+        const x: i32 = @intCast(x0);
+        // The last segment absorbs the remainder so the strip tiles the full
+        // client width (no undrawn gap on the right edge).
+        const seg: u32 = if (i == n - 1) total_w -| x0 else seg_w;
+        const c = if (i == ws.tabs.active) active else inactive;
+        try quads.append(alloc, .{ .solid = .{ .px = x, .py = 0, .w = seg, .h = h, .r = c[0], .g = c[1], .b = c[2] } });
+        // Tab number glyph (1-based). Tabs past 9 reuse the digits 1-9 (a minimal
+        // affordance; full per-tab labels are a follow-up).
+        if (ft) {
+            const digit: u21 = @as(u21, '1') + @as(u21, @intCast(i % 9));
+            if (cache.get(digit, false, false)) |gi| {
+                try quads.append(alloc, .{ .glyph = .{
+                    .px = x + 6 + gi.bearing_x,
+                    .py = @as(i32, @intCast(ascent)) - gi.bearing_y + 3,
+                    .sx = gi.region.x,
+                    .sy = gi.region.y,
+                    .sw = gi.region.width,
+                    .sh = gi.region.height,
+                    .r = fg[0],
+                    .g = fg[1],
+                    .b = fg[2],
+                } });
+            }
+        }
+    }
 }
 
 /// Translate the terminal viewport into renderable quads, honoring SGR colors
@@ -1121,7 +1580,8 @@ fn buildQuads(
     theme: *const Theme,
     cursor_render: CursorRender,
 ) !void {
-    quads.clearRetainingCapacity();
+    // The caller clears `quads` once per frame and then calls this for every pane
+    // in the active tab, so each pane's quads accumulate into one draw (#87).
 
     // Reused across cells to hold an underline's decoration rects (#80); cleared
     // per underlined cell, so its capacity amortizes over the frame.

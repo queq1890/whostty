@@ -108,6 +108,23 @@ pub const Surface = struct {
         try self.termio.resize(l.cols, l.rows);
     }
 
+    /// Lay the grid out inside a sub-rect of the window (a split pane, #87) at
+    /// window-pixel offset (x, y) with size (w, h). Like `resizePixels` but the
+    /// grid origin is offset by the pane's position, so the renderer and mouse
+    /// mapping (both keyed on `origin_*`, in absolute window pixels) address the
+    /// pane correctly. The pty + terminal grid are resized only when the cell
+    /// dimensions actually change.
+    pub fn resizeInRect(self: *Surface, x: u32, y: u32, w: u32, h: u32) !void {
+        const l = layout(w, h, self.cell_w, self.cell_h, self.pad);
+        self.origin_x = x + l.origin_x;
+        self.origin_y = y + l.origin_y;
+        if (l.cols == self.cols and l.rows == self.rows) return;
+        self.cols = l.cols;
+        self.rows = l.rows;
+        try self.pty.setSize(.{ .ws_col = l.cols, .ws_row = l.rows });
+        try self.termio.resize(l.cols, l.rows);
+    }
+
     /// A mouse button was pressed/released. When an application has enabled
     /// mouse tracking the event is encoded and written to the pty (unless Shift
     /// is held, which forces local selection like xterm); otherwise the left
