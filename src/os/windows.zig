@@ -546,6 +546,41 @@ pub extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn BringWindowToTop(hWnd: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 
+// --- Single-instance / IPC (#93) ---------------------------------------------
+// A named mutex detects an already-running instance; a hidden message-only
+// window (HWND_MESSAGE parent) in the primary receives a system-wide registered
+// message from a secondary launch and opens a new window in the existing process.
+
+/// CreateMutexW set this when the named mutex already existed — i.e. another
+/// instance is already running, so this launch is the "secondary".
+pub const ERROR_ALREADY_EXISTS: DWORD = 183;
+
+/// Parent handle marking a message-only window: it receives messages but is
+/// never shown, has no Z-order, and is found only via FindWindowExW(HWND_MESSAGE,
+/// …). (HWND)-3.
+pub const HWND_MESSAGE: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))));
+
+pub extern "kernel32" fn CreateMutexW(
+    lpMutexAttributes: ?*SECURITY_ATTRIBUTES,
+    bInitialOwner: BOOL,
+    lpName: ?LPCWSTR,
+) callconv(.winapi) ?HANDLE;
+
+/// Register (or look up) a system-wide message id by name; every process that
+/// registers the same string gets the same id, so a secondary can post it to the
+/// primary's listener window.
+pub extern "user32" fn RegisterWindowMessageW(lpString: LPCWSTR) callconv(.winapi) UINT;
+
+/// Find a child window by class under a parent (HWND_MESSAGE for message-only
+/// windows, which the plain FindWindowW does not search).
+pub extern "user32" fn FindWindowExW(
+    hWndParent: ?HWND,
+    hWndChildAfter: ?HWND,
+    lpszClass: ?LPCWSTR,
+    lpszWindow: ?LPCWSTR,
+) callconv(.winapi) ?HWND;
+// (GetMessageW is declared above with the core user32 message-loop functions.)
+
 // --- Window flash (visual bell) ------------------------------------------------
 pub const FLASHW_STOP: DWORD = 0;
 pub const FLASHW_CAPTION: DWORD = 0x1;

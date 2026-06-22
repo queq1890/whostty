@@ -553,6 +553,158 @@ fn toSplitDir(d: binding.Direction) st.Direction {
     };
 }
 
+/// Single-instance / IPC (#93). When `single-instance` is on, the first launch
+/// becomes the PRIMARY: it owns a named mutex and runs a hidden message-only
+/// listener window on its own thread. A later launch is the SECONDARY: it finds
+/// that window, posts the system-wide "new-window" message, and exits — so the
+/// primary opens a new window instead of a second process starting. Default off,
+/// so the normal one-process-per-launch behavior is untouched.
+const SingleInstance = struct {
+    /// Per-session mutex name (the default/Local namespace is per-logon-session).
+    const mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("whostty-single-instance");
+    /// The hidden listener window's class.
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttySingleInstanceListener");
+    /// The registered-message name; the same string maps to the same id in every
+    /// process, so a secondary can post it to the primary's listener.
+    const msg_name = std.unicode.utf8ToUtf16LeStringLiteral("whostty-new-window");
+
+    app: *App,
+    /// Owned named mutex; closed on deinit (releasing single-instance ownership).
+    mutex: w.HANDLE,
+    /// The registered "open a new window" message id.
+    msg_id: w.UINT,
+    /// The listener window, created and published by the listener thread.
+    hwnd: ?w.HWND = null,
+    /// Signaled once the listener thread has created (or failed to create) its
+    /// window, so `start` doesn't return before the listener is up.
+    ready: std.Thread.ResetEvent = .{},
+    thread: ?std.Thread = null,
+
+    var register_listener_once = std.once(registerListenerClass);
+    var listener_register_ok: bool = false;
+
+    fn registerListenerClass() void {
+        const hinstance = w.GetModuleHandleW(null).?;
+        const wc: w.WNDCLASSEXW = .{
+            .cbSize = @sizeOf(w.WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = listenerWndProc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = class_name,
+            .hIconSm = null,
+        };
+        listener_register_ok = w.RegisterClassExW(&wc) != 0 or
+            w.GetLastError() == w.ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    fn fromHwnd(hwnd: w.HWND) ?*SingleInstance {
+        const ud = w.GetWindowLongPtrW(hwnd, w.GWLP_USERDATA);
+        if (ud == 0) return null;
+        return @ptrFromInt(@as(usize, @bitCast(ud)));
+    }
+
+    /// The listener window proc: on the registered "new-window" message, open a
+    /// new window in this (primary) process; on close, tear the window down so the
+    /// listener thread's message loop ends.
+    fn listenerWndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(.winapi) w.LRESULT {
+        switch (msg) {
+            w.WM_CLOSE => {
+                _ = w.DestroyWindow(hwnd);
+                return 0;
+            },
+            w.WM_DESTROY => {
+                w.PostQuitMessage(0);
+                return 0;
+            },
+            else => {
+                // The registered message id is a runtime value, so it can't be a
+                // switch label — compare it here.
+                if (fromHwnd(hwnd)) |si| if (msg == si.msg_id) {
+                    si.app.spawnWindow() catch |e| log.err("single-instance: new_window failed: {}", .{e});
+                    return 0;
+                };
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+        }
+    }
+
+    /// The listener thread: register the class, create the message-only window,
+    /// publish it, then pump messages until WM_QUIT (posted by `stopListener`).
+    fn listenerThread(si: *SingleInstance) void {
+        register_listener_once.call();
+        if (!listener_register_ok) {
+            si.ready.set();
+            return;
+        }
+        const hinstance = w.GetModuleHandleW(null).?;
+        const hwnd = w.CreateWindowExW(0, class_name, null, 0, 0, 0, 0, 0, w.HWND_MESSAGE, null, hinstance, null);
+        if (hwnd) |h| {
+            _ = w.SetWindowLongPtrW(h, w.GWLP_USERDATA, @bitCast(@intFromPtr(si)));
+            si.hwnd = h;
+        }
+        si.ready.set();
+        if (hwnd == null) return;
+
+        var msg: w.MSG = undefined;
+        while (w.GetMessageW(&msg, null, 0, 0) > 0) {
+            _ = w.TranslateMessage(&msg);
+            _ = w.DispatchMessageW(&msg);
+        }
+    }
+
+    /// Become the primary: take ownership of `mutex`, start the listener thread,
+    /// and wait until its window is up. On failure the mutex is closed.
+    fn start(alloc: std.mem.Allocator, app: *App, mutex: w.HANDLE) !*SingleInstance {
+        const si = alloc.create(SingleInstance) catch |e| {
+            _ = w.CloseHandle(mutex);
+            return e;
+        };
+        si.* = .{
+            .app = app,
+            .mutex = mutex,
+            .msg_id = w.RegisterWindowMessageW(msg_name),
+        };
+        si.thread = std.Thread.spawn(.{}, listenerThread, .{si}) catch |e| {
+            alloc.destroy(si);
+            _ = w.CloseHandle(mutex);
+            return e;
+        };
+        si.ready.wait();
+        return si;
+    }
+
+    /// Secondary path: find the primary's listener window and post the registered
+    /// "new-window" message, so the primary opens a window. Best-effort — if the
+    /// window can't be found (a race with the primary exiting) nothing happens.
+    fn signalPrimary() void {
+        const hwnd = w.FindWindowExW(w.HWND_MESSAGE, null, class_name, null) orelse return;
+        const msg_id = w.RegisterWindowMessageW(msg_name);
+        _ = w.PostMessageW(hwnd, msg_id, 0, 0);
+    }
+
+    /// Stop accepting new-window requests: close the listener window (ending its
+    /// message loop) and join the thread. Idempotent.
+    fn stopListener(self: *SingleInstance) void {
+        if (self.thread) |t| {
+            if (self.hwnd) |h| _ = w.PostMessageW(h, w.WM_CLOSE, 0, 0);
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn deinit(self: *SingleInstance, alloc: std.mem.Allocator) void {
+        self.stopListener();
+        _ = w.CloseHandle(self.mutex);
+        alloc.destroy(self);
+    }
+};
+
 /// whostty's entry point (called from `main`). The orchestrator for the
 /// multi-window, thread-per-window runtime (#86): build the shared `App`, spawn
 /// the FIRST window (which runs on its own thread exactly like every later one —
@@ -568,12 +720,44 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     defer app.threads.deinit(alloc);
     defer app.windows.deinit(alloc);
 
+    // Single-instance gate (#93). Only consults the config flag; loaded once here
+    // and freed immediately (each window still loads its own). When the flag is
+    // off (the default), nothing below runs and behavior is exactly as before.
+    var single: ?*SingleInstance = null;
+    defer if (single) |s| s.deinit(alloc);
+    if (singleInstanceEnabled(alloc, opts)) {
+        const mutex = w.CreateMutexW(null, w.FALSE, SingleInstance.mutex_name);
+        const already = w.GetLastError() == w.ERROR_ALREADY_EXISTS;
+        if (mutex) |m| {
+            if (already) {
+                // Secondary launch: hand the request to the running primary and
+                // exit without opening a window of our own.
+                _ = w.CloseHandle(m);
+                SingleInstance.signalPrimary();
+                return;
+            }
+            // Primary launch: own the mutex and start the IPC listener. A start
+            // failure is non-fatal — fall back to a normal single-process run.
+            single = SingleInstance.start(alloc, &app, m) catch |e| blk: {
+                log.warn("single-instance: listener start failed ({s}); running standalone", .{@errorName(e)});
+                break :blk null;
+            };
+        }
+    }
+
     // Spawn the first window. If even that fails there is nothing to wait for.
     try app.spawnWindow();
 
     // Block until the live-window count hits 0 (the last window closed). Never
     // returns while a window is alive — the process stays up as long as any
     // window does.
+    app.waitUntilEmpty();
+
+    // Stop the IPC listener BEFORE the final join so no late secondary signal can
+    // spawn a window (and append a thread) during teardown; then drain any window
+    // that the listener spawned just before it stopped (the listener is now dead,
+    // so `live` only decreases) so the thread list is stable for the join.
+    if (single) |s| s.stopListener();
     app.waitUntilEmpty();
 
     // Every window thread has signaled exit; join them so no thread handle leaks
@@ -586,6 +770,14 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // inline run() propagated it to main; the threaded surfaceThread otherwise
     // swallows it after logging). A normal close leaves first_error null.
     if (app.first_error) |e| return e;
+}
+
+/// Read just the `single-instance` config flag for the gate in `run` (#93). The
+/// config is loaded and freed here; each window still parses its own afterward.
+fn singleInstanceEnabled(alloc: std.mem.Allocator, opts: cli.Options) bool {
+    var cfg = loadConfig(alloc, opts.config_text);
+    defer cfg.deinit();
+    return cfg.single_instance;
 }
 
 /// One window, start to finish, on its OWN thread (#86). This is the OLD `run`

@@ -190,6 +190,13 @@ pub const Config = struct {
     /// of all landing on the right/bottom edge (ghostty's `window-padding-balance`).
     window_padding_balance: bool = false,
 
+    /// Route a second launch into the already-running instance (#93): when set,
+    /// starting whostty while it's already running opens a new window in the
+    /// existing process instead of spawning a separate one. Default off, so the
+    /// normal one-process-per-launch behavior is unchanged. Ported from ghostty's
+    /// single-instance behavior (`gtk-single-instance`).
+    single_instance: bool = false,
+
     /// Per-index overrides of the 256-color palette. A `null` entry means
     /// "use libghostty-vt's default for this index". Set via repeated
     /// `palette = <index>=<color>` lines (ghostty syntax).
@@ -288,6 +295,8 @@ pub const Config = struct {
             self.window_padding_y = try std.fmt.parseInt(u16, value, 10);
         } else if (std.mem.eql(u8, key, "window-padding-balance")) {
             self.window_padding_balance = try parseBool(value);
+        } else if (std.mem.eql(u8, key, "single-instance")) {
+            self.single_instance = try parseBool(value);
         } else {
             try self.diag(alloc, "unknown config key: {s}", .{key});
         }
@@ -493,6 +502,17 @@ test "config: window padding parses x/y/balance; defaults to zero/off" {
     try testing.expectEqual(@as(u16, 0), def.window_padding_x);
     try testing.expectEqual(@as(u16, 0), def.window_padding_y);
     try testing.expect(!def.window_padding_balance);
+}
+
+test "config: single-instance parses; defaults off" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "single-instance = true\n");
+    defer cfg.deinit();
+    try testing.expect(cfg.single_instance);
+
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expect(!def.single_instance);
 }
 
 test "config: color overrides default to null; bool flag form is true" {
