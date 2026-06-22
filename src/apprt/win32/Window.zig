@@ -102,6 +102,12 @@ pub const Window = struct {
     /// mashed again) would queue another `.close` and re-prompt after the user
     /// answers; wndProc drops WM_CLOSE while this is set.
     close_pending: bool = false,
+    /// Whether the window is pinned always-on-top (toggle_window_float_on_top,
+    /// #92). The window is created not-topmost.
+    topmost: bool = false,
+    /// Whether the window is currently hidden (toggle_visibility, #92). The
+    /// window is created visible.
+    hidden: bool = false,
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttyWindowClass");
 
@@ -375,6 +381,42 @@ pub const Window = struct {
             w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOZORDER | w.SWP_FRAMECHANGED,
         );
         self.decorations = !self.decorations;
+    }
+
+    /// Bring the window to the foreground and raise it (present_terminal, #92).
+    /// Un-hides it first if it was hidden. The OS foreground lock may refuse the
+    /// focus change cross-process, so this is best-effort (BringWindowToTop +
+    /// SetForegroundWindow), matching ghostty's `present` semantics.
+    pub fn present(self: *Window) void {
+        if (self.hidden) {
+            _ = w.ShowWindow(self.hwnd, w.SW_SHOW);
+            self.hidden = false;
+        }
+        _ = w.BringWindowToTop(self.hwnd);
+        _ = w.SetForegroundWindow(self.hwnd);
+    }
+
+    /// Toggle always-on-top (toggle_window_float_on_top, #92): re-file the window
+    /// at the top of (or out of) the topmost Z-order band without moving, sizing,
+    /// or activating it. Tracks the state so the next toggle reverses it.
+    pub fn toggleFloat(self: *Window) void {
+        const after: w.HWND = if (self.topmost) w.HWND_NOTOPMOST else w.HWND_TOPMOST;
+        _ = w.SetWindowPos(self.hwnd, after, 0, 0, 0, 0, w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOACTIVATE);
+        self.topmost = !self.topmost;
+    }
+
+    /// Show/hide the window (toggle_visibility, #92). Hiding removes it from the
+    /// screen + taskbar (SW_HIDE) without closing it (its shell keeps running);
+    /// showing restores it and brings it forward so it's usable again.
+    pub fn toggleVisibility(self: *Window) void {
+        if (self.hidden) {
+            _ = w.ShowWindow(self.hwnd, w.SW_SHOW);
+            _ = w.SetForegroundWindow(self.hwnd);
+            self.hidden = false;
+        } else {
+            _ = w.ShowWindow(self.hwnd, w.SW_HIDE);
+            self.hidden = true;
+        }
     }
 
     /// Close-confirmation gate (#91), mirroring ghostty's `needsConfirmQuit`

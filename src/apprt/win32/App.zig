@@ -228,6 +228,15 @@ const App = struct {
     /// lifecycle race-free: it guarantees every thread has fully exited before
     /// `App` (which holds the mutex/condition) is destroyed.
     threads: std.ArrayList(std.Thread) = .empty,
+    /// Live top-level windows, registered by each window thread after its window
+    /// is created and unregistered before it is destroyed (both under `mutex`).
+    /// The cross-window lifecycle actions (#92) reach other windows ONLY through
+    /// this list and ONLY via thread-safe Win32 calls (`PostMessageW` to request a
+    /// close, `SetForegroundWindow` to focus) — never by touching another window's
+    /// per-window state. "In the list" implies "not yet destroyed" because the
+    /// owning thread removes itself under the mutex before freeing the `Window`,
+    /// and readers iterate under the same mutex.
+    windows: std.ArrayList(*Window) = .empty,
     /// The first error any window thread hit during startup, captured so `run`
     /// can return a non-zero exit (matching the pre-#86 inline behavior where a
     /// first-window startup failure propagated to `main`). First-writer-wins;
@@ -279,6 +288,53 @@ const App = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.live != 0) self.empty.wait(&self.mutex);
+    }
+
+    /// Track a newly-created window for the cross-window actions (#92). Append
+    /// failure is non-fatal: the window still runs, only the lifecycle actions
+    /// can't reach it (a degraded, not broken, state).
+    fn registerWindow(self: *App, win: *Window) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.windows.append(self.alloc, win) catch {};
+    }
+
+    /// Stop tracking a window just before its `Window` is destroyed. Must run
+    /// (under the mutex) before the owning thread frees the `Window`, so a
+    /// concurrent `quitAll`/`focusWindow` can never observe a freed pointer.
+    fn unregisterWindow(self: *App, win: *Window) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.windows.items, 0..) |x, i| if (x == win) {
+            _ = self.windows.swapRemove(i);
+            break;
+        };
+    }
+
+    /// `quit` (#92): ask every window to close. `PostMessageW` is thread-safe and
+    /// merely queues `WM_CLOSE` on each window's own thread, where it runs through
+    /// the normal close path (close-confirmation included) — we never tear another
+    /// window down from here. Posting to the calling window too is harmless: it
+    /// just queues a `.close` it will process on its next loop turn.
+    fn quitAll(self: *App) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.windows.items) |x| _ = w.PostMessageW(x.handle(), w.WM_CLOSE, 0, 0);
+    }
+
+    /// `goto_window` (#92): bring the Nth (1-based) registered window to the
+    /// foreground, best-effort. Order follows creation order. Out-of-range and 0
+    /// are ignored. Cross-thread `SetForegroundWindow` may be refused by the OS
+    /// foreground lock, so it's paired with `BringWindowToTop`.
+    fn focusWindow(self: *App, index1: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index1 == 0) return;
+        const i: usize = @as(usize, index1) - 1;
+        if (i >= self.windows.items.len) return;
+        const hwnd = self.windows.items[i].handle();
+        _ = w.BringWindowToTop(hwnd);
+        _ = w.SetForegroundWindow(hwnd);
     }
 };
 
@@ -502,6 +558,7 @@ fn toSplitDir(d: binding.Direction) st.Direction {
 pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     var app: App = .{ .alloc = alloc, .opts = opts };
     defer app.threads.deinit(alloc);
+    defer app.windows.deinit(alloc);
 
     // Spawn the first window. If even that fails there is nothing to wait for.
     try app.spawnWindow();
@@ -550,6 +607,11 @@ fn runSurface(app: *App) !void {
     defer alloc.destroy(win);
     try win.init("whostty", 960, 540);
     defer win.deinit();
+    // Register for cross-window actions (#92). The unregister defer is declared
+    // AFTER the destroy/deinit defers so it runs FIRST on teardown (LIFO) — the
+    // window leaves the registry before its `Window` is freed.
+    app.registerWindow(win);
+    defer app.unregisterWindow(win);
     win.makeCurrent();
 
     var renderer = try gl.Renderer.init(alloc, w.wglGetProcAddress);
@@ -1323,6 +1385,34 @@ fn performAction(ws: *WinState, action: apprt.Action) bool {
         },
         .toggle_window_decorations => {
             ws.win.toggleDecorations();
+            return true;
+        },
+
+        // --- App-lifecycle + windowing actions (#92) ---
+        .quit => {
+            ws.app.quitAll();
+            return true;
+        },
+        // Close THIS whole window (every tab/pane), vs. close_surface's one pane.
+        // The teardown defer frees all the panes; the loop breaks next turn.
+        .close_window => {
+            ws.close_requested = true;
+            return true;
+        },
+        .goto_window => |n| {
+            ws.app.focusWindow(n);
+            return true;
+        },
+        .present_terminal => {
+            ws.win.present();
+            return true;
+        },
+        .toggle_window_float_on_top => {
+            ws.win.toggleFloat();
+            return true;
+        },
+        .toggle_visibility => {
+            ws.win.toggleVisibility();
             return true;
         },
     }

@@ -349,6 +349,14 @@ pub const SW_SHOW: INT = 5;
 pub const SW_SHOWNORMAL: INT = 1;
 pub const SW_MAXIMIZE: INT = 3;
 pub const SW_RESTORE: INT = 9;
+/// ShowWindow SW_HIDE for the show/hide (toggle_visibility) action (#92).
+pub const SW_HIDE: INT = 0;
+
+/// SetWindowPos special hWndInsertAfter values for the float-on-top toggle (#92):
+/// HWND_TOPMOST ((HWND)-1) makes the window always-on-top; HWND_NOTOPMOST
+/// ((HWND)-2) clears that and re-files it below the topmost band.
+pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+pub const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 
 /// GetWindowLongPtrW/SetWindowLongPtrW indices (#91).
 pub const GWL_STYLE: INT = -16;
@@ -504,6 +512,15 @@ pub extern "user32" fn MessageBoxW(
     lpCaption: [*:0]const u16,
     uType: UINT,
 ) callconv(.winapi) INT;
+
+// --- App-lifecycle + windowing actions (#92) ---------------------------------
+// Bring a window to the foreground (present_terminal / show) and raise it in the
+// Z-order. SetForegroundWindow may be refused cross-thread by the OS foreground
+// lock (a focus-stealing guard), so callers pair it with BringWindowToTop and
+// treat both as best-effort.
+pub extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn BringWindowToTop(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 
 // --- Window flash (visual bell) ------------------------------------------------
 pub const FLASHW_STOP: DWORD = 0;
