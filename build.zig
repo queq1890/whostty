@@ -26,8 +26,23 @@ pub fn build(b: *std.Build) void {
         "Build the Freetype glyph rasterizer (fetches freetype source)",
     ) orelse false;
 
+    // HarfBuzz text shaping (#79): ligatures, contextual alternates, complex /
+    // RTL scripts, `font-feature` toggles. Built from the HarfBuzz amalgam and
+    // linked when enabled. Shaping needs an `hb_font` wrapping the Freetype face,
+    // so it requires -Dfreetype. (The `shape-proof` step builds HarfBuzz on its
+    // own, without Freetype, via the font-blob path.)
+    const enable_harfbuzz = b.option(
+        bool,
+        "harfbuzz",
+        "Build HarfBuzz text shaping (#79); requires -Dfreetype",
+    ) orelse false;
+    if (enable_harfbuzz and !enable_freetype) {
+        std.debug.panic("-Dharfbuzz requires -Dfreetype (the shaper builds an hb_font from the Freetype face)", .{});
+    }
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "freetype", enable_freetype);
+    build_options.addOption(bool, "harfbuzz", enable_harfbuzz);
 
     const exe = b.addExecutable(.{
         .name = "whostty",
@@ -58,6 +73,9 @@ pub fn build(b: *std.Build) void {
             // The module only provides the Zig bindings; link the compiled
             // freetype C library so the FT_* symbols resolve.
             exe.root_module.linkLibrary(dep.artifact("freetype"));
+            // Shaping rides on the Freetype face: build + link HarfBuzz with the
+            // FreeType glyph functions so the shaper can build an hb_font (#79).
+            if (enable_harfbuzz) _ = linkHarfbuzz(b, exe.root_module, target, optimize, dep);
         }
     }
     b.installArtifact(exe);
@@ -99,4 +117,84 @@ pub fn build(b: *std.Build) void {
         const off_run = b.addRunArtifact(offscreen);
         off_step.dependOn(&off_run.step);
     }
+
+    // Standalone HarfBuzz shaping proof (#79): drives the real `font/harfbuzz.zig`
+    // binding + `Shaper` against a real font and asserts ligatures form + feature
+    // toggles take effect. It loads the font via a blob (no Freetype) and only
+    // links HarfBuzz, so unlike the GL offscreen proof it builds AND runs in this
+    // environment. Pass a ligature font: `zig build shape-proof -- <font.ttf>`.
+    const shape_proof = b.addExecutable(.{
+        .name = "shape-proof",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shape_proof.zig"),
+            .target = native_target,
+            .optimize = optimize,
+        }),
+    });
+    shape_proof.root_module.link_libc = true;
+    const shape_step = b.step("shape-proof", "Standalone HarfBuzz shaping proof (#79)");
+    if (linkHarfbuzz(b, shape_proof.root_module, native_target, optimize, null)) {
+        const shape_run = b.addRunArtifact(shape_proof);
+        if (b.args) |args| shape_run.addArgs(args);
+        shape_step.dependOn(&shape_run.step);
+    }
+}
+
+/// Build HarfBuzz from its amalgam (`src/harfbuzz.cc`) as a static library and
+/// link it into `mod`. When `freetype_dep` is non-null, HarfBuzz is built with
+/// the FreeType glyph functions (the renderer path); when null, it uses its own
+/// OpenType glyph functions (the `shape-proof` path — no FreeType needed).
+/// Returns false if the (lazy) HarfBuzz source isn't fetched yet, so the caller
+/// can skip wiring the run step until Zig refetches.
+fn linkHarfbuzz(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    freetype_dep: ?*std.Build.Dependency,
+) bool {
+    const upstream = b.lazyDependency("harfbuzz", .{}) orelse return false;
+
+    const lib = b.addLibrary(.{
+        .name = "harfbuzz",
+        .linkage = .static,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
+    });
+    lib.linkLibC();
+    lib.linkLibCpp();
+
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(b.allocator);
+    flags.appendSlice(b.allocator, &.{"-DHAVE_STDBOOL_H"}) catch @panic("OOM");
+    if (target.result.os.tag != .windows) {
+        flags.appendSlice(b.allocator, &.{
+            "-DHAVE_UNISTD_H",
+            "-DHAVE_SYS_MMAN_H",
+            "-DHAVE_PTHREAD=1",
+        }) catch @panic("OOM");
+    }
+
+    if (freetype_dep) |ft| {
+        flags.appendSlice(b.allocator, &.{
+            "-DHAVE_FREETYPE=1",
+            // Assume a recent Freetype (the pinned one is 2.14.x).
+            "-DHAVE_FT_GET_VAR_BLEND_COORDINATES=1",
+            "-DHAVE_FT_SET_VAR_BLEND_COORDINATES=1",
+            "-DHAVE_FT_DONE_MM_VAR=1",
+            "-DHAVE_FT_GET_TRANSFORM=1",
+        }) catch @panic("OOM");
+        // Link the compiled Freetype and put its headers on HarfBuzz's include
+        // path so `hb-ft.cc` finds <ft2build.h>.
+        lib.linkLibrary(ft.artifact("freetype"));
+        lib.addIncludePath(ft.builder.dependency("freetype", .{}).path("include"));
+    }
+
+    lib.addIncludePath(upstream.path("src"));
+    lib.addCSourceFile(.{
+        .file = upstream.path("src/harfbuzz.cc"),
+        .flags = flags.items,
+    });
+
+    mod.linkLibrary(lib);
+    return true;
 }
