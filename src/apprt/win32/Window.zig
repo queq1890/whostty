@@ -58,6 +58,11 @@ pub const Event = union(enum) {
     mouse_capture_lost,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
+    /// The window moved to a monitor with a different DPI (WM_DPICHANGED, #90),
+    /// carrying the new DPI. The window proc already applied the OS-suggested
+    /// rect (which fires a `.resize`); the app rebuilds the glyph atlas + cell
+    /// metrics at the new scale.
+    dpi_changed: u32,
     /// The window gained (true) or lost (false) keyboard focus. Drives the
     /// hollow-when-unfocused cursor.
     focus: bool,
@@ -134,6 +139,22 @@ pub const Window = struct {
     var register_class_once = std.once(registerClassOnce);
     var register_ok: bool = false;
 
+    /// Per-monitor-DPI-v2 must be set process-wide BEFORE any window is created
+    /// (#90), so it runs once from `init` ahead of class registration. Best-effort:
+    /// on an OS without the API the window stays system-DPI-scaled.
+    var dpi_aware_once = std.once(setProcessDpiAware);
+
+    fn setProcessDpiAware() void {
+        _ = w.SetProcessDpiAwarenessContext(w.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    /// The DPI of the monitor this window is on (#90); 96 (scale 1.0) if the OS
+    /// can't report it.
+    pub fn dpiForWindow(self: *Window) u32 {
+        const d = w.GetDpiForWindow(self.hwnd);
+        return if (d == 0) w.USER_DEFAULT_SCREEN_DPI else d;
+    }
+
     fn registerClassOnce() void {
         const hinstance = w.GetModuleHandleW(null).?;
         const wc: w.WNDCLASSEXW = .{
@@ -163,6 +184,10 @@ pub const Window = struct {
         self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined };
 
         const hinstance = w.GetModuleHandleW(null).?;
+
+        // Opt into per-monitor DPI awareness (#90) before creating any window so
+        // WM_DPICHANGED is delivered and GetDpiForWindow reports the real DPI.
+        dpi_aware_once.call();
 
         // Register the window class once per process (thread-safe via std.once);
         // every window after the first reuses the already-registered class.
@@ -596,6 +621,29 @@ pub const Window = struct {
                     const width: u16 = @truncate(@as(usize, @bitCast(lparam)) & 0xFFFF);
                     const height: u16 = @truncate((@as(usize, @bitCast(lparam)) >> 16) & 0xFFFF);
                     s.push(.{ .resize = .{ .width = width, .height = height } });
+                }
+                return 0;
+            },
+            w.WM_DPICHANGED => {
+                if (self) |s| {
+                    // wParam LOWORD = the new DPI (X and Y are equal here).
+                    const new_dpi: u32 = @as(u16, @truncate(wparam & 0xFFFF));
+                    // Queue the rebuild BEFORE applying the suggested rect, so the
+                    // app updates cell metrics before the `.resize` that the move
+                    // generates re-grids the panes with them.
+                    s.push(.{ .dpi_changed = new_dpi });
+                    // lParam points at the OS-suggested window rect for the new DPI
+                    // (position + size); apply it so the window scales to match.
+                    const r: *const w.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    _ = w.SetWindowPos(
+                        hwnd,
+                        null,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        w.SWP_NOZORDER | w.SWP_NOACTIVATE,
+                    );
                 }
                 return 0;
             },

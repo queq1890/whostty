@@ -156,6 +156,14 @@ fn cfgColor(c: ?config.Color) ?[3]f32 {
     return if (c) |x| rgbf(toVtRgb(x)) else null;
 }
 
+/// Glyph pixel size for a point size at a given monitor DPI (#90). At 96 DPI this
+/// is the point value unchanged (the pre-DPI behavior, so no regression on a
+/// standard monitor); a HiDPI monitor scales it up so glyphs stay crisp. Clamped
+/// to >= 1 px.
+fn fontPx(size_pt: f32, dpi: u32) u32 {
+    return @intFromFloat(@max(1, @round(size_pt * @as(f32, @floatFromInt(dpi)) / 96.0)));
+}
+
 /// Per-frame cursor inputs the renderer needs that don't live in the VT state:
 /// window focus, the blink phase, and the configured cursor colors/opacity. The
 /// VT-owned state (position, DECTCEM, blink mode, style) is read in `buildQuads`.
@@ -665,8 +673,11 @@ fn runSurface(app: *App) !void {
         break :blk primary_path_buf.?;
     } else default_font_path;
 
+    // DPI-aware sizing (#90): open the face at the point size scaled by the
+    // window's monitor DPI, so HiDPI displays get crisp glyphs. WM_DPICHANGED
+    // rebuilds the cache at the new scale (handled in the event loop).
     var cache: GlyphCache = if (ft)
-        try GlyphCache.init(alloc, primary_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
+        try GlyphCache.init(alloc, primary_path, fontPx(cfg.font_size, win.dpiForWindow()), atlas_size)
     else {};
     defer if (ft) cache.deinit();
 
@@ -784,9 +795,9 @@ fn runSurface(app: *App) !void {
     const blink_interval_ns: u64 = 600 * std.time.ns_per_ms;
     var blink_timer: ?std.time.Timer = std.time.Timer.start() catch null;
     // The cursor's fill color lives in `terminal.colors.cursor` (seeded from
-    // config, overridable by OSC 12), read per-frame in buildQuads. The text
-    // color and thickness are constant for the run; focus + blink vary per frame.
-    const cursor_thickness: u32 = @max(1, cell_h / 10);
+    // config, overridable by OSC 12), read per-frame in buildQuads. The thickness
+    // is derived from `cell_h` at the cursor render below so it tracks a DPI
+    // rebuild (#90); focus + blink vary per frame.
     const cursor_text = cfgColor(cfg.cursor_text);
 
     // --- Frame pacing (#72) ---
@@ -938,6 +949,48 @@ fn runSurface(app: *App) !void {
                 },
                 // Re-grid every pane in the active tab to the new client size.
                 .resize => |_| ws.layoutActive(),
+                // The window moved to a different-DPI monitor (#90). The window
+                // proc already applied the suggested rect (which queued a
+                // `.resize`); rebuild the glyph cache + shaper + cell metrics at
+                // the new scale so glyphs stay crisp, then re-grid with them.
+                .dpi_changed => |new_dpi| {
+                    if (ft) {
+                        const new_px = fontPx(cfg.font_size, new_dpi);
+                        if (new_px != cache.px) {
+                            if (GlyphCache.init(alloc, primary_path, new_px, atlas_size)) |new_cache| {
+                                // Drop the shaper FIRST (its hb_font references the
+                                // old face), then the old cache, before swapping in
+                                // the new one — order keeps the face valid until no
+                                // one holds it.
+                                if (hb) {
+                                    if (text_shaper) |*s| s.deinit();
+                                    text_shaper = null;
+                                }
+                                cache.deinit();
+                                cache = new_cache;
+                                for (default_fallback_fonts) |fb| cache.addFallback(fb);
+                                cell_w = cache.cell_w;
+                                cell_h = cache.cell_h;
+                                ascent = cache.ascent;
+                                ws.cell_w = cell_w;
+                                ws.cell_h = cell_h;
+                                renderer.setAtlas(cache.atlas.data, cache.atlas.size);
+                                if (hb) {
+                                    if (cache.primaryFaceHandle()) |fh| {
+                                        if (harfbuzz.Font.initFreetype(fh)) |hbfont| {
+                                            text_shaper = harfbuzz.Shaper.init(alloc, hbfont, cfg.font_features.items) catch null;
+                                        } else |err| log.warn("dpi: harfbuzz re-init failed ({s})", .{@errorName(err)});
+                                    }
+                                }
+                                // Re-grid with the new metrics (the suggested-rect
+                                // `.resize` laid out with the old cell size).
+                                ws.layoutActive();
+                            } else |err| {
+                                log.warn("dpi: glyph cache rebuild failed ({s}); keeping size", .{@errorName(err)});
+                            }
+                        }
+                    }
+                },
                 .focus => |f| {
                     // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
                     // can't emit a duplicate report.
@@ -1064,7 +1117,8 @@ fn runSurface(app: *App) !void {
                 .blink_visible = blink_visible,
                 .text = cursor_text,
                 .opacity = cfg.cursor_opacity,
-                .thickness = cursor_thickness,
+                // Derived from the current cell height so it tracks a DPI rebuild.
+                .thickness = @max(1, cell_h / 10),
             };
             try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render, &text_shaper);
             // Per-pane scrollbar within the pane's rect.

@@ -513,6 +513,30 @@ pub extern "user32" fn MessageBoxW(
     uType: UINT,
 ) callconv(.winapi) INT;
 
+// --- Per-monitor DPI awareness (#90) ------------------------------------------
+// Opt into per-monitor-DPI-v2 so the OS sends WM_DPICHANGED (instead of bitmap-
+// stretching the window) when it moves to a different-DPI monitor; then rebuild
+// the glyph atlas at the new scale so text stays crisp.
+
+/// A DPI_AWARENESS_CONTEXT is an opaque pseudo-handle; the v2 per-monitor value
+/// is the sentinel (DPI_AWARENESS_CONTEXT)-4.
+pub const DPI_AWARENESS_CONTEXT = HANDLE;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
+    @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
+
+/// 96 DPI = scale 1.0 (the unscaled baseline).
+pub const USER_DEFAULT_SCREEN_DPI: UINT = 96;
+
+pub const WM_DPICHANGED: UINT = 0x02E0;
+
+/// Set the process DPI awareness. Available on Windows 10 1607+ (whostty already
+/// requires Win10 for ConPTY). Best-effort: a false return (already set, or older
+/// OS) leaves the window system-DPI-scaled, which still runs.
+pub extern "user32" fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
+/// The DPI of the monitor a window is on (per-monitor-aware processes); 0 on
+/// failure, which the caller treats as the 96 baseline.
+pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
+
 // --- App-lifecycle + windowing actions (#92) ---------------------------------
 // Bring a window to the foreground (present_terminal / show) and raise it in the
 // Z-order. SetForegroundWindow may be refused cross-thread by the OS foreground
