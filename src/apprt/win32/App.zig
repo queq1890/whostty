@@ -738,10 +738,11 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
             }
             // Primary launch: own the mutex and start the IPC listener. A start
             // failure is non-fatal — fall back to a normal single-process run.
-            single = SingleInstance.start(alloc, &app, m) catch |e| blk: {
+            if (SingleInstance.start(alloc, &app, m)) |s| {
+                single = s;
+            } else |e| {
                 log.warn("single-instance: listener start failed ({s}); running standalone", .{@errorName(e)});
-                break :blk null;
-            };
+            }
         }
     }
 
