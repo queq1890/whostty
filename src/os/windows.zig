@@ -597,6 +597,54 @@ pub extern "user32" fn ToUnicodeEx(
     dwhkl: ?HKL,
 ) callconv(.winapi) INT;
 
+// --- IME: composition + candidate window placement (imm32, #88) --------------
+// Compose CJK / dead-key / accented input. We let the OS IME draw its own
+// composition + candidate UI, but pin those windows to the caret and capture
+// the committed result string to feed to the pty.
+
+/// Input-method context handle (HIMC).
+pub const HIMC = HANDLE;
+
+pub const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+pub const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+pub const WM_IME_COMPOSITION: UINT = 0x010F;
+
+/// ImmGetCompositionStringW dwIndex: the committed result vs. the in-progress
+/// composition string.
+pub const GCS_RESULTSTR: DWORD = 0x0800;
+pub const GCS_COMPSTR: DWORD = 0x0008;
+
+/// Composition/candidate form styles: pin the window to an exact client point.
+pub const CFS_POINT: DWORD = 0x0002;
+pub const CFS_CANDIDATEPOS: DWORD = 0x0040;
+
+pub const COMPOSITIONFORM = extern struct {
+    dwStyle: DWORD,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
+pub const CANDIDATEFORM = extern struct {
+    dwIndex: DWORD,
+    dwStyle: DWORD,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
+pub extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?HIMC;
+pub extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.winapi) BOOL;
+/// Copy a composition/result string. With `lpBuf == null` / `dwBufLen == 0` it
+/// returns the byte size needed; otherwise it writes up to `dwBufLen` bytes of
+/// UTF-16 and returns the bytes copied (negative on error).
+pub extern "imm32" fn ImmGetCompositionStringW(
+    hIMC: HIMC,
+    dwIndex: DWORD,
+    lpBuf: ?*anyopaque,
+    dwBufLen: DWORD,
+) callconv(.winapi) LONG;
+pub extern "imm32" fn ImmSetCompositionWindow(hIMC: HIMC, lpCompForm: *const COMPOSITIONFORM) callconv(.winapi) BOOL;
+pub extern "imm32" fn ImmSetCandidateWindow(hIMC: HIMC, lpCandidate: *const CANDIDATEFORM) callconv(.winapi) BOOL;
+
 // --- gdi32 -----------------------------------------------------------------
 
 pub extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) INT;

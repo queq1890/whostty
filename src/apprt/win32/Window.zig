@@ -108,6 +108,10 @@ pub const Window = struct {
     /// Whether the window is currently hidden (toggle_visibility, #92). The
     /// window is created visible.
     hidden: bool = false,
+    /// Caret pixel (client coords) the IME composition + candidate windows are
+    /// pinned to (#88). The app refreshes it each loop turn from the focused
+    /// pane's cursor; the composition messages read it when the IME opens.
+    ime_pos: w.POINT = .{ .x = 0, .y = 0 },
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttyWindowClass");
 
@@ -419,6 +423,49 @@ pub const Window = struct {
         }
     }
 
+    /// Update where the IME composition/candidate windows appear (#88). The app
+    /// passes the focused pane's caret pixel each loop turn so the candidate list
+    /// tracks the cursor; the value is read when composition starts/updates.
+    pub fn setImePosition(self: *Window, x: i32, y: i32) void {
+        self.ime_pos = .{ .x = x, .y = y };
+    }
+
+    /// Pin the IME composition + candidate windows to the caret (`ime_pos`) so
+    /// they open at the cursor, not the window's top-left (#88). Best-effort: no
+    /// IME context (no IME active for this window) is a clean no-op.
+    fn placeImeWindows(self: *Window) void {
+        const himc = w.ImmGetContext(self.hwnd) orelse return;
+        defer _ = w.ImmReleaseContext(self.hwnd, himc);
+        const comp: w.COMPOSITIONFORM = .{
+            .dwStyle = w.CFS_POINT,
+            .ptCurrentPos = self.ime_pos,
+            .rcArea = std.mem.zeroes(w.RECT),
+        };
+        _ = w.ImmSetCompositionWindow(himc, &comp);
+        const cand: w.CANDIDATEFORM = .{
+            .dwIndex = 0,
+            .dwStyle = w.CFS_CANDIDATEPOS,
+            .ptCurrentPos = self.ime_pos,
+            .rcArea = std.mem.zeroes(w.RECT),
+        };
+        _ = w.ImmSetCandidateWindow(himc, &cand);
+    }
+
+    /// Read the committed IME result string and queue it as `.char` events (#88),
+    /// reusing the same text path as a typed key. Bounded by a fixed UTF-16
+    /// scratch (commit strings are short); an over-long result is truncated on a
+    /// unit boundary rather than overflowing (the #89 stack-overflow precedent).
+    fn pushImeResult(self: *Window) void {
+        const himc = w.ImmGetContext(self.hwnd) orelse return;
+        defer _ = w.ImmReleaseContext(self.hwnd, himc);
+        var buf: [256]u16 = undefined;
+        const bytes = w.ImmGetCompositionStringW(himc, w.GCS_RESULTSTR, &buf, @sizeOf(@TypeOf(buf)));
+        if (bytes <= 0) return;
+        const units: usize = @min(@as(usize, @intCast(bytes)) / 2, buf.len);
+        var it = std.unicode.Utf16LeIterator.init(buf[0..units]);
+        while (it.nextCodepoint() catch null) |cp| self.push(.{ .char = @intCast(cp) });
+    }
+
     /// Close-confirmation gate (#91), mirroring ghostty's `needsConfirmQuit`
     /// semantics for the `.true` default: prompt ONLY when a foreground command
     /// is running, i.e. the shell has a live child process. Returns true if the
@@ -698,6 +745,27 @@ pub const Window = struct {
                     s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y } });
                 }
                 return 0;
+            },
+            w.WM_IME_STARTCOMPOSITION => {
+                // Open the IME's own composition + candidate UI at the caret, then
+                // let DefWindowProc run that default UI.
+                if (self) |s| s.placeImeWindows();
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+            w.WM_IME_COMPOSITION => {
+                if (self) |s| {
+                    s.placeImeWindows();
+                    // A committed result: feed it to the pty and CONSUME the
+                    // message so DefWindowProc doesn't also deliver it as
+                    // WM_IME_CHAR/WM_CHAR (which would double the input).
+                    if ((@as(usize, @bitCast(lparam)) & @as(usize, w.GCS_RESULTSTR)) != 0) {
+                        s.pushImeResult();
+                        return 0;
+                    }
+                }
+                // In-progress composition (GCS_COMPSTR / caret move): let the
+                // default IME composition window draw it at the pinned caret.
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
             },
             else => return w.DefWindowProcW(hwnd, msg, wparam, lparam),
         }

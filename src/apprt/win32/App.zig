@@ -992,6 +992,16 @@ fn runSurface(app: *App) !void {
             }
         }
 
+        // Pin the IME composition/candidate window to the focused pane's caret
+        // (#88) so CJK / dead-key composition opens at the cursor. Refreshed every
+        // loop turn (cheap) so it is current whenever the IME opens.
+        if (ws.focusedPane()) |p| {
+            if (p.io.cursorViewport()) |cur| win.setImePosition(
+                @intCast(p.sfc.origin_x + cur.x * cell_w),
+                @intCast(p.sfc.origin_y + cur.y * cell_h),
+            );
+        }
+
         const sz = win.clientSize();
         const blink_elapsed: u64 = if (blink_timer) |*t| t.read() else 0;
         const blink_visible = if (blink_timer != null)
