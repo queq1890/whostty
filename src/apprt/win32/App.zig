@@ -30,6 +30,13 @@ const w = @import("../../os/windows.zig");
 /// exactly as before.
 const ft = build_options.freetype;
 const GlyphCache = if (ft) @import("../../font/GlyphCache.zig") else void;
+/// Whether HarfBuzz text shaping is compiled in (#79). When true, rows are
+/// segmented into runs and shaped (ligatures, contextual alternates, font
+/// features) before drawing; when false the renderer draws one glyph per cell as
+/// before. Requires `ft` (the shaper builds an hb_font from the Freetype face).
+const hb = build_options.harfbuzz;
+const shaper = @import("../../font/shaper.zig");
+const harfbuzz = if (hb) @import("../../font/harfbuzz.zig") else struct {};
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
@@ -617,6 +624,23 @@ fn runSurface(app: *App) !void {
         renderer.setAtlas(cache.atlas.data, cache.atlas.size);
     }
 
+    // HarfBuzz shaper (#79): built once from the primary face and reused every
+    // frame. Best-effort — if HarfBuzz isn't compiled in, the primary face is
+    // missing, or construction fails, `text_shaper` stays null and the renderer
+    // draws one glyph per cell as before. The address is always passed to
+    // `buildQuads` (which ignores it unless `hb`).
+    var text_shaper: if (hb) ?harfbuzz.Shaper else void = if (hb) null else {};
+    defer if (hb) {
+        if (text_shaper) |*s| s.deinit();
+    };
+    if (hb) {
+        if (cache.primaryFaceHandle()) |fh| {
+            if (harfbuzz.Font.initFreetype(fh)) |hbfont| {
+                text_shaper = harfbuzz.Shaper.init(alloc, hbfont, cfg.font_features.items) catch null;
+            } else |err| log.warn("harfbuzz font init failed ({s}); shaping disabled", .{@errorName(err)});
+        }
+    }
+
     // --- Initial grid from the client size, honoring window padding (#71) ---
     const pad: surface.Padding = .{
         .x = cfg.window_padding_x,
@@ -970,7 +994,7 @@ fn runSurface(app: *App) !void {
                 .opacity = cfg.cursor_opacity,
                 .thickness = cursor_thickness,
             };
-            try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render);
+            try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render, &text_shaper);
             // Per-pane scrollbar within the pane's rect.
             appendScrollbar(alloc, &quads, pane.io.scrollbar(), pl.rect, cell_w, theme.fg) catch {};
         }
@@ -1551,6 +1575,15 @@ fn appendTabBar(
     }
 }
 
+/// Per-column shaping result for a row (#79): fall back to the per-codepoint
+/// glyph (`unshaped`); draw nothing because a ligature merged this cell into a
+/// neighbor (`blank`); or draw a specific shaped glyph.
+const ShapedSlot = union(enum) {
+    unshaped,
+    blank,
+    glyph: shaper.ShapedGlyph,
+};
+
 /// Translate the terminal viewport into renderable quads, honoring SGR colors
 /// and attributes (#12): per-cell foreground/background colors (default, 256
 /// palette, or truecolor), inverse video, and the underline / strikethrough /
@@ -1579,6 +1612,10 @@ fn buildQuads(
     origin_y: u32,
     theme: *const Theme,
     cursor_render: CursorRender,
+    /// Pointer to the optional HarfBuzz shaper (`*?harfbuzz.Shaper`), or `*void`
+    /// in non-shaping builds. Only dereferenced under `hb`; shaping is applied
+    /// per row to form ligatures / contextual alternates / font features (#79).
+    shaper_opt: anytype,
 ) !void {
     // The caller clears `quads` once per frame and then calls this for every pane
     // in the active tab, so each pane's quads accumulate into one draw (#87).
@@ -1608,8 +1645,70 @@ fn buildQuads(
     const line_h: u32 = @max(1, cell_h / 16);
     const ascent_i: i32 = @intCast(ascent);
 
+    // Shaped-text scratch (#79): when shaping is active, each row is segmented
+    // into runs and shaped with the primary face, filling `row_slot[col]` with
+    // how to draw that column. Allocated once (grid width) and reused across
+    // rows; on allocation failure shaping is skipped and the per-cell path draws.
+    var row_cells: []shaper.Cell = &.{};
+    var row_slot: []ShapedSlot = &.{};
+    var shaping_ready = false;
+    if (hb) {
+        if (shaper_opt.* != null and cols > 0) {
+            if (alloc.alloc(shaper.Cell, cols)) |rc| {
+                if (alloc.alloc(ShapedSlot, cols)) |rs| {
+                    row_cells = rc;
+                    row_slot = rs;
+                    shaping_ready = true;
+                } else |_| alloc.free(rc);
+            } else |_| {}
+        }
+    }
+    defer {
+        if (row_cells.len > 0) alloc.free(row_cells);
+        if (row_slot.len > 0) alloc.free(row_slot);
+    }
+
     var row: u32 = 0;
     while (row < rows) : (row += 1) {
+        // Shape this row first (#79): build the run cells from the grid, segment
+        // into runs, and shape each with the primary face. Cells the primary face
+        // lacks shape to glyph 0 and stay `unshaped` (the per-codepoint path then
+        // renders them via fallback); cells a ligature merges into a neighbor
+        // become `blank`.
+        if (hb and shaping_ready) {
+            var c: u32 = 0;
+            while (c < cols) : (c += 1) {
+                const rcp: u21 = if (screen.pages.getCell(.{ .viewport = .{
+                    .x = @intCast(c),
+                    .y = @intCast(row),
+                } })) |x| x.cell.codepoint() else 0;
+                // Empty cells (including wide-char spacer tails) carry no glyph of
+                // their own; mark them spacer tails so they extend, not split, a
+                // run and are not added to the shaping buffer.
+                row_cells[c] = .{ .codepoint = rcp, .width = if (rcp == 0) .spacer_tail else .narrow };
+                row_slot[c] = .unshaped;
+            }
+            if (shaper_opt.*) |*s| {
+                var it = shaper.RunIterator.init(row_cells[0..cols]);
+                while (it.next()) |text_run| {
+                    const glyphs = s.shape(text_run, row_cells[0..cols]) catch continue;
+                    for (glyphs, 0..) |g, gi| {
+                        const start_col = text_run.column(g.cluster);
+                        if (start_col >= cols) continue;
+                        if (g.glyph_index != 0) row_slot[start_col] = .{ .glyph = g };
+                        // Columns from this glyph's cluster to the next glyph's are
+                        // covered by it (a multi-cell ligature) — draw nothing.
+                        const next_cluster: usize = if (gi + 1 < glyphs.len) glyphs[gi + 1].cluster else text_run.len;
+                        var cc: usize = @as(usize, g.cluster) + 1;
+                        while (cc < next_cluster) : (cc += 1) {
+                            const colx = text_run.start + cc;
+                            if (colx < cols and row_cells[colx].width != .spacer_tail) row_slot[colx] = .blank;
+                        }
+                    }
+                }
+            }
+        }
+
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
             const gc = screen.pages.getCell(.{ .viewport = .{
@@ -1672,31 +1771,56 @@ fn buildQuads(
                 .b = c[2],
             } });
 
-            // Foreground glyph (invisible attribute suppresses it). The glyph is
-            // rasterized on demand and packed into the atlas the first time its
-            // codepoint is seen. Faint/dim (SGR 2) text is drawn at reduced
-            // opacity via the per-quad alpha.
+            // Foreground glyph (invisible attribute suppresses it). Faint/dim
+            // (SGR 2) text is drawn at reduced opacity via the per-quad alpha.
+            // With shaping active (#79) the column may carry a shaped glyph (drawn
+            // by glyph index, with the shaper's sub-cell offset) or be blank
+            // because a ligature merged it into a neighbor; otherwise the glyph is
+            // rasterized on demand from the cell's codepoint as before.
             if (ft and !style.flags.invisible) {
-                const cp = cell.codepoint();
-                if (cp >= first_drawable) {
-                    if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
-                        const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
-                        const gcell: gl.Cell = .{
-                            .px = cell_x + gi.bearing_x,
-                            .py = cell_y + ascent_i - gi.bearing_y,
-                            .sx = gi.region.x,
-                            .sy = gi.region.y,
-                            .sw = gi.region.width,
-                            .sh = gi.region.height,
-                            .r = fg[0],
-                            .g = fg[1],
-                            .b = fg[2],
-                            .a = glyph_alpha,
-                        };
-                        // Color glyphs (emoji, #78) come from the RGBA atlas and
-                        // are drawn untinted; everything else is alpha-tinted.
-                        try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
-                    }
+                const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
+                const slot: ShapedSlot = if (hb and shaping_ready) row_slot[col] else .unshaped;
+                switch (slot) {
+                    // A ligature drew over this column from its starting cell.
+                    .blank => {},
+                    .glyph => |sg| {
+                        if (cache.getByIndex(sg.glyph_index, style.flags.bold, style.flags.italic)) |gi| {
+                            try quads.append(alloc, .{ .glyph = .{
+                                .px = cell_x + gi.bearing_x + sg.x_offset,
+                                .py = cell_y + ascent_i - gi.bearing_y - sg.y_offset,
+                                .sx = gi.region.x,
+                                .sy = gi.region.y,
+                                .sw = gi.region.width,
+                                .sh = gi.region.height,
+                                .r = fg[0],
+                                .g = fg[1],
+                                .b = fg[2],
+                                .a = glyph_alpha,
+                            } });
+                        }
+                    },
+                    .unshaped => {
+                        const cp = cell.codepoint();
+                        if (cp >= first_drawable) {
+                            if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
+                                const gcell: gl.Cell = .{
+                                    .px = cell_x + gi.bearing_x,
+                                    .py = cell_y + ascent_i - gi.bearing_y,
+                                    .sx = gi.region.x,
+                                    .sy = gi.region.y,
+                                    .sw = gi.region.width,
+                                    .sh = gi.region.height,
+                                    .r = fg[0],
+                                    .g = fg[1],
+                                    .b = fg[2],
+                                    .a = glyph_alpha,
+                                };
+                                // Color glyphs (emoji, #78) come from the RGBA atlas
+                                // and are drawn untinted; everything else is tinted.
+                                try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
+                            }
+                        }
+                    },
                 }
             }
 

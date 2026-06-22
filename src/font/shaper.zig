@@ -1,16 +1,17 @@
-//! whostty: text shaping — run segmentation now, Harfbuzz shaping seamed.
+//! whostty: text shaping — run segmentation + the pure shaping types.
 //!
 //! Reference: ghostty `src/font/shaper/` — `run.zig` (the `RunIterator` that
 //! groups a row's cells into shapable runs) and `harfbuzz.zig` (the shaper that
-//! turns a run into positioned glyphs). Strategy: port. The run iterator is
-//! portable logic and is ported + host-tested here; the Harfbuzz binding is a
-//! build dependency that can't be added or verified without compiling, so it is
-//! seamed (see `Shaper.shape`). See PORTING.md.
+//! turns a run into positioned glyphs). Strategy: port. The run iterator and the
+//! feature grammar are portable logic and are ported + host-tested here; the
+//! HarfBuzz `Shaper` itself lives in `harfbuzz.zig` (it links the HarfBuzz C
+//! library and is only compiled under `-Dharfbuzz`) and consumes these types.
+//! See PORTING.md.
 //!
-//! Run segmentation is the prerequisite for shaping: the renderer currently
-//! draws one glyph per cell (no ligatures/complex text). Shaping replaces the
-//! per-run cells with a shaped glyph sequence; before that can happen the row
-//! must be split into runs that share a font/style so Harfbuzz can shape each.
+//! Run segmentation is the prerequisite for shaping: without it the renderer
+//! draws one glyph per cell (no ligatures/complex text). Shaping replaces a
+//! run's cells with a shaped glyph sequence; before that can happen the row must
+//! be split into runs that share a font/style so HarfBuzz can shape each.
 //!
 //! This module is free of the `freetype`/`harfbuzz` imports and of any platform
 //! types, so it compiles and unit-tests on the host.
@@ -146,37 +147,11 @@ pub const ShapedGlyph = struct {
     y_offset: i32 = 0,
 };
 
-/// The Harfbuzz shaper seam. Shaping a run requires an `hb_font_t` wrapping the
-/// Freetype face plus the Harfbuzz library, both build dependencies. The call
-/// shape is:
-///
-///   hb_buffer_reset(buf)
-///   hb_buffer_add_utf32(buf, run codepoints, ...)  // or add per cluster
-///   hb_buffer_guess_segment_properties(buf)
-///   hb_shape(hb_font, buf, features, n)
-///   infos = hb_buffer_get_glyph_infos(buf, &n)
-///   pos   = hb_buffer_get_glyph_positions(buf, &n)
-///   -> emit ShapedGlyph{ glyph_index, cluster, x_advance>>6, ... }
-///
-/// Wiring this needs the harfbuzz dependency in build.zig.zon and a compiler to
-/// verify the binding, neither of which is available in this environment, so it
-/// is not landed blind. Until then the renderer keeps its per-cell glyph path
-/// (no ligatures). The run segmentation above is the part that's ready.
-pub const Shaper = struct {
-    pub fn shape(
-        self: *Shaper,
-        alloc: std.mem.Allocator,
-        run: Run,
-        cells: []const Cell,
-    ) ![]ShapedGlyph {
-        _ = self;
-        _ = alloc;
-        _ = run;
-        _ = cells;
-        return error.Unimplemented;
-    }
-};
-
+/// The HarfBuzz `Shaper` — which consumes a `Run` plus these `ShapedGlyph` /
+/// `Feature` types and calls `hb_shape` — lives in `harfbuzz.zig` (it links the
+/// HarfBuzz C library and is only built under `-Dharfbuzz`). Keeping it out of
+/// this module is what lets the run segmentation + feature grammar above stay
+/// dependency-free and host-testable.
 const testing = std.testing;
 
 test "shaper: a uniform row is a single run" {
@@ -274,12 +249,6 @@ test "shaper: empty input yields no runs" {
     const cells = [_]Cell{};
     var it = RunIterator.init(&cells);
     try testing.expect(it.next() == null);
-}
-
-test "shaper: shape is seamed until the harfbuzz binding lands" {
-    const cells = [_]Cell{.{ .codepoint = 'x' }};
-    var sh: Shaper = .{};
-    try testing.expectError(error.Unimplemented, sh.shape(testing.allocator, .{ .start = 0, .len = 1, .style = .regular }, &cells));
 }
 
 test "shaper: Feature.parse forms" {

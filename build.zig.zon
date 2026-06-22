@@ -20,5 +20,15 @@
             .hash = "freetype-2.14.3-C3-WdXSKAAB-kHs4qgRoeoFnRkNQn6M_SSlUGZ6ywgBQ",
             .lazy = true,
         },
+        // HarfBuzz source, built from the amalgam `src/harfbuzz.cc`, for text
+        // shaping (#79). Same upstream tag + content ghostty pins; only fetched
+        // when `-Dharfbuzz` (or the `shape-proof` step) needs it. The Windows
+        // shaper builds it with FreeType glyph funcs; `shape-proof` builds it
+        // standalone (no FreeType).
+        .harfbuzz = .{
+            .url = "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/11.0.0.tar.gz",
+            .hash = "N-V-__8AAG02ugUcWec-Ndp-i7JTsJ0dgF8nnJRUInkGLG7G",
+            .lazy = true,
+        },
     },
 }
