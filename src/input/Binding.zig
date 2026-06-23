@@ -101,6 +101,19 @@ pub const Action = union(enum) {
     toggle_fullscreen,
     toggle_maximize,
     toggle_window_decorations,
+    /// App-lifecycle + extra windowing actions (#92). `quit` closes every window
+    /// (ending the app); `close_window` closes the calling window (all its tabs/
+    /// splits) vs. `close_surface` which closes one pane; `goto_window` focuses
+    /// the Nth top-level window (1-based); `present_terminal` brings the calling
+    /// window to the foreground; `toggle_window_float_on_top` pins it always-on-
+    /// top; `toggle_visibility` hides/shows it. Names mirror ghostty's where they
+    /// overlap. Void-payload except `goto_window`.
+    quit,
+    close_window,
+    goto_window: u8,
+    present_terminal,
+    toggle_window_float_on_top,
+    toggle_visibility,
 };
 
 /// A parsed `trigger = action` binding.
@@ -226,6 +239,15 @@ pub fn parseAction(input: []const u8) ParseError!Action {
     if (eqlIgnoreCase(name, "toggle_fullscreen")) return .toggle_fullscreen;
     if (eqlIgnoreCase(name, "toggle_maximize")) return .toggle_maximize;
     if (eqlIgnoreCase(name, "toggle_window_decorations")) return .toggle_window_decorations;
+    if (eqlIgnoreCase(name, "quit")) return .quit;
+    if (eqlIgnoreCase(name, "close_window")) return .close_window;
+    if (eqlIgnoreCase(name, "goto_window")) {
+        const a = arg orelse return error.InvalidArgument;
+        return .{ .goto_window = std.fmt.parseInt(u8, a, 10) catch return error.InvalidArgument };
+    }
+    if (eqlIgnoreCase(name, "present_terminal")) return .present_terminal;
+    if (eqlIgnoreCase(name, "toggle_window_float_on_top")) return .toggle_window_float_on_top;
+    if (eqlIgnoreCase(name, "toggle_visibility")) return .toggle_visibility;
     return error.InvalidAction;
 }
 
@@ -304,6 +326,7 @@ pub fn addDefaults(set: *Set, alloc: std.mem.Allocator) !void {
         "ctrl+shift+enter=toggle_fullscreen",
         "ctrl+shift+m=toggle_maximize",
         "ctrl+shift+b=toggle_window_decorations",
+        "ctrl+shift+q=quit",
     };
     for (lines) |line| try set.putLine(alloc, line);
 }
@@ -357,6 +380,13 @@ test "binding: parse actions with and without arguments" {
     try testing.expectEqual(Action.toggle_window_decorations, try parseAction("toggle_window_decorations"));
     // Case-insensitive, like the other action names.
     try testing.expectEqual(Action.toggle_fullscreen, try parseAction("Toggle_Fullscreen"));
+    // App-lifecycle + windowing actions (#92).
+    try testing.expectEqual(Action.quit, try parseAction("quit"));
+    try testing.expectEqual(Action.close_window, try parseAction("close_window"));
+    try testing.expectEqual(Action{ .goto_window = 2 }, try parseAction("goto_window:2"));
+    try testing.expectEqual(Action.present_terminal, try parseAction("present_terminal"));
+    try testing.expectEqual(Action.toggle_window_float_on_top, try parseAction("toggle_window_float_on_top"));
+    try testing.expectEqual(Action.toggle_visibility, try parseAction("toggle_visibility"));
 }
 
 test "binding: bad actions error" {
@@ -364,6 +394,7 @@ test "binding: bad actions error" {
     try testing.expectError(error.InvalidArgument, parseAction("new_split")); // missing dir
     try testing.expectError(error.InvalidArgument, parseAction("new_split:sideways"));
     try testing.expectError(error.InvalidArgument, parseAction("goto_tab:x"));
+    try testing.expectError(error.InvalidArgument, parseAction("goto_window")); // missing index
 }
 
 test "binding: full parse of a line" {

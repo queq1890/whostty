@@ -26,6 +26,15 @@ pub const Key = struct {
     italic: bool = false,
 };
 
+/// Cache key for a shaped glyph: a font glyph index (what HarfBuzz returns,
+/// post-shaping) plus the synthetic style. Kept in a separate map from `Key` so
+/// glyph indices and codepoints never collide in the cache (#79).
+pub const IndexKey = struct {
+    glyph: u32,
+    bold: bool = false,
+    italic: bool = false,
+};
+
 alloc: std.mem.Allocator,
 lib: font.Library,
 /// null when the configured face could not be opened (missing font / bring-up):
@@ -46,6 +55,9 @@ color_atlas: Atlas,
 /// blank glyph such as space, a codepoint the face lacks, or the atlas being
 /// full) so we don't re-attempt it every frame.
 map: std.AutoHashMapUnmanaged(Key, ?Atlas.Placement),
+/// (glyph index, style) -> placement for shaped glyphs (#79). Separate from
+/// `map`; same cached-null semantics.
+index_map: std.AutoHashMapUnmanaged(IndexKey, ?Atlas.Placement),
 cell_w: u32,
 cell_h: u32,
 ascent: u32,
@@ -91,6 +103,7 @@ pub fn init(alloc: std.mem.Allocator, path: [:0]const u8, px: u32, atlas_size: u
         .atlas = atlas,
         .color_atlas = color_atlas,
         .map = .empty,
+        .index_map = .empty,
         .cell_w = cell_w,
         .cell_h = cell_h,
         .ascent = ascent,
@@ -116,6 +129,7 @@ pub fn addFallback(self: *GlyphCache, path: [:0]const u8) void {
 
 pub fn deinit(self: *GlyphCache) void {
     self.map.deinit(self.alloc);
+    self.index_map.deinit(self.alloc);
     if (self.face) |*f| f.deinit();
     for (self.fallbacks.items) |*f| f.deinit();
     self.fallbacks.deinit(self.alloc);
@@ -144,6 +158,22 @@ pub fn get(self: *GlyphCache, cp: u21, bold: bool, italic: bool) ?Atlas.Placemen
     if (placed) |p| {
         if (p.color) self.color_dirty = true else self.dirty = true;
     }
+    return placed;
+}
+
+/// The atlas placement for a shaped glyph by its font glyph index (#79),
+/// rasterized from the primary face and packed on first sight. Null means
+/// "draw nothing" (no primary face, an empty bitmap, or the atlas full). The
+/// primary face is used because the shaper builds its `hb_font` from it; runs
+/// the primary lacks fall back to the per-codepoint path in the caller. Same
+/// slot-before-pack discipline as `get`.
+pub fn getByIndex(self: *GlyphCache, glyph_index: u32, bold: bool, italic: bool) ?Atlas.Placement {
+    const key: IndexKey = .{ .glyph = glyph_index, .bold = bold, .italic = italic };
+    if (self.index_map.get(key)) |cached| return cached;
+    self.index_map.ensureUnusedCapacity(self.alloc, 1) catch return null;
+    const placed = self.rasterizeAndPackIndex(key);
+    self.index_map.putAssumeCapacity(key, placed);
+    if (placed) |_| self.dirty = true;
     return placed;
 }
 
@@ -212,6 +242,28 @@ fn rasterizeAndPack(self: *GlyphCache, key: Key) ?Atlas.Placement {
     const region = self.atlas.reserve(g.width, g.height) catch return null;
     self.atlas.set(region, g.pixels);
     return .{ .region = region, .bearing_x = g.bearing_x, .bearing_y = g.bearing_y };
+}
+
+/// Rasterize + pack a shaped glyph from the primary face by glyph index (#79).
+/// Monochrome alpha only: shaped runs are text-presentation (emoji break a run
+/// and render through the per-codepoint color path), and sprite glyphs are keyed
+/// by codepoint, not glyph index.
+fn rasterizeAndPackIndex(self: *GlyphCache, key: IndexKey) ?Atlas.Placement {
+    const face = if (self.face) |*f| f else return null;
+    var g = face.rasterizeIndex(self.alloc, key.glyph, .{ .bold = key.bold, .italic = key.italic }) catch return null;
+    defer g.deinit(self.alloc);
+    if (g.width == 0 or g.height == 0) return null;
+    const region = self.atlas.reserve(g.width, g.height) catch return null;
+    self.atlas.set(region, g.pixels);
+    return .{ .region = region, .bearing_x = g.bearing_x, .bearing_y = g.bearing_y };
+}
+
+/// The primary face's underlying `FT_Face` as an opaque pointer, for building a
+/// HarfBuzz font (#79), or null if no primary face loaded. Opaque so callers
+/// (the apprt) don't need the freetype import.
+pub fn primaryFaceHandle(self: *GlyphCache) ?*anyopaque {
+    if (self.face) |*f| return @ptrCast(f.inner.handle);
+    return null;
 }
 
 /// Whether the alpha atlas changed since the last call, clearing the flag. The

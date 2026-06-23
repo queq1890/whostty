@@ -349,6 +349,14 @@ pub const SW_SHOW: INT = 5;
 pub const SW_SHOWNORMAL: INT = 1;
 pub const SW_MAXIMIZE: INT = 3;
 pub const SW_RESTORE: INT = 9;
+/// ShowWindow SW_HIDE for the show/hide (toggle_visibility) action (#92).
+pub const SW_HIDE: INT = 0;
+
+/// SetWindowPos special hWndInsertAfter values for the float-on-top toggle (#92):
+/// HWND_TOPMOST ((HWND)-1) makes the window always-on-top; HWND_NOTOPMOST
+/// ((HWND)-2) clears that and re-files it below the topmost band.
+pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+pub const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 
 /// GetWindowLongPtrW/SetWindowLongPtrW indices (#91).
 pub const GWL_STYLE: INT = -16;
@@ -505,6 +513,74 @@ pub extern "user32" fn MessageBoxW(
     uType: UINT,
 ) callconv(.winapi) INT;
 
+// --- Per-monitor DPI awareness (#90) ------------------------------------------
+// Opt into per-monitor-DPI-v2 so the OS sends WM_DPICHANGED (instead of bitmap-
+// stretching the window) when it moves to a different-DPI monitor; then rebuild
+// the glyph atlas at the new scale so text stays crisp.
+
+/// A DPI_AWARENESS_CONTEXT is an opaque pseudo-handle; the v2 per-monitor value
+/// is the sentinel (DPI_AWARENESS_CONTEXT)-4.
+pub const DPI_AWARENESS_CONTEXT = HANDLE;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
+    @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
+
+/// 96 DPI = scale 1.0 (the unscaled baseline).
+pub const USER_DEFAULT_SCREEN_DPI: UINT = 96;
+
+pub const WM_DPICHANGED: UINT = 0x02E0;
+
+/// Set the process DPI awareness. Available on Windows 10 1607+ (whostty already
+/// requires Win10 for ConPTY). Best-effort: a false return (already set, or older
+/// OS) leaves the window system-DPI-scaled, which still runs.
+pub extern "user32" fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
+/// The DPI of the monitor a window is on (per-monitor-aware processes); 0 on
+/// failure, which the caller treats as the 96 baseline.
+pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
+
+// --- App-lifecycle + windowing actions (#92) ---------------------------------
+// Bring a window to the foreground (present_terminal / show) and raise it in the
+// Z-order. SetForegroundWindow may be refused cross-thread by the OS foreground
+// lock (a focus-stealing guard), so callers pair it with BringWindowToTop and
+// treat both as best-effort.
+pub extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn BringWindowToTop(hWnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
+
+// --- Single-instance / IPC (#93) ---------------------------------------------
+// A named mutex detects an already-running instance; a hidden message-only
+// window (HWND_MESSAGE parent) in the primary receives a system-wide registered
+// message from a secondary launch and opens a new window in the existing process.
+
+/// CreateMutexW set this when the named mutex already existed — i.e. another
+/// instance is already running, so this launch is the "secondary".
+pub const ERROR_ALREADY_EXISTS: DWORD = 183;
+
+/// Parent handle marking a message-only window: it receives messages but is
+/// never shown, has no Z-order, and is found only via FindWindowExW(HWND_MESSAGE,
+/// …). (HWND)-3.
+pub const HWND_MESSAGE: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))));
+
+pub extern "kernel32" fn CreateMutexW(
+    lpMutexAttributes: ?*SECURITY_ATTRIBUTES,
+    bInitialOwner: BOOL,
+    lpName: ?LPCWSTR,
+) callconv(.winapi) ?HANDLE;
+
+/// Register (or look up) a system-wide message id by name; every process that
+/// registers the same string gets the same id, so a secondary can post it to the
+/// primary's listener window.
+pub extern "user32" fn RegisterWindowMessageW(lpString: LPCWSTR) callconv(.winapi) UINT;
+
+/// Find a child window by class under a parent (HWND_MESSAGE for message-only
+/// windows, which the plain FindWindowW does not search).
+pub extern "user32" fn FindWindowExW(
+    hWndParent: ?HWND,
+    hWndChildAfter: ?HWND,
+    lpszClass: ?LPCWSTR,
+    lpszWindow: ?LPCWSTR,
+) callconv(.winapi) ?HWND;
+// (GetMessageW is declared above with the core user32 message-loop functions.)
+
 // --- Window flash (visual bell) ------------------------------------------------
 pub const FLASHW_STOP: DWORD = 0;
 pub const FLASHW_CAPTION: DWORD = 0x1;
@@ -579,6 +655,54 @@ pub extern "user32" fn ToUnicodeEx(
     wFlags: UINT,
     dwhkl: ?HKL,
 ) callconv(.winapi) INT;
+
+// --- IME: composition + candidate window placement (imm32, #88) --------------
+// Compose CJK / dead-key / accented input. We let the OS IME draw its own
+// composition + candidate UI, but pin those windows to the caret and capture
+// the committed result string to feed to the pty.
+
+/// Input-method context handle (HIMC).
+pub const HIMC = HANDLE;
+
+pub const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+pub const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+pub const WM_IME_COMPOSITION: UINT = 0x010F;
+
+/// ImmGetCompositionStringW dwIndex: the committed result vs. the in-progress
+/// composition string.
+pub const GCS_RESULTSTR: DWORD = 0x0800;
+pub const GCS_COMPSTR: DWORD = 0x0008;
+
+/// Composition/candidate form styles: pin the window to an exact client point.
+pub const CFS_POINT: DWORD = 0x0002;
+pub const CFS_CANDIDATEPOS: DWORD = 0x0040;
+
+pub const COMPOSITIONFORM = extern struct {
+    dwStyle: DWORD,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
+pub const CANDIDATEFORM = extern struct {
+    dwIndex: DWORD,
+    dwStyle: DWORD,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
+pub extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?HIMC;
+pub extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.winapi) BOOL;
+/// Copy a composition/result string. With `lpBuf == null` / `dwBufLen == 0` it
+/// returns the byte size needed; otherwise it writes up to `dwBufLen` bytes of
+/// UTF-16 and returns the bytes copied (negative on error).
+pub extern "imm32" fn ImmGetCompositionStringW(
+    hIMC: HIMC,
+    dwIndex: DWORD,
+    lpBuf: ?*anyopaque,
+    dwBufLen: DWORD,
+) callconv(.winapi) LONG;
+pub extern "imm32" fn ImmSetCompositionWindow(hIMC: HIMC, lpCompForm: *const COMPOSITIONFORM) callconv(.winapi) BOOL;
+pub extern "imm32" fn ImmSetCandidateWindow(hIMC: HIMC, lpCandidate: *const CANDIDATEFORM) callconv(.winapi) BOOL;
 
 // --- gdi32 -----------------------------------------------------------------
 

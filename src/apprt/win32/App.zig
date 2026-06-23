@@ -31,6 +31,13 @@ const w = @import("../../os/windows.zig");
 /// exactly as before.
 const ft = build_options.freetype;
 const GlyphCache = if (ft) @import("../../font/GlyphCache.zig") else void;
+/// Whether HarfBuzz text shaping is compiled in (#79). When true, rows are
+/// segmented into runs and shaped (ligatures, contextual alternates, font
+/// features) before drawing; when false the renderer draws one glyph per cell as
+/// before. Requires `ft` (the shaper builds an hb_font from the Freetype face).
+const hb = build_options.harfbuzz;
+const shaper = @import("../../font/shaper.zig");
+const harfbuzz = if (hb) @import("../../font/harfbuzz.zig") else struct {};
 const vt = @import("ghostty-vt");
 const config = @import("../../config.zig");
 const scroll = @import("../../scroll.zig");
@@ -150,6 +157,14 @@ fn cfgColor(c: ?config.Color) ?[3]f32 {
     return if (c) |x| rgbf(toVtRgb(x)) else null;
 }
 
+/// Glyph pixel size for a point size at a given monitor DPI (#90). At 96 DPI this
+/// is the point value unchanged (the pre-DPI behavior, so no regression on a
+/// standard monitor); a HiDPI monitor scales it up so glyphs stay crisp. Clamped
+/// to >= 1 px.
+fn fontPx(size_pt: f32, dpi: u32) u32 {
+    return @intFromFloat(@max(1, @round(size_pt * @as(f32, @floatFromInt(dpi)) / 96.0)));
+}
+
 /// Per-frame cursor inputs the renderer needs that don't live in the VT state:
 /// window focus, the blink phase, and the configured cursor colors/opacity. The
 /// VT-owned state (position, DECTCEM, blink mode, style) is read in `buildQuads`.
@@ -222,6 +237,15 @@ const App = struct {
     /// lifecycle race-free: it guarantees every thread has fully exited before
     /// `App` (which holds the mutex/condition) is destroyed.
     threads: std.ArrayList(std.Thread) = .empty,
+    /// Live top-level windows, registered by each window thread after its window
+    /// is created and unregistered before it is destroyed (both under `mutex`).
+    /// The cross-window lifecycle actions (#92) reach other windows ONLY through
+    /// this list and ONLY via thread-safe Win32 calls (`PostMessageW` to request a
+    /// close, `SetForegroundWindow` to focus) — never by touching another window's
+    /// per-window state. "In the list" implies "not yet destroyed" because the
+    /// owning thread removes itself under the mutex before freeing the `Window`,
+    /// and readers iterate under the same mutex.
+    windows: std.ArrayList(*Window) = .empty,
     /// The first error any window thread hit during startup, captured so `run`
     /// can return a non-zero exit (matching the pre-#86 inline behavior where a
     /// first-window startup failure propagated to `main`). First-writer-wins;
@@ -273,6 +297,53 @@ const App = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.live != 0) self.empty.wait(&self.mutex);
+    }
+
+    /// Track a newly-created window for the cross-window actions (#92). Append
+    /// failure is non-fatal: the window still runs, only the lifecycle actions
+    /// can't reach it (a degraded, not broken, state).
+    fn registerWindow(self: *App, win: *Window) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.windows.append(self.alloc, win) catch {};
+    }
+
+    /// Stop tracking a window just before its `Window` is destroyed. Must run
+    /// (under the mutex) before the owning thread frees the `Window`, so a
+    /// concurrent `quitAll`/`focusWindow` can never observe a freed pointer.
+    fn unregisterWindow(self: *App, win: *Window) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.windows.items, 0..) |x, i| if (x == win) {
+            _ = self.windows.swapRemove(i);
+            break;
+        };
+    }
+
+    /// `quit` (#92): ask every window to close. `PostMessageW` is thread-safe and
+    /// merely queues `WM_CLOSE` on each window's own thread, where it runs through
+    /// the normal close path (close-confirmation included) — we never tear another
+    /// window down from here. Posting to the calling window too is harmless: it
+    /// just queues a `.close` it will process on its next loop turn.
+    fn quitAll(self: *App) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.windows.items) |x| _ = w.PostMessageW(x.handle(), w.WM_CLOSE, 0, 0);
+    }
+
+    /// `goto_window` (#92): bring the Nth (1-based) registered window to the
+    /// foreground, best-effort. Order follows creation order. Out-of-range and 0
+    /// are ignored. Cross-thread `SetForegroundWindow` may be refused by the OS
+    /// foreground lock, so it's paired with `BringWindowToTop`.
+    fn focusWindow(self: *App, index1: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index1 == 0) return;
+        const i: usize = @as(usize, index1) - 1;
+        if (i >= self.windows.items.len) return;
+        const hwnd = self.windows.items[i].handle();
+        _ = w.BringWindowToTop(hwnd);
+        _ = w.SetForegroundWindow(hwnd);
     }
 };
 
@@ -483,6 +554,158 @@ fn toSplitDir(d: binding.Direction) st.Direction {
     };
 }
 
+/// Single-instance / IPC (#93). When `single-instance` is on, the first launch
+/// becomes the PRIMARY: it owns a named mutex and runs a hidden message-only
+/// listener window on its own thread. A later launch is the SECONDARY: it finds
+/// that window, posts the system-wide "new-window" message, and exits — so the
+/// primary opens a new window instead of a second process starting. Default off,
+/// so the normal one-process-per-launch behavior is untouched.
+const SingleInstance = struct {
+    /// Per-session mutex name (the default/Local namespace is per-logon-session).
+    const mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("whostty-single-instance");
+    /// The hidden listener window's class.
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttySingleInstanceListener");
+    /// The registered-message name; the same string maps to the same id in every
+    /// process, so a secondary can post it to the primary's listener.
+    const msg_name = std.unicode.utf8ToUtf16LeStringLiteral("whostty-new-window");
+
+    app: *App,
+    /// Owned named mutex; closed on deinit (releasing single-instance ownership).
+    mutex: w.HANDLE,
+    /// The registered "open a new window" message id.
+    msg_id: w.UINT,
+    /// The listener window, created and published by the listener thread.
+    hwnd: ?w.HWND = null,
+    /// Signaled once the listener thread has created (or failed to create) its
+    /// window, so `start` doesn't return before the listener is up.
+    ready: std.Thread.ResetEvent = .{},
+    thread: ?std.Thread = null,
+
+    var register_listener_once = std.once(registerListenerClass);
+    var listener_register_ok: bool = false;
+
+    fn registerListenerClass() void {
+        const hinstance = w.GetModuleHandleW(null).?;
+        const wc: w.WNDCLASSEXW = .{
+            .cbSize = @sizeOf(w.WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = listenerWndProc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = hinstance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = class_name,
+            .hIconSm = null,
+        };
+        listener_register_ok = w.RegisterClassExW(&wc) != 0 or
+            w.GetLastError() == w.ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    fn fromHwnd(hwnd: w.HWND) ?*SingleInstance {
+        const ud = w.GetWindowLongPtrW(hwnd, w.GWLP_USERDATA);
+        if (ud == 0) return null;
+        return @ptrFromInt(@as(usize, @bitCast(ud)));
+    }
+
+    /// The listener window proc: on the registered "new-window" message, open a
+    /// new window in this (primary) process; on close, tear the window down so the
+    /// listener thread's message loop ends.
+    fn listenerWndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(.winapi) w.LRESULT {
+        switch (msg) {
+            w.WM_CLOSE => {
+                _ = w.DestroyWindow(hwnd);
+                return 0;
+            },
+            w.WM_DESTROY => {
+                w.PostQuitMessage(0);
+                return 0;
+            },
+            else => {
+                // The registered message id is a runtime value, so it can't be a
+                // switch label — compare it here.
+                if (fromHwnd(hwnd)) |si| if (msg == si.msg_id) {
+                    si.app.spawnWindow() catch |e| log.err("single-instance: new_window failed: {}", .{e});
+                    return 0;
+                };
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+        }
+    }
+
+    /// The listener thread: register the class, create the message-only window,
+    /// publish it, then pump messages until WM_QUIT (posted by `stopListener`).
+    fn listenerThread(si: *SingleInstance) void {
+        register_listener_once.call();
+        if (!listener_register_ok) {
+            si.ready.set();
+            return;
+        }
+        const hinstance = w.GetModuleHandleW(null).?;
+        const hwnd = w.CreateWindowExW(0, class_name, null, 0, 0, 0, 0, 0, w.HWND_MESSAGE, null, hinstance, null);
+        if (hwnd) |h| {
+            _ = w.SetWindowLongPtrW(h, w.GWLP_USERDATA, @bitCast(@intFromPtr(si)));
+            si.hwnd = h;
+        }
+        si.ready.set();
+        if (hwnd == null) return;
+
+        var msg: w.MSG = undefined;
+        while (w.GetMessageW(&msg, null, 0, 0) > 0) {
+            _ = w.TranslateMessage(&msg);
+            _ = w.DispatchMessageW(&msg);
+        }
+    }
+
+    /// Become the primary: take ownership of `mutex`, start the listener thread,
+    /// and wait until its window is up. On failure the mutex is closed.
+    fn start(alloc: std.mem.Allocator, app: *App, mutex: w.HANDLE) !*SingleInstance {
+        const si = alloc.create(SingleInstance) catch |e| {
+            _ = w.CloseHandle(mutex);
+            return e;
+        };
+        si.* = .{
+            .app = app,
+            .mutex = mutex,
+            .msg_id = w.RegisterWindowMessageW(msg_name),
+        };
+        si.thread = std.Thread.spawn(.{}, listenerThread, .{si}) catch |e| {
+            alloc.destroy(si);
+            _ = w.CloseHandle(mutex);
+            return e;
+        };
+        si.ready.wait();
+        return si;
+    }
+
+    /// Secondary path: find the primary's listener window and post the registered
+    /// "new-window" message, so the primary opens a window. Best-effort — if the
+    /// window can't be found (a race with the primary exiting) nothing happens.
+    fn signalPrimary() void {
+        const hwnd = w.FindWindowExW(w.HWND_MESSAGE, null, class_name, null) orelse return;
+        const msg_id = w.RegisterWindowMessageW(msg_name);
+        _ = w.PostMessageW(hwnd, msg_id, 0, 0);
+    }
+
+    /// Stop accepting new-window requests: close the listener window (ending its
+    /// message loop) and join the thread. Idempotent.
+    fn stopListener(self: *SingleInstance) void {
+        if (self.thread) |t| {
+            if (self.hwnd) |h| _ = w.PostMessageW(h, w.WM_CLOSE, 0, 0);
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn deinit(self: *SingleInstance, alloc: std.mem.Allocator) void {
+        self.stopListener();
+        _ = w.CloseHandle(self.mutex);
+        alloc.destroy(self);
+    }
+};
+
 /// whostty's entry point (called from `main`). The orchestrator for the
 /// multi-window, thread-per-window runtime (#86): build the shared `App`, spawn
 /// the FIRST window (which runs on its own thread exactly like every later one —
@@ -496,6 +719,33 @@ fn toSplitDir(d: binding.Direction) st.Direction {
 pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     var app: App = .{ .alloc = alloc, .opts = opts };
     defer app.threads.deinit(alloc);
+    defer app.windows.deinit(alloc);
+
+    // Single-instance gate (#93). Only consults the config flag; loaded once here
+    // and freed immediately (each window still loads its own). When the flag is
+    // off (the default), nothing below runs and behavior is exactly as before.
+    var single: ?*SingleInstance = null;
+    defer if (single) |s| s.deinit(alloc);
+    if (singleInstanceEnabled(alloc, opts)) {
+        const mutex = w.CreateMutexW(null, w.FALSE, SingleInstance.mutex_name);
+        const already = w.GetLastError() == w.ERROR_ALREADY_EXISTS;
+        if (mutex) |m| {
+            if (already) {
+                // Secondary launch: hand the request to the running primary and
+                // exit without opening a window of our own.
+                _ = w.CloseHandle(m);
+                SingleInstance.signalPrimary();
+                return;
+            }
+            // Primary launch: own the mutex and start the IPC listener. A start
+            // failure is non-fatal — fall back to a normal single-process run.
+            if (SingleInstance.start(alloc, &app, m)) |s| {
+                single = s;
+            } else |e| {
+                log.warn("single-instance: listener start failed ({s}); running standalone", .{@errorName(e)});
+            }
+        }
+    }
 
     // Spawn the first window. If even that fails there is nothing to wait for.
     try app.spawnWindow();
@@ -503,6 +753,13 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // Block until the live-window count hits 0 (the last window closed). Never
     // returns while a window is alive — the process stays up as long as any
     // window does.
+    app.waitUntilEmpty();
+
+    // Stop the IPC listener BEFORE the final join so no late secondary signal can
+    // spawn a window (and append a thread) during teardown; then drain any window
+    // that the listener spawned just before it stopped (the listener is now dead,
+    // so `live` only decreases) so the thread list is stable for the join.
+    if (single) |s| s.stopListener();
     app.waitUntilEmpty();
 
     // Every window thread has signaled exit; join them so no thread handle leaks
@@ -515,6 +772,14 @@ pub fn run(alloc: std.mem.Allocator, opts: cli.Options) !void {
     // inline run() propagated it to main; the threaded surfaceThread otherwise
     // swallows it after logging). A normal close leaves first_error null.
     if (app.first_error) |e| return e;
+}
+
+/// Read just the `single-instance` config flag for the gate in `run` (#93). The
+/// config is loaded and freed here; each window still parses its own afterward.
+fn singleInstanceEnabled(alloc: std.mem.Allocator, opts: cli.Options) bool {
+    var cfg = loadConfig(alloc, opts.config_text);
+    defer cfg.deinit();
+    return cfg.single_instance;
 }
 
 /// One window, start to finish, on its OWN thread (#86). This is the OLD `run`
@@ -551,6 +816,11 @@ fn runSurface(app: *App) !void {
     defer alloc.destroy(win);
     try win.init("whostty", 960, 540, cfg.renderer == .opengl);
     defer win.deinit();
+    // Register for cross-window actions (#92). The unregister defer is declared
+    // AFTER the destroy/deinit defers so it runs FIRST on teardown (LIFO) — the
+    // window leaves the registry before its `Window` is freed.
+    app.registerWindow(win);
+    defer app.unregisterWindow(win);
     win.makeCurrent();
 
     // The selected backend (config `renderer`). Both expose the identical
@@ -606,8 +876,11 @@ fn runSurface(app: *App) !void {
         break :blk primary_path_buf.?;
     } else default_font_path;
 
+    // DPI-aware sizing (#90): open the face at the point size scaled by the
+    // window's monitor DPI, so HiDPI displays get crisp glyphs. WM_DPICHANGED
+    // rebuilds the cache at the new scale (handled in the event loop).
     var cache: GlyphCache = if (ft)
-        try GlyphCache.init(alloc, primary_path, @intFromFloat(@max(1, @round(cfg.font_size))), atlas_size)
+        try GlyphCache.init(alloc, primary_path, fontPx(cfg.font_size, win.dpiForWindow()), atlas_size)
     else {};
     defer if (ft) cache.deinit();
 
@@ -626,6 +899,23 @@ fn runSurface(app: *App) !void {
         // params are configured before the first draw; new glyphs re-upload.
         switch (renderer) {
             inline else => |*r| r.setAtlas(cache.atlas.data, cache.atlas.size),
+        }
+    }
+
+    // HarfBuzz shaper (#79): built once from the primary face and reused every
+    // frame. Best-effort — if HarfBuzz isn't compiled in, the primary face is
+    // missing, or construction fails, `text_shaper` stays null and the renderer
+    // draws one glyph per cell as before. The address is always passed to
+    // `buildQuads` (which ignores it unless `hb`).
+    var text_shaper: if (hb) ?harfbuzz.Shaper else void = if (hb) null else {};
+    defer if (hb) {
+        if (text_shaper) |*s| s.deinit();
+    };
+    if (hb) {
+        if (cache.primaryFaceHandle()) |fh| {
+            if (harfbuzz.Font.initFreetype(fh)) |hbfont| {
+                text_shaper = harfbuzz.Shaper.init(alloc, hbfont, cfg.font_features.items) catch null;
+            } else |err| log.warn("harfbuzz font init failed ({s}); shaping disabled", .{@errorName(err)});
         }
     }
 
@@ -710,9 +1000,9 @@ fn runSurface(app: *App) !void {
     const blink_interval_ns: u64 = 600 * std.time.ns_per_ms;
     var blink_timer: ?std.time.Timer = std.time.Timer.start() catch null;
     // The cursor's fill color lives in `terminal.colors.cursor` (seeded from
-    // config, overridable by OSC 12), read per-frame in buildQuads. The text
-    // color and thickness are constant for the run; focus + blink vary per frame.
-    const cursor_thickness: u32 = @max(1, cell_h / 10);
+    // config, overridable by OSC 12), read per-frame in buildQuads. The thickness
+    // is derived from `cell_h` at the cursor render below so it tracks a DPI
+    // rebuild (#90); focus + blink vary per frame.
     const cursor_text = cfgColor(cfg.cursor_text);
 
     // --- Frame pacing (#72) ---
@@ -864,6 +1154,50 @@ fn runSurface(app: *App) !void {
                 },
                 // Re-grid every pane in the active tab to the new client size.
                 .resize => |_| ws.layoutActive(),
+                // The window moved to a different-DPI monitor (#90). The window
+                // proc already applied the suggested rect (which queued a
+                // `.resize`); rebuild the glyph cache + shaper + cell metrics at
+                // the new scale so glyphs stay crisp, then re-grid with them.
+                .dpi_changed => |new_dpi| {
+                    if (ft) {
+                        const new_px = fontPx(cfg.font_size, new_dpi);
+                        if (new_px != cache.px) {
+                            if (GlyphCache.init(alloc, primary_path, new_px, atlas_size)) |new_cache| {
+                                // Drop the shaper FIRST (its hb_font references the
+                                // old face), then the old cache, before swapping in
+                                // the new one — order keeps the face valid until no
+                                // one holds it.
+                                if (hb) {
+                                    if (text_shaper) |*s| s.deinit();
+                                    text_shaper = null;
+                                }
+                                cache.deinit();
+                                cache = new_cache;
+                                for (default_fallback_fonts) |fb| cache.addFallback(fb);
+                                cell_w = cache.cell_w;
+                                cell_h = cache.cell_h;
+                                ascent = cache.ascent;
+                                ws.cell_w = cell_w;
+                                ws.cell_h = cell_h;
+                                switch (renderer) {
+                                    inline else => |*r| r.setAtlas(cache.atlas.data, cache.atlas.size),
+                                }
+                                if (hb) {
+                                    if (cache.primaryFaceHandle()) |fh| {
+                                        if (harfbuzz.Font.initFreetype(fh)) |hbfont| {
+                                            text_shaper = harfbuzz.Shaper.init(alloc, hbfont, cfg.font_features.items) catch null;
+                                        } else |err| log.warn("dpi: harfbuzz re-init failed ({s})", .{@errorName(err)});
+                                    }
+                                }
+                                // Re-grid with the new metrics (the suggested-rect
+                                // `.resize` laid out with the old cell size).
+                                ws.layoutActive();
+                            } else |err| {
+                                log.warn("dpi: glyph cache rebuild failed ({s}); keeping size", .{@errorName(err)});
+                            }
+                        }
+                    }
+                },
                 .focus => |f| {
                     // Only act on a real change so a redundant WM_SETFOCUS/KILLFOCUS
                     // can't emit a duplicate report.
@@ -916,6 +1250,16 @@ fn runSurface(app: *App) !void {
                 pane.title = title;
                 if (pane.id == ws.focused_id) win.setTitle(title);
             }
+        }
+
+        // Pin the IME composition/candidate window to the focused pane's caret
+        // (#88) so CJK / dead-key composition opens at the cursor. Refreshed every
+        // loop turn (cheap) so it is current whenever the IME opens.
+        if (ws.focusedPane()) |p| {
+            if (p.io.cursorViewport()) |cur| win.setImePosition(
+                @intCast(p.sfc.origin_x + cur.x * cell_w),
+                @intCast(p.sfc.origin_y + cur.y * cell_h),
+            );
         }
 
         const sz = win.clientSize();
@@ -980,9 +1324,10 @@ fn runSurface(app: *App) !void {
                 .blink_visible = blink_visible,
                 .text = cursor_text,
                 .opacity = cfg.cursor_opacity,
-                .thickness = cursor_thickness,
+                // Derived from the current cell height so it tracks a DPI rebuild.
+                .thickness = @max(1, cell_h / 10),
             };
-            try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render);
+            try buildQuads(alloc, &quads, pane.io, if (ft) &cache else {}, cell_w, cell_h, ascent, pane.sfc.origin_x, pane.sfc.origin_y, &theme, cursor_render, &text_shaper);
             // Per-pane scrollbar within the pane's rect.
             appendScrollbar(alloc, &quads, pane.io.scrollbar(), pl.rect, cell_w, theme.fg) catch {};
         }
@@ -1327,6 +1672,34 @@ fn performAction(ws: *WinState, action: apprt.Action) bool {
             ws.win.toggleDecorations();
             return true;
         },
+
+        // --- App-lifecycle + windowing actions (#92) ---
+        .quit => {
+            ws.app.quitAll();
+            return true;
+        },
+        // Close THIS whole window (every tab/pane), vs. close_surface's one pane.
+        // The teardown defer frees all the panes; the loop breaks next turn.
+        .close_window => {
+            ws.close_requested = true;
+            return true;
+        },
+        .goto_window => |n| {
+            ws.app.focusWindow(n);
+            return true;
+        },
+        .present_terminal => {
+            ws.win.present();
+            return true;
+        },
+        .toggle_window_float_on_top => {
+            ws.win.toggleFloat();
+            return true;
+        },
+        .toggle_visibility => {
+            ws.win.toggleVisibility();
+            return true;
+        },
     }
 }
 
@@ -1577,6 +1950,15 @@ fn appendTabBar(
     }
 }
 
+/// Per-column shaping result for a row (#79): fall back to the per-codepoint
+/// glyph (`unshaped`); draw nothing because a ligature merged this cell into a
+/// neighbor (`blank`); or draw a specific shaped glyph.
+const ShapedSlot = union(enum) {
+    unshaped,
+    blank,
+    glyph: shaper.ShapedGlyph,
+};
+
 /// Translate the terminal viewport into renderable quads, honoring SGR colors
 /// and attributes (#12): per-cell foreground/background colors (default, 256
 /// palette, or truecolor), inverse video, and the underline / strikethrough /
@@ -1605,6 +1987,10 @@ fn buildQuads(
     origin_y: u32,
     theme: *const Theme,
     cursor_render: CursorRender,
+    /// Pointer to the optional HarfBuzz shaper (`*?harfbuzz.Shaper`), or `*void`
+    /// in non-shaping builds. Only dereferenced under `hb`; shaping is applied
+    /// per row to form ligatures / contextual alternates / font features (#79).
+    shaper_opt: anytype,
 ) !void {
     // The caller clears `quads` once per frame and then calls this for every pane
     // in the active tab, so each pane's quads accumulate into one draw (#87).
@@ -1634,8 +2020,70 @@ fn buildQuads(
     const line_h: u32 = @max(1, cell_h / 16);
     const ascent_i: i32 = @intCast(ascent);
 
+    // Shaped-text scratch (#79): when shaping is active, each row is segmented
+    // into runs and shaped with the primary face, filling `row_slot[col]` with
+    // how to draw that column. Allocated once (grid width) and reused across
+    // rows; on allocation failure shaping is skipped and the per-cell path draws.
+    var row_cells: []shaper.Cell = &.{};
+    var row_slot: []ShapedSlot = &.{};
+    var shaping_ready = false;
+    if (hb) {
+        if (shaper_opt.* != null and cols > 0) {
+            if (alloc.alloc(shaper.Cell, cols)) |rc| {
+                if (alloc.alloc(ShapedSlot, cols)) |rs| {
+                    row_cells = rc;
+                    row_slot = rs;
+                    shaping_ready = true;
+                } else |_| alloc.free(rc);
+            } else |_| {}
+        }
+    }
+    defer {
+        if (row_cells.len > 0) alloc.free(row_cells);
+        if (row_slot.len > 0) alloc.free(row_slot);
+    }
+
     var row: u32 = 0;
     while (row < rows) : (row += 1) {
+        // Shape this row first (#79): build the run cells from the grid, segment
+        // into runs, and shape each with the primary face. Cells the primary face
+        // lacks shape to glyph 0 and stay `unshaped` (the per-codepoint path then
+        // renders them via fallback); cells a ligature merges into a neighbor
+        // become `blank`.
+        if (hb and shaping_ready) {
+            var c: u32 = 0;
+            while (c < cols) : (c += 1) {
+                const rcp: u21 = if (screen.pages.getCell(.{ .viewport = .{
+                    .x = @intCast(c),
+                    .y = @intCast(row),
+                } })) |x| x.cell.codepoint() else 0;
+                // Empty cells (including wide-char spacer tails) carry no glyph of
+                // their own; mark them spacer tails so they extend, not split, a
+                // run and are not added to the shaping buffer.
+                row_cells[c] = .{ .codepoint = rcp, .width = if (rcp == 0) .spacer_tail else .narrow };
+                row_slot[c] = .unshaped;
+            }
+            if (shaper_opt.*) |*s| {
+                var it = shaper.RunIterator.init(row_cells[0..cols]);
+                while (it.next()) |text_run| {
+                    const glyphs = s.shape(text_run, row_cells[0..cols]) catch continue;
+                    for (glyphs, 0..) |g, gi| {
+                        const start_col = text_run.column(g.cluster);
+                        if (start_col >= cols) continue;
+                        if (g.glyph_index != 0) row_slot[start_col] = .{ .glyph = g };
+                        // Columns from this glyph's cluster to the next glyph's are
+                        // covered by it (a multi-cell ligature) — draw nothing.
+                        const next_cluster: usize = if (gi + 1 < glyphs.len) glyphs[gi + 1].cluster else text_run.len;
+                        var cc: usize = @as(usize, g.cluster) + 1;
+                        while (cc < next_cluster) : (cc += 1) {
+                            const colx = text_run.start + cc;
+                            if (colx < cols and row_cells[colx].width != .spacer_tail) row_slot[colx] = .blank;
+                        }
+                    }
+                }
+            }
+        }
+
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
             const gc = screen.pages.getCell(.{ .viewport = .{
@@ -1698,31 +2146,56 @@ fn buildQuads(
                 .b = c[2],
             } });
 
-            // Foreground glyph (invisible attribute suppresses it). The glyph is
-            // rasterized on demand and packed into the atlas the first time its
-            // codepoint is seen. Faint/dim (SGR 2) text is drawn at reduced
-            // opacity via the per-quad alpha.
+            // Foreground glyph (invisible attribute suppresses it). Faint/dim
+            // (SGR 2) text is drawn at reduced opacity via the per-quad alpha.
+            // With shaping active (#79) the column may carry a shaped glyph (drawn
+            // by glyph index, with the shaper's sub-cell offset) or be blank
+            // because a ligature merged it into a neighbor; otherwise the glyph is
+            // rasterized on demand from the cell's codepoint as before.
             if (ft and !style.flags.invisible) {
-                const cp = cell.codepoint();
-                if (cp >= first_drawable) {
-                    if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
-                        const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
-                        const gcell: gl.Cell = .{
-                            .px = cell_x + gi.bearing_x,
-                            .py = cell_y + ascent_i - gi.bearing_y,
-                            .sx = gi.region.x,
-                            .sy = gi.region.y,
-                            .sw = gi.region.width,
-                            .sh = gi.region.height,
-                            .r = fg[0],
-                            .g = fg[1],
-                            .b = fg[2],
-                            .a = glyph_alpha,
-                        };
-                        // Color glyphs (emoji, #78) come from the RGBA atlas and
-                        // are drawn untinted; everything else is alpha-tinted.
-                        try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
-                    }
+                const glyph_alpha: f32 = if (style.flags.faint) theme.faint_opacity else 1;
+                const slot: ShapedSlot = if (hb and shaping_ready) row_slot[col] else .unshaped;
+                switch (slot) {
+                    // A ligature drew over this column from its starting cell.
+                    .blank => {},
+                    .glyph => |sg| {
+                        if (cache.getByIndex(sg.glyph_index, style.flags.bold, style.flags.italic)) |gi| {
+                            try quads.append(alloc, .{ .glyph = .{
+                                .px = cell_x + gi.bearing_x + sg.x_offset,
+                                .py = cell_y + ascent_i - gi.bearing_y - sg.y_offset,
+                                .sx = gi.region.x,
+                                .sy = gi.region.y,
+                                .sw = gi.region.width,
+                                .sh = gi.region.height,
+                                .r = fg[0],
+                                .g = fg[1],
+                                .b = fg[2],
+                                .a = glyph_alpha,
+                            } });
+                        }
+                    },
+                    .unshaped => {
+                        const cp = cell.codepoint();
+                        if (cp >= first_drawable) {
+                            if (cache.get(cp, style.flags.bold, style.flags.italic)) |gi| {
+                                const gcell: gl.Cell = .{
+                                    .px = cell_x + gi.bearing_x,
+                                    .py = cell_y + ascent_i - gi.bearing_y,
+                                    .sx = gi.region.x,
+                                    .sy = gi.region.y,
+                                    .sw = gi.region.width,
+                                    .sh = gi.region.height,
+                                    .r = fg[0],
+                                    .g = fg[1],
+                                    .b = fg[2],
+                                    .a = glyph_alpha,
+                                };
+                                // Color glyphs (emoji, #78) come from the RGBA atlas
+                                // and are drawn untinted; everything else is tinted.
+                                try quads.append(alloc, if (gi.color) .{ .color_glyph = gcell } else .{ .glyph = gcell });
+                            }
+                        }
+                    },
                 }
             }
 
