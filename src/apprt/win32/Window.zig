@@ -58,6 +58,11 @@ pub const Event = union(enum) {
     mouse_capture_lost,
     /// The client area was resized (pixels).
     resize: struct { width: u16, height: u16 },
+    /// The window moved to a monitor with a different DPI (WM_DPICHANGED, #90),
+    /// carrying the new DPI. The window proc already applied the OS-suggested
+    /// rect (which fires a `.resize`); the app rebuilds the glyph atlas + cell
+    /// metrics at the new scale.
+    dpi_changed: u32,
     /// The window gained (true) or lost (false) keyboard focus. Drives the
     /// hollow-when-unfocused cursor.
     focus: bool,
@@ -102,6 +107,16 @@ pub const Window = struct {
     /// mashed again) would queue another `.close` and re-prompt after the user
     /// answers; wndProc drops WM_CLOSE while this is set.
     close_pending: bool = false,
+    /// Whether the window is pinned always-on-top (toggle_window_float_on_top,
+    /// #92). The window is created not-topmost.
+    topmost: bool = false,
+    /// Whether the window is currently hidden (toggle_visibility, #92). The
+    /// window is created visible.
+    hidden: bool = false,
+    /// Caret pixel (client coords) the IME composition + candidate windows are
+    /// pinned to (#88). The app refreshes it each loop turn from the focused
+    /// pane's cursor; the composition messages read it when the IME opens.
+    ime_pos: w.POINT = .{ .x = 0, .y = 0 },
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("whosttyWindowClass");
 
@@ -123,6 +138,22 @@ pub const Window = struct {
     /// registration genuinely failed (vs. the benign already-registered case).
     var register_class_once = std.once(registerClassOnce);
     var register_ok: bool = false;
+
+    /// Per-monitor-DPI-v2 must be set process-wide BEFORE any window is created
+    /// (#90), so it runs once from `init` ahead of class registration. Best-effort:
+    /// on an OS without the API the window stays system-DPI-scaled.
+    var dpi_aware_once = std.once(setProcessDpiAware);
+
+    fn setProcessDpiAware() void {
+        _ = w.SetProcessDpiAwarenessContext(w.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    /// The DPI of the monitor this window is on (#90); 96 (scale 1.0) if the OS
+    /// can't report it.
+    pub fn dpiForWindow(self: *Window) u32 {
+        const d = w.GetDpiForWindow(self.hwnd);
+        return if (d == 0) w.USER_DEFAULT_SCREEN_DPI else d;
+    }
 
     fn registerClassOnce() void {
         const hinstance = w.GetModuleHandleW(null).?;
@@ -153,6 +184,10 @@ pub const Window = struct {
         self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined };
 
         const hinstance = w.GetModuleHandleW(null).?;
+
+        // Opt into per-monitor DPI awareness (#90) before creating any window so
+        // WM_DPICHANGED is delivered and GetDpiForWindow reports the real DPI.
+        dpi_aware_once.call();
 
         // Register the window class once per process (thread-safe via std.once);
         // every window after the first reuses the already-registered class.
@@ -377,6 +412,85 @@ pub const Window = struct {
         self.decorations = !self.decorations;
     }
 
+    /// Bring the window to the foreground and raise it (present_terminal, #92).
+    /// Un-hides it first if it was hidden. The OS foreground lock may refuse the
+    /// focus change cross-process, so this is best-effort (BringWindowToTop +
+    /// SetForegroundWindow), matching ghostty's `present` semantics.
+    pub fn present(self: *Window) void {
+        if (self.hidden) {
+            _ = w.ShowWindow(self.hwnd, w.SW_SHOW);
+            self.hidden = false;
+        }
+        _ = w.BringWindowToTop(self.hwnd);
+        _ = w.SetForegroundWindow(self.hwnd);
+    }
+
+    /// Toggle always-on-top (toggle_window_float_on_top, #92): re-file the window
+    /// at the top of (or out of) the topmost Z-order band without moving, sizing,
+    /// or activating it. Tracks the state so the next toggle reverses it.
+    pub fn toggleFloat(self: *Window) void {
+        const after: w.HWND = if (self.topmost) w.HWND_NOTOPMOST else w.HWND_TOPMOST;
+        _ = w.SetWindowPos(self.hwnd, after, 0, 0, 0, 0, w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOACTIVATE);
+        self.topmost = !self.topmost;
+    }
+
+    /// Show/hide the window (toggle_visibility, #92). Hiding removes it from the
+    /// screen + taskbar (SW_HIDE) without closing it (its shell keeps running);
+    /// showing restores it and brings it forward so it's usable again.
+    pub fn toggleVisibility(self: *Window) void {
+        if (self.hidden) {
+            _ = w.ShowWindow(self.hwnd, w.SW_SHOW);
+            _ = w.SetForegroundWindow(self.hwnd);
+            self.hidden = false;
+        } else {
+            _ = w.ShowWindow(self.hwnd, w.SW_HIDE);
+            self.hidden = true;
+        }
+    }
+
+    /// Update where the IME composition/candidate windows appear (#88). The app
+    /// passes the focused pane's caret pixel each loop turn so the candidate list
+    /// tracks the cursor; the value is read when composition starts/updates.
+    pub fn setImePosition(self: *Window, x: i32, y: i32) void {
+        self.ime_pos = .{ .x = x, .y = y };
+    }
+
+    /// Pin the IME composition + candidate windows to the caret (`ime_pos`) so
+    /// they open at the cursor, not the window's top-left (#88). Best-effort: no
+    /// IME context (no IME active for this window) is a clean no-op.
+    fn placeImeWindows(self: *Window) void {
+        const himc = w.ImmGetContext(self.hwnd) orelse return;
+        defer _ = w.ImmReleaseContext(self.hwnd, himc);
+        const comp: w.COMPOSITIONFORM = .{
+            .dwStyle = w.CFS_POINT,
+            .ptCurrentPos = self.ime_pos,
+            .rcArea = std.mem.zeroes(w.RECT),
+        };
+        _ = w.ImmSetCompositionWindow(himc, &comp);
+        const cand: w.CANDIDATEFORM = .{
+            .dwIndex = 0,
+            .dwStyle = w.CFS_CANDIDATEPOS,
+            .ptCurrentPos = self.ime_pos,
+            .rcArea = std.mem.zeroes(w.RECT),
+        };
+        _ = w.ImmSetCandidateWindow(himc, &cand);
+    }
+
+    /// Read the committed IME result string and queue it as `.char` events (#88),
+    /// reusing the same text path as a typed key. Bounded by a fixed UTF-16
+    /// scratch (commit strings are short); an over-long result is truncated on a
+    /// unit boundary rather than overflowing (the #89 stack-overflow precedent).
+    fn pushImeResult(self: *Window) void {
+        const himc = w.ImmGetContext(self.hwnd) orelse return;
+        defer _ = w.ImmReleaseContext(self.hwnd, himc);
+        var buf: [256]u16 = undefined;
+        const bytes = w.ImmGetCompositionStringW(himc, w.GCS_RESULTSTR, &buf, @sizeOf(@TypeOf(buf)));
+        if (bytes <= 0) return;
+        const units: usize = @min(@as(usize, @intCast(bytes)) / 2, buf.len);
+        var it = std.unicode.Utf16LeIterator.init(buf[0..units]);
+        while (it.nextCodepoint() catch null) |cp| self.push(.{ .char = @intCast(cp) });
+    }
+
     /// Close-confirmation gate (#91), mirroring ghostty's `needsConfirmQuit`
     /// semantics for the `.true` default: prompt ONLY when a foreground command
     /// is running, i.e. the shell has a live child process. Returns true if the
@@ -507,6 +621,29 @@ pub const Window = struct {
                     const width: u16 = @truncate(@as(usize, @bitCast(lparam)) & 0xFFFF);
                     const height: u16 = @truncate((@as(usize, @bitCast(lparam)) >> 16) & 0xFFFF);
                     s.push(.{ .resize = .{ .width = width, .height = height } });
+                }
+                return 0;
+            },
+            w.WM_DPICHANGED => {
+                if (self) |s| {
+                    // wParam LOWORD = the new DPI (X and Y are equal here).
+                    const new_dpi: u32 = @as(u16, @truncate(wparam & 0xFFFF));
+                    // Queue the rebuild BEFORE applying the suggested rect, so the
+                    // app updates cell metrics before the `.resize` that the move
+                    // generates re-grids the panes with them.
+                    s.push(.{ .dpi_changed = new_dpi });
+                    // lParam points at the OS-suggested window rect for the new DPI
+                    // (position + size); apply it so the window scales to match.
+                    const r: *const w.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    _ = w.SetWindowPos(
+                        hwnd,
+                        null,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        w.SWP_NOZORDER | w.SWP_NOACTIVATE,
+                    );
                 }
                 return 0;
             },
@@ -656,6 +793,27 @@ pub const Window = struct {
                     s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y } });
                 }
                 return 0;
+            },
+            w.WM_IME_STARTCOMPOSITION => {
+                // Open the IME's own composition + candidate UI at the caret, then
+                // let DefWindowProc run that default UI.
+                if (self) |s| s.placeImeWindows();
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+            w.WM_IME_COMPOSITION => {
+                if (self) |s| {
+                    s.placeImeWindows();
+                    // A committed result: feed it to the pty and CONSUME the
+                    // message so DefWindowProc doesn't also deliver it as
+                    // WM_IME_CHAR/WM_CHAR (which would double the input).
+                    if ((@as(usize, @bitCast(lparam)) & @as(usize, w.GCS_RESULTSTR)) != 0) {
+                        s.pushImeResult();
+                        return 0;
+                    }
+                }
+                // In-progress composition (GCS_COMPSTR / caret move): let the
+                // default IME composition window draw it at the pinned caret.
+                return w.DefWindowProcW(hwnd, msg, wparam, lparam);
             },
             else => return w.DefWindowProcW(hwnd, msg, wparam, lparam),
         }

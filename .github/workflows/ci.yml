@@ -42,3 +42,14 @@ jobs:
 
       - name: Cross-compile the Win32 terminal (link check)
         run: zig build -Dtarget=x86_64-windows
+
+      # Shaping (#79) rides on Freetype + HarfBuzz (both built from source). This
+      # cross-compiles the full shaped renderer for Windows — link-checking the
+      # HarfBuzz binding, the shaper, and the apprt's shaped-text path — and then
+      # builds + runs the standalone shaping proof (which links HarfBuzz only and
+      # shapes via the OpenType blob path, no Freetype).
+      - name: Cross-compile the shaped Win32 terminal (Freetype + HarfBuzz)
+        run: zig build -Dtarget=x86_64-windows -Dfreetype -Dharfbuzz
+
+      - name: HarfBuzz shaping proof
+        run: zig build shape-proof

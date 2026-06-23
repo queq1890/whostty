@@ -527,6 +527,18 @@ pub const Termio = struct {
             self.terminal.modes.get(.cursor_visible);
     }
 
+    /// The focused cursor's position in viewport cells (x = column, y = row), or
+    /// null when it has scrolled out of view. Mirrors the mapping `buildQuads`
+    /// uses to draw the cursor; used to pin the IME composition/candidate window
+    /// to the caret (#88). Thread-safe.
+    pub fn cursorViewport(self: *Termio) ?struct { x: u32, y: u32 } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const cpt = screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*) orelse return null;
+        return .{ .x = cpt.viewport.x, .y = cpt.viewport.y };
+    }
+
     /// Seed the terminal's dynamic colors with the configured defaults so that
     /// OSC color queries report the configured color (until an app overrides it)
     /// and the renderer can treat `terminal.colors` as the single source of

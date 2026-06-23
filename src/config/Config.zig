@@ -460,6 +460,12 @@ mouse_hide_while_typing: bool = false,
 mouse_shift_capture: MouseShiftCapture = .true,
 focus_follows_mouse: bool = false,
 scrollback_limit: usize = 10_000_000,
+/// Route a second launch into the already-running instance (#93): when set,
+/// starting whostty while it's already running opens a new window in the
+/// existing process instead of spawning a separate one. Default off, so the
+/// normal one-process-per-launch behavior is unchanged. Ported from ghostty's
+/// single-instance behavior (`gtk-single-instance`).
+single_instance: bool = false,
 
 // --- Command / shell / environment ---
 command: ?Command = null,
@@ -674,6 +680,8 @@ fn set(self: *Config, alloc: std.mem.Allocator, key: []const u8, value: []const 
         self.focus_follows_mouse = try parseBool(value);
     } else if (eq(key, "scrollback-limit")) {
         self.scrollback_limit = try std.fmt.parseInt(usize, value, 10);
+    } else if (eq(key, "single-instance")) {
+        self.single_instance = try parseBool(value);
 
         // Command / shell / environment
     } else if (eq(key, "command")) {
@@ -1011,6 +1019,17 @@ test "config: window padding parses x/y/balance; defaults to zero/off" {
     try testing.expectEqual(@as(u16, 0), def.window_padding_x);
     try testing.expectEqual(@as(u16, 0), def.window_padding_y);
     try testing.expect(!def.window_padding_balance);
+}
+
+test "config: single-instance parses; defaults off" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator, "single-instance = true\n");
+    defer cfg.deinit();
+    try testing.expect(cfg.single_instance);
+
+    var def = try Config.parse(testing.allocator, "\n");
+    defer def.deinit();
+    try testing.expect(!def.single_instance);
 }
 
 test "config: color overrides default to null; bool flag form is true" {

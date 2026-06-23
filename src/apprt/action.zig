@@ -37,8 +37,21 @@ pub const Action = union(enum) {
     // --- App-scoped (Target.app) ---
     /// Open a new top-level window (a fresh window thread, #86).
     new_window,
+    /// Close every window, ending the app (#92).
+    quit,
+    /// Bring the Nth top-level window (1-based) to the foreground (#92).
+    goto_window: u8,
 
     // --- Surface-scoped (Target.surface): the calling window ---
+    /// Close the calling window and all its tabs/splits (#92). Distinct from
+    /// `close_surface`, which closes only the focused pane.
+    close_window,
+    /// Bring the calling window to the foreground (#92).
+    present_terminal,
+    /// Pin / unpin the calling window always-on-top (#92).
+    toggle_window_float_on_top,
+    /// Hide / show the calling window (#92).
+    toggle_visibility,
     /// Close the calling window. Breaks only that window's message loop; the
     /// process exits only when the LAST window closes.
     close_surface,
@@ -72,7 +85,7 @@ pub const Action = union(enum) {
     /// each action to a `Target`.
     pub fn target(self: Action) Target {
         return switch (self) {
-            .new_window => .app,
+            .new_window, .quit, .goto_window => .app,
             else => .surface,
         };
     }
@@ -101,6 +114,12 @@ pub fn fromBinding(b: binding.Action) Action {
         .next_tab => .next_tab,
         .previous_tab => .previous_tab,
         .goto_tab => |n| .{ .goto_tab = n },
+        .quit => .quit,
+        .close_window => .close_window,
+        .goto_window => |n| .{ .goto_window = n },
+        .present_terminal => .present_terminal,
+        .toggle_window_float_on_top => .toggle_window_float_on_top,
+        .toggle_visibility => .toggle_visibility,
     };
 }
 
@@ -118,6 +137,13 @@ test "apprt.Action: binding maps to the matching apprt action" {
     try testing.expectEqual(Action.scroll_to_bottom, fromBinding(.scroll_to_bottom));
     try testing.expectEqual(Action.copy_to_clipboard, fromBinding(.copy_to_clipboard));
     try testing.expectEqual(Action.paste_from_clipboard, fromBinding(.paste_from_clipboard));
+    // App-lifecycle + windowing actions (#92).
+    try testing.expectEqual(Action.quit, fromBinding(.quit));
+    try testing.expectEqual(Action.close_window, fromBinding(.close_window));
+    try testing.expectEqual(Action{ .goto_window = 2 }, fromBinding(.{ .goto_window = 2 }));
+    try testing.expectEqual(Action.present_terminal, fromBinding(.present_terminal));
+    try testing.expectEqual(Action.toggle_window_float_on_top, fromBinding(.toggle_window_float_on_top));
+    try testing.expectEqual(Action.toggle_visibility, fromBinding(.toggle_visibility));
 }
 
 test "apprt.Action: stubbed tab/split actions still map (payload-preserving)" {
@@ -139,4 +165,11 @@ test "apprt.Action: only new_window is app-scoped" {
     try testing.expectEqual(Target.surface, scroll_page_up.target());
     try testing.expectEqual(Target.surface, copy.target());
     try testing.expectEqual(Target.surface, (Action{ .new_split = .left }).target());
+    // App-lifecycle (#92): quit + goto_window are app-scoped; the rest act on
+    // the calling window (surface-scoped).
+    try testing.expectEqual(Target.app, @as(Action, .quit).target());
+    try testing.expectEqual(Target.app, (Action{ .goto_window = 1 }).target());
+    try testing.expectEqual(Target.surface, @as(Action, .close_window).target());
+    try testing.expectEqual(Target.surface, @as(Action, .present_terminal).target());
+    try testing.expectEqual(Target.surface, @as(Action, .toggle_visibility).target());
 }

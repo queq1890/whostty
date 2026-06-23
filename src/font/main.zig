@@ -123,10 +123,16 @@ pub const Face = struct {
     /// synthesizing bold (embolden the outline) and/or italic (shear the
     /// outline) before rendering.
     pub fn rasterize(self: Face, alloc: std.mem.Allocator, codepoint: u32, style: Style) !Glyph {
-        const idx = self.inner.getCharIndex(codepoint) orelse 0;
+        return self.rasterizeIndex(alloc, self.inner.getCharIndex(codepoint) orelse 0, style);
+    }
+
+    /// Rasterize by glyph index rather than codepoint — the form the shaped-text
+    /// path needs, since HarfBuzz returns glyph indices, not codepoints (#79).
+    /// Identical synthetic bold/italic handling to `rasterize`.
+    pub fn rasterizeIndex(self: Face, alloc: std.mem.Allocator, glyph_index: u32, style: Style) !Glyph {
         // Load the outline WITHOUT rendering so synthetic styling can transform
         // it; then render. (`render = true` would rasterize the plain glyph.)
-        try self.inner.loadGlyph(idx, .{});
+        try self.inner.loadGlyph(glyph_index, .{});
 
         const slot = self.inner.handle.*.glyph;
         // Only outline glyphs can be transformed; bitmap (color/emoji) faces are
