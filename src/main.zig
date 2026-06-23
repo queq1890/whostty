@@ -52,7 +52,7 @@ const help_text =
     \\  --help, -h         Show this help.
     \\  --version, -V      Show the version.
     \\
-    \\Config file: %APPDATA%\whostty\config
+    \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
     \\
 ;
 
