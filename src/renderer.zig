@@ -42,25 +42,20 @@ pub const Backend = enum {
     direct3d,
 };
 
-/// Direct3D backend (#15) — the long-term native Windows renderer.
+/// The Direct3D 11 backend (#15/#43) — the native Windows renderer.
 ///
-/// Not yet implemented. A faithful D3D11 path mirrors the OpenGL one: create a
-/// device + swap chain for the HWND (`D3D11CreateDeviceAndSwapChain`), a glyph
-/// atlas as a `Texture2D` + SRV, a textured-quad vertex/pixel shader pair, a
-/// dynamic vertex buffer for per-cell quads, and `Present` per frame — the same
-/// quad geometry the OpenGL backend's host-tested `pushQuad` already produces,
-/// so that math is shared rather than reimplemented.
-///
-/// This is COM-heavy (device, context, swap chain, buffers, shaders, blend
-/// state) and must be written and verified on a Windows host with a compiler; a
-/// wrong interface layout faults at run time, not compile time. It is therefore
-/// not landed blind in this environment. Selecting `renderer = direct3d` today
-/// falls back to OpenGL with a warning (see `apprt/win32/App.zig`).
-pub const direct3d_status = "pending: needs a Windows host + compiler to verify the COM device/swapchain path (#15)";
+/// A faithful port of the OpenGL one: it creates a device + swap chain for the
+/// HWND (`D3D11CreateDeviceAndSwapChain`), an R8 glyph atlas + RGBA color atlas
+/// as `Texture2D` + SRV, a runtime-compiled HLSL vertex/pixel shader pair, a
+/// dynamic vertex buffer, and `Present` per frame — sharing the OpenGL backend's
+/// host-tested `pushQuad`/`pushSolid`/`pushColorQuad` geometry rather than
+/// reimplementing it. The app selects it with `renderer = direct3d`.
+pub const Direct3D11 = @import("renderer/Direct3D11.zig");
 
 test {
-    // Pull the implemented backend's host tests in via the abstraction module.
+    // Pull the implemented backends' host tests in via the abstraction module.
     _ = OpenGL;
+    _ = Direct3D11;
     _ = cursor;
     _ = color;
 }

@@ -17,6 +17,7 @@ const Termio = @import("../../termio.zig").Termio;
 const Window = @import("Window.zig").Window;
 const st = @import("SplitTree.zig");
 const gl = @import("../../renderer/OpenGL.zig");
+const d3d = @import("../../renderer/Direct3D11.zig");
 const rcursor = @import("../../renderer/cursor.zig");
 const rcolor = @import("../../renderer/color.zig");
 const decoration = @import("../../renderer/decoration.zig");
@@ -799,10 +800,17 @@ fn runSurface(app: *App) !void {
     const co_hr = w.CoInitializeEx(null, w.COINIT_APARTMENTTHREADED);
     defer if (co_hr >= 0) w.CoUninitialize();
 
-    // --- Window + GL context (UI thread) ---
+    // --- Config (colors, font size, palette overrides) ---
+    // Loaded before the window so the renderer backend choice can drive whether
+    // the window creates a WGL/OpenGL context (Direct3D owns its own swap chain).
+    var cfg = loadConfig(alloc, opts.config_text);
+    defer cfg.deinit();
+    const theme: Theme = .fromConfig(&cfg);
+
+    // --- Window + render backend (UI thread) ---
     const win = try alloc.create(Window);
     defer alloc.destroy(win);
-    try win.init("whostty", 960, 540);
+    try win.init("whostty", 960, 540, cfg.renderer == .opengl);
     defer win.deinit();
     // Register for cross-window actions (#92). The unregister defer is declared
     // AFTER the destroy/deinit defers so it runs FIRST on teardown (LIFO) — the
@@ -811,19 +819,21 @@ fn runSurface(app: *App) !void {
     defer app.unregisterWindow(win);
     win.makeCurrent();
 
-    var renderer = try gl.Renderer.init(alloc, w.wglGetProcAddress);
-    defer renderer.deinit();
-
-    // --- Config (colors, font size, palette overrides) ---
-    var cfg = loadConfig(alloc, opts.config_text);
-    defer cfg.deinit();
-    const theme: Theme = .fromConfig(&cfg);
-
-    // Direct3D (#15) is selectable in config but not implemented yet; OpenGL is
-    // the only backend, so warn and fall back rather than failing to start.
-    if (cfg.renderer == .direct3d) {
-        log.warn("renderer = direct3d is not implemented yet; using OpenGL", .{});
-    }
+    // The selected backend (config `renderer`). Both expose the identical
+    // init/deinit/setAtlas/setColorAtlas/draw shape; `inline else` resolves the
+    // concrete method at compile time, so there's no hot-path vtable. OpenGL
+    // presents via `win.swapBuffers`; Direct3D owns its swap chain (`present`).
+    const RendererImpl = union(enum) {
+        opengl: gl.Renderer,
+        direct3d: d3d.Renderer,
+    };
+    var renderer: RendererImpl = switch (cfg.renderer) {
+        .opengl => .{ .opengl = try gl.Renderer.init(alloc, w.wglGetProcAddress) },
+        .direct3d => .{ .direct3d = try d3d.Renderer.init(alloc, win.handle()) },
+    };
+    defer switch (renderer) {
+        inline else => |*r| r.deinit(),
+    };
 
     // Keybindings: seed defaults, then apply user `keybind` overrides.
     var binds: binding.Set = .{};
@@ -883,7 +893,9 @@ fn runSurface(app: *App) !void {
         for (default_fallback_fonts) |fb| cache.addFallback(fb);
         // Upload the (empty) atlas once so the glyph texture + its sampling
         // params are configured before the first draw; new glyphs re-upload.
-        renderer.setAtlas(cache.atlas.data, cache.atlas.size);
+        switch (renderer) {
+            inline else => |*r| r.setAtlas(cache.atlas.data, cache.atlas.size),
+        }
     }
 
     // HarfBuzz shaper (#79): built once from the primary face and reused every
@@ -1163,7 +1175,9 @@ fn runSurface(app: *App) !void {
                                 ascent = cache.ascent;
                                 ws.cell_w = cell_w;
                                 ws.cell_h = cell_h;
-                                renderer.setAtlas(cache.atlas.data, cache.atlas.size);
+                                switch (renderer) {
+                                    inline else => |*r| r.setAtlas(cache.atlas.data, cache.atlas.size),
+                                }
                                 if (hb) {
                                     if (cache.primaryFaceHandle()) |fh| {
                                         if (harfbuzz.Font.initFreetype(fh)) |hbfont| {
@@ -1315,8 +1329,12 @@ fn runSurface(app: *App) !void {
         }
         // buildQuads (across all panes) may have packed new glyphs into the shared
         // atlas; re-upload once before drawing.
-        if (ft and cache.takeDirty()) renderer.setAtlas(cache.atlas.data, cache.atlas.size);
-        if (ft and cache.takeColorDirty()) renderer.setColorAtlas(cache.color_atlas.data, cache.color_atlas.size);
+        if (ft and cache.takeDirty()) switch (renderer) {
+            inline else => |*r| r.setAtlas(cache.atlas.data, cache.atlas.size),
+        };
+        if (ft and cache.takeColorDirty()) switch (renderer) {
+            inline else => |*r| r.setColorAtlas(cache.color_atlas.data, cache.color_atlas.size),
+        };
 
         // Split dividers, then (with >1 tab) the tab strip, both drawn on top.
         appendDividers(&ws, &quads, alloc) catch {};
@@ -1325,12 +1343,22 @@ fn runSurface(app: *App) !void {
         // Default-background cells show through the clear color, so it tracks the
         // focused pane's OSC 11 background override (falling back to config bg).
         const clear_bg = if (fp) |p| rgbf(p.io.backgroundColor(theme.bg)) else rgbf(theme.bg);
-        try renderer.draw(quads.items, clear_bg, sz.width, sz.height);
+        try switch (renderer) {
+            inline else => |*r| r.draw(quads.items, clear_bg, sz.width, sz.height),
+        };
 
         dbg_frame += 1;
-        if (render_debug and dbg_frame == 10) renderer.debugCountLitPixels(clear_bg, sz.width, sz.height);
+        // The render-debug back-buffer self-check is OpenGL-only (glReadPixels).
+        if (render_debug and dbg_frame == 10) switch (renderer) {
+            .opengl => |*r| r.debugCountLitPixels(clear_bg, sz.width, sz.height),
+            .direct3d => {},
+        };
 
-        win.swapBuffers();
+        // Present: OpenGL via the window's double buffer, Direct3D via its swap chain.
+        switch (renderer) {
+            .opengl => win.swapBuffers(),
+            .direct3d => |*r| r.present(),
+        }
     }
 }
 

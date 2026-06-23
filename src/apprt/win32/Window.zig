@@ -76,6 +76,10 @@ pub const Window = struct {
     hwnd: w.HWND,
     hdc: w.HDC,
     hglrc: w.HGLRC,
+    /// Whether a WGL OpenGL context was created. False for the Direct3D backend,
+    /// which needs only the HWND and owns its own swap chain — then `hglrc` is
+    /// unused and `makeCurrent`/`swapBuffers`/the WGL teardown are no-ops.
+    gl_enabled: bool = true,
 
     // Single-threaded SPSC-on-one-thread event ring (producer = wndproc,
     // consumer = poll, both on the UI thread).
@@ -180,8 +184,8 @@ pub const Window = struct {
 
     /// Create the window and its GL context. `self` must have a stable address
     /// (heap-allocate it) because the window stores a pointer back to it.
-    pub fn init(self: *Window, title_utf8: []const u8, width: i32, height: i32) CreateError!void {
-        self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined };
+    pub fn init(self: *Window, title_utf8: []const u8, width: i32, height: i32, use_gl: bool) CreateError!void {
+        self.* = .{ .hwnd = undefined, .hdc = undefined, .hglrc = undefined, .gl_enabled = use_gl };
 
         const hinstance = w.GetModuleHandleW(null).?;
 
@@ -218,7 +222,9 @@ pub const Window = struct {
         _ = w.SetWindowLongPtrW(hwnd, w.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
         self.hdc = w.GetDC(hwnd) orelse return error.GetDCFailed;
-        try self.initGl();
+        // The Direct3D backend creates its own device + swap chain from the HWND;
+        // only the WGL/OpenGL backend needs a GL context here.
+        if (use_gl) try self.initGl();
 
         _ = w.ShowWindow(hwnd, w.SW_SHOW);
         _ = w.UpdateWindow(hwnd);
@@ -274,15 +280,17 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
-        _ = w.wglMakeCurrent(null, null);
-        _ = w.wglDeleteContext(self.hglrc);
+        if (self.gl_enabled) {
+            _ = w.wglMakeCurrent(null, null);
+            _ = w.wglDeleteContext(self.hglrc);
+        }
         _ = w.ReleaseDC(self.hwnd, self.hdc);
         _ = w.DestroyWindow(self.hwnd);
         self.* = undefined;
     }
 
     pub fn makeCurrent(self: *Window) void {
-        _ = w.wglMakeCurrent(self.hdc, self.hglrc);
+        if (self.gl_enabled) _ = w.wglMakeCurrent(self.hdc, self.hglrc);
     }
 
     /// The native window handle (for synchronous Win32 calls like the clipboard).
@@ -517,7 +525,7 @@ pub const Window = struct {
     }
 
     pub fn swapBuffers(self: *Window) void {
-        _ = w.SwapBuffers(self.hdc);
+        if (self.gl_enabled) _ = w.SwapBuffers(self.hdc);
     }
 
     pub fn clientSize(self: *Window) struct { width: u16, height: u16 } {
