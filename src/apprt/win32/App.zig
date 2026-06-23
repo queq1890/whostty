@@ -178,26 +178,22 @@ const CursorRender = struct {
     thickness: u32,
 };
 
-/// Load the user config from `%APPDATA%\whostty\config`, falling back to
-/// defaults if it is missing or unreadable. The configured `font-family` is
-/// resolved to a concrete face via DirectWrite discovery (#74); size/colors
-/// also take effect.
+/// Load the user config via the full config system (#49): the default file
+/// `%APPDATA%\whostty\config.whostty` (legacy `…\config`), its `theme` applied
+/// as a base layer (resolved against the OS light/dark appearance), and its
+/// `config-file` includes loaded recursively. Falls back to defaults if the
+/// file is missing or unreadable. The configured `font-family` is resolved to a
+/// concrete face via DirectWrite discovery (#74); size/colors also take effect.
 fn loadConfig(alloc: std.mem.Allocator, override_text: []const u8) config.Config {
-    var cfg = loadConfigFile(alloc) catch config.Config.init(alloc);
+    var cfg = config.Config.init(alloc);
+    const state: config.ConditionalState = .{
+        .theme = if (w.isSystemDarkMode()) .dark else .light,
+    };
+    config.loadDefaultFiles(&cfg, alloc, state) catch {};
     // CLI `--key value` flags arrive as `key = value` lines applied on top of
     // the file config (same grammar), so the command line wins.
     if (override_text.len > 0) cfg.loadString(override_text) catch {};
     return cfg;
-}
-
-fn loadConfigFile(alloc: std.mem.Allocator) !config.Config {
-    const appdata = try std.process.getEnvVarOwned(alloc, "APPDATA");
-    defer alloc.free(appdata);
-    const path = try std.fs.path.join(alloc, &.{ appdata, "whostty", "config" });
-    defer alloc.free(path);
-    const data = try std.fs.cwd().readFileAlloc(alloc, path, 1 << 20);
-    defer alloc.free(data);
-    return try config.Config.parse(alloc, data);
 }
 
 /// The small, heap-allocated state shared across every window thread (#86). It is

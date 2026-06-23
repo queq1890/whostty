@@ -830,3 +830,38 @@ pub const WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB: INT = 0x00000002;
 /// Signature of wglCreateContextAttribsARB. `attribs` is an INT key/value list
 /// terminated by 0.
 pub const CreateContextAttribsFn = *const fn (HDC, ?HGLRC, [*:0]const INT) callconv(.winapi) ?HGLRC;
+
+// --- Registry (system light/dark appearance detection) ------------------
+
+pub const HKEY = *opaque {};
+pub const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+
+/// RegGetValue flag: restrict to REG_DWORD values.
+pub const RRF_RT_REG_DWORD: DWORD = 0x00000010;
+
+pub extern "advapi32" fn RegGetValueW(
+    hkey: HKEY,
+    lpSubKey: ?LPCWSTR,
+    lpValue: ?LPCWSTR,
+    dwFlags: DWORD,
+    pdwType: ?*DWORD,
+    pvData: ?*anyopaque,
+    pcbData: ?*DWORD,
+) callconv(.winapi) i32;
+
+/// Returns true if the Windows desktop is using the dark app theme. Reads
+/// `HKCU\…\Themes\Personalize\AppsUseLightTheme` (0 = dark, 1 = light); any
+/// error (key missing, non-Windows) is treated as light. Used to seed the
+/// config conditional state so `theme = light:… dark:…` resolves (#49).
+pub fn isSystemDarkMode() bool {
+    if (builtin.os.tag != .windows) return false;
+    var data: DWORD = 1; // default: light
+    var size: DWORD = @sizeOf(DWORD);
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    const value = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    const rc = RegGetValueW(HKEY_CURRENT_USER, subkey, value, RRF_RT_REG_DWORD, null, &data, &size);
+    if (rc != 0) return false;
+    return data == 0;
+}
