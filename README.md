@@ -22,6 +22,30 @@ reimplement the VT core — it depends on
 - **Language**: Zig (same as ghostty; direct module import, no C FFI).
 - **Windows-native**: Win32 `apprt/win32`, ConPTY (no WSL), WGL + OpenGL
   rendering first (Direct3D later), Freetype glyphs first (DirectWrite later).
+- **Importable engine boundary** (epic E0): the platform-free engine layer is
+  published as a Zig module so [whomux](https://github.com/queq1890/whomux) can
+  pin whostty and drive the terminal from its own Win32 host.
+
+### Engine module exports
+
+A downstream package pins whostty in its `build.zig.zon` and imports:
+
+| module | what it is |
+|---|---|
+| `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame` — zero Win32 / ConPTY / WGL dependency. |
+| `ghostty-vt` | the pinned libghostty-vt VT core, re-exported so the consumer shares whostty's single pin (no second, drifting ghostty-vt dependency). |
+
+```zig
+// downstream build.zig
+const whostty = b.dependency("whostty", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("whostty-engine", whostty.module("whostty-engine"));
+exe.root_module.addImport("ghostty-vt", whostty.module("ghostty-vt"));
+```
+
+Per the staged minimal-export-first policy the engine model is the first stable
+export; the apprt-free Surface host vtable, foundational Surface APIs, unified
+cwd, the attention side channel, OSC 133 / OSC 8, terminfo and the config
+resolver are layered onto the boundary by the remaining E0 issues.
 
 See [CONTEXT.md](CONTEXT.md) for the project glossary and [docs/adr/](docs/adr/)
 for architecture decisions.
