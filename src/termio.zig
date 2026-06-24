@@ -7,7 +7,7 @@
 //! See PORTING.md.
 const std = @import("std");
 const vt = @import("ghostty-vt");
-const mouse = @import("mouse.zig");
+const mouse = @import("engine/mouse.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.

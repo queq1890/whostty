@@ -109,16 +109,13 @@ test {
     _ = @import("renderer.zig");
     _ = @import("Surface.zig");
     _ = @import("config.zig");
-    _ = @import("scroll.zig");
-    _ = @import("frame.zig");
-    _ = @import("apprt/win32/SplitTree.zig");
+    _ = @import("engine/engine.zig"); // grid + SplitTree/TabList + mouse + scroll + frame
     _ = @import("font/discovery.zig");
     _ = @import("font/shaper.zig");
     _ = @import("input/Binding.zig");
     _ = @import("apprt/action.zig");
     _ = @import("apprt/win32/keymap.zig");
     _ = @import("os/windows.zig");
-    _ = @import("mouse.zig");
     _ = @import("cli.zig");
     if (@import("build_options").freetype) _ = @import("font/main.zig");
     if (@import("build_options").freetype) _ = @import("font/GlyphCache.zig");

@@ -90,6 +90,43 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // --- Platform-free engine model (#129, epic E0 #141) ---
+    // The engine layer — grid/cell/layout geometry, the SplitTree/TabList model,
+    // and the pure mouse / scroll / frame logic — must compile and unit-test with
+    // ZERO Windows dependency so whomux can import it. The module is rooted at
+    // src/engine/engine.zig, which imports ONLY the platform-free engine files.
+    //
+    // `engine-test` builds + runs the engine unit tests for the native host, so
+    // a dev runs them on their own box. The module path itself blocks any
+    // relative platform import (`@import("../os/windows.zig")` → "import of file
+    // outside module path"). On the Linux CI host this also link-checks against a
+    // non-Windows target; a Windows-only leak that still compiles on a Windows
+    // host is caught by `engine-linux` below, which CI also runs. (`zig build
+    // test` covers these via main.zig too; this target proves the engine builds
+    // standalone, with none of the Win32 apprt in the module graph.)
+    const engine_module = b.createModule(.{
+        .root_source_file = b.path("src/engine/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const engine_tests = b.addTest(.{ .root_module = engine_module });
+    const engine_test_step = b.step("engine-test", "Run the platform-free engine unit tests (#129)");
+    engine_test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+
+    // The host-independent boundary guard (CI runs this): link-check the engine
+    // model for an explicit Linux target so the boundary holds even when the
+    // build host is Windows. Built (compiled + linked) but not run — it may be a
+    // foreign target.
+    const engine_linkcheck = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine/engine.zig"),
+            .target = b.resolveTargetQuery(.{ .os_tag = .linux }),
+            .optimize = optimize,
+        }),
+    });
+    const engine_linkcheck_step = b.step("engine-linux", "Link-check the engine model for a non-Windows target (#129)");
+    engine_linkcheck_step.dependOn(&engine_linkcheck.step);
+
     // Headless render proof (Linux/EGL + Mesa): exercises the real OpenGL.zig
     // shaders/geometry, font/main.zig (Freetype) and font/Atlas.zig on a genuine
     // GL 3.3 core context and asserts glyphs reach lit pixels — on-device

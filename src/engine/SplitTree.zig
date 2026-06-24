@@ -1,4 +1,8 @@
-//! whostty: surface management — split trees and a tab list.
+//! whostty engine: surface management — split trees and a tab list (#129).
+//!
+//! Part of the platform-free engine layer (`src/engine/`, epic E0 #141):
+//! relocated here from `src/apprt/win32/` so whomux can drive the split/tab
+//! geometry from its own host. Both models stay free of any Windows types.
 //!
 //! Reference: ghostty manages splits per-apprt (e.g. `src/apprt/gtk` drives GTK
 //! `Paned` widgets) and tabs via the apprt notebook. Strategy: template — the
