@@ -23,6 +23,11 @@ pub const mouse = @import("mouse.zig");
 pub const scroll = @import("scroll.zig");
 pub const frame = @import("frame.zig");
 
+/// The apprt-free host vtable the engine calls back through for window services
+/// (GL context, redraw, clipboard, title, cursor, IME). Stability: experimental
+/// (ADR 0010) — the host (whomux) implements it; #132.
+pub const host = @import("host.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -31,6 +36,8 @@ pub const GridSize = grid.GridSize;
 pub const Cell = grid.Cell;
 pub const Padding = grid.Padding;
 pub const Layout = grid.Layout;
+pub const Host = host.Host;
+pub const CursorShape = host.CursorShape;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -40,4 +47,5 @@ test {
     _ = mouse;
     _ = scroll;
     _ = frame;
+    _ = host;
 }
