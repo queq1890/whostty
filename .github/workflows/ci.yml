@@ -40,6 +40,22 @@ jobs:
       - name: Host unit tests
         run: zig build test
 
+      # The platform-free engine layer (#129, epic E0) must build + unit-test with
+      # ZERO Windows dependency so whomux can import it. This runs the engine model
+      # (grid/cell/layout, SplitTree/TabList, mouse/scroll/frame) on the Linux CI
+      # host — a non-Windows target — so a leaked Win32 / ConPTY / WGL import into
+      # the engine namespace fails the build here.
+      - name: Platform-free engine unit tests + boundary check (#129)
+        run: zig build engine-test
+
+      # Force the engine model onto an explicit non-Windows target (compile +
+      # link only, never run). On the Linux CI host this overlaps engine-test,
+      # but it is the host-independent boundary guard: a platform leak that
+      # compiles on Windows yet won't link for Linux (e.g. a `kernel32` extern
+      # gated on `builtin.os.tag`) is caught here regardless of who runs it.
+      - name: Engine non-Windows boundary link-check (#129)
+        run: zig build engine-linux
+
       - name: Cross-compile the Win32 terminal (link check)
         run: zig build -Dtarget=x86_64-windows
 
