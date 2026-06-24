@@ -28,6 +28,11 @@ pub const frame = @import("frame.zig");
 /// (ADR 0010) — the host (whomux) implements it; #132.
 pub const host = @import("host.zig");
 
+/// Host-facing foundational Surface geometry (#133): DPI-aware cell metrics + the
+/// pure resize/reflow decision, extracted from the platform-bound Surface.
+/// Stability: experimental (ADR 0010).
+pub const surface = @import("surface.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -38,6 +43,7 @@ pub const Padding = grid.Padding;
 pub const Layout = grid.Layout;
 pub const Host = host.Host;
 pub const CursorShape = host.CursorShape;
+pub const Geometry = surface.Geometry;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -48,4 +54,5 @@ test {
     _ = scroll;
     _ = frame;
     _ = host;
+    _ = surface;
 }
