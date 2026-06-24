@@ -24,7 +24,9 @@ reimplement the VT core — it depends on
   rendering first (Direct3D later), Freetype glyphs first (DirectWrite later).
 - **Importable engine boundary** (epic E0): the platform-free engine layer is
   published as a Zig module so [whomux](https://github.com/queq1890/whomux) can
-  pin whostty and drive the terminal from its own Win32 host.
+  pin whostty and drive the terminal from its own Win32 host. The export surface
+  and its stability policy are defined in
+  [ADR 0010](docs/adr/0010-engine-api-stability.md).
 
 ### Engine module exports
 
@@ -42,9 +44,10 @@ exe.root_module.addImport("whostty-engine", whostty.module("whostty-engine"));
 exe.root_module.addImport("ghostty-vt", whostty.module("ghostty-vt"));
 ```
 
-Per the staged minimal-export-first policy the engine model is the first stable
-export; the apprt-free Surface host vtable, foundational Surface APIs, unified
-cwd, the attention side channel, OSC 133 / OSC 8, terminfo and the config
+Per the staged minimal-export-first policy
+([ADR 0010](docs/adr/0010-engine-api-stability.md)) the engine model is the first
+stable export; the apprt-free Surface host vtable, foundational Surface APIs,
+unified cwd, the attention side channel, OSC 133 / OSC 8, terminfo and the config
 resolver are layered onto the boundary by the remaining E0 issues.
 
 See [CONTEXT.md](CONTEXT.md) for the project glossary and [docs/adr/](docs/adr/)
