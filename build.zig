@@ -90,11 +90,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
-    // --- Platform-free engine model (#129, epic E0 #141) ---
-    // The engine layer — grid/cell/layout geometry, the SplitTree/TabList model,
-    // and the pure mouse / scroll / frame logic — must compile and unit-test with
-    // ZERO Windows dependency so whomux can import it. The module is rooted at
-    // src/engine/engine.zig, which imports ONLY the platform-free engine files.
+    // --- Engine module export (#130, epic E0 #141) ---
+    // The platform-free engine layer (#129) — grid/cell/layout geometry, the
+    // SplitTree/TabList model, and the pure mouse / scroll / frame logic — must
+    // compile and unit-test with ZERO Windows dependency so whomux can import it.
+    // The module is rooted at src/engine/engine.zig, which imports ONLY the
+    // platform-free engine files.
+    //
+    // `addModule("whostty-engine", …)` registers it in this package's module
+    // table so a downstream package that pins whostty in its build.zig.zon
+    // resolves it with `whostty_dep.module("whostty-engine")` — this is the first
+    // public, importable module of the engine boundary whomux builds on. Per the
+    // staged minimal-export-first stability policy (ADR 0003, #131) this is the
+    // minimal stable surface; the apprt-free Surface host vtable, foundational
+    // Surface APIs, unified cwd, the attention side channel, OSC 133 / OSC 8,
+    // terminfo, scrollback search and the config resolver are layered onto the
+    // boundary by #132–#140.
     //
     // `engine-test` builds + runs the engine unit tests for the native host, so
     // a dev runs them on their own box. The module path itself blocks any
@@ -104,11 +115,18 @@ pub fn build(b: *std.Build) void {
     // host is caught by `engine-linux` below, which CI also runs. (`zig build
     // test` covers these via main.zig too; this target proves the engine builds
     // standalone, with none of the Win32 apprt in the module graph.)
-    const engine_module = b.createModule(.{
+    const engine_module = b.addModule("whostty-engine", .{
         .root_source_file = b.path("src/engine/engine.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // Re-export the pinned libghostty-vt module under its canonical name so a
+    // downstream consumer imports the SAME VT core whostty pins (one pin, no
+    // second drifting ghostty-vt dependency in whomux). whomux resolves it with
+    // `whostty_dep.module("ghostty-vt")`. `addModule` does exactly this put for
+    // modules it creates; here we register an already-built dependency module.
+    b.modules.put(b.dupe("ghostty-vt"), ghostty_vt) catch @panic("OOM");
     const engine_tests = b.addTest(.{ .root_module = engine_module });
     const engine_test_step = b.step("engine-test", "Run the platform-free engine unit tests (#129)");
     engine_test_step.dependOn(&b.addRunArtifact(engine_tests).step);
