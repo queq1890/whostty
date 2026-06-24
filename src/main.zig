@@ -10,7 +10,9 @@ const vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
 const w = @import("os/windows.zig");
 
-const version_string = "whostty 0.0.0 (ghostty v1.3.1, libghostty-vt)";
+// Canonical version lives in build.zig.zon (`.version`); keep this literal in
+// lockstep with it and the git release tag when bumping.
+const version_string = "whostty 0.0.1 (ghostty v1.3.1, libghostty-vt)";
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
