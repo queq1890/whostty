@@ -47,6 +47,12 @@ pub const Surface = struct {
     /// managed by Termio's selectStart/Extend/End under its lock.
     mouse_left_down: bool = false,
 
+    /// The last cell a motion report was emitted for, so a drag under an
+    /// app's mouse-motion tracking (modes 1002/1003) reports only when the
+    /// cursor crosses a cell boundary (xterm semantics, #52). Seeded by the
+    /// reported left-press and cleared on its release.
+    last_motion_cell: ?struct { x: u16, y: u16 } = null,
+
     /// Handle a window resize (client pixels). Recomputes the layout; the grid
     /// origin always tracks the new size (padding-balance depends on it), and the
     /// pseudo console + terminal grid are resized only when the cell dimensions
@@ -91,6 +97,12 @@ pub const Surface = struct {
             var buf: [32]u8 = undefined;
             if (self.termio.encodeMouseReport(&buf, cell.x, cell.y, button, action, mods)) |bytes| {
                 _ = self.pty.write(bytes) catch {};
+                // Seed (press) / clear (release) the motion dedup so a reported
+                // left-drag only emits on a cell change (#52).
+                if (button == .left) self.last_motion_cell = switch (action) {
+                    .press => .{ .x = cell.x, .y = cell.y },
+                    else => null,
+                };
                 return;
             }
         }
@@ -108,17 +120,35 @@ pub const Surface = struct {
         };
     }
 
-    /// Mouse moved during a left-drag: extend the selection to the current cell.
-    /// (Motion mouse-reporting for button/any modes is a follow-up.)
-    pub fn mouseDrag(self: *Surface, px_x: i32, px_y: i32) void {
-        if (!self.mouse_left_down) return;
+    /// Mouse moved during a left-drag. When a local selection is in progress it
+    /// is extended to the current cell; otherwise — i.e. an app has mouse
+    /// tracking on, so the press was reported rather than starting a selection —
+    /// the move is reported as a motion event for button/any tracking modes
+    /// (1002/1003), deduped per cell so it only fires on a cell change (#52).
+    /// (No-button motion in `any` mode, which needs every move routed, not just
+    /// the held-button drag, is a follow-up.)
+    pub fn mouseDrag(self: *Surface, px_x: i32, px_y: i32, mods: mouse.Mods) void {
         const cell = grid.cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows, self.origin_x, self.origin_y);
-        self.termio.selectExtend(cell.x, cell.y);
+
+        if (self.mouse_left_down) {
+            self.termio.selectExtend(cell.x, cell.y);
+            return;
+        }
+
+        if (self.last_motion_cell) |lc| if (lc.x == cell.x and lc.y == cell.y) return;
+        var buf: [32]u8 = undefined;
+        if (self.termio.encodeMouseReport(&buf, cell.x, cell.y, .left, .motion, mods)) |bytes| {
+            _ = self.pty.write(bytes) catch {};
+            self.last_motion_cell = .{ .x = cell.x, .y = cell.y };
+        }
     }
 
-    /// End an in-progress selection drag (button release already handled, or
-    /// capture was lost). Releases the anchor; keeps the selection.
+    /// End an in-progress drag (button release already handled, or capture was
+    /// lost). Releases the selection anchor (keeping the selection) and the motion
+    /// dedup, so neither outlives the drag — the next left-press re-establishes
+    /// both.
     pub fn endDrag(self: *Surface) void {
+        self.last_motion_cell = null;
         if (self.mouse_left_down) {
             self.mouse_left_down = false;
             self.termio.selectEnd();

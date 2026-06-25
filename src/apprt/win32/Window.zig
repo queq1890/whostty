@@ -51,8 +51,9 @@ pub const Event = union(enum) {
         y: i32,
         mods: Mods,
     },
-    /// Mouse moved to client pixel (x, y).
-    mouse_move: struct { x: i32, y: i32 },
+    /// Mouse moved to client pixel (x, y), with the modifiers held (so a drag
+    /// under an app's mouse-motion tracking reports the right modifier bits).
+    mouse_move: struct { x: i32, y: i32, mods: Mods },
     /// Mouse capture was lost (e.g. alt-tab mid-drag) — end any local drag
     /// without synthesizing a reportable button event.
     mouse_capture_lost,
@@ -794,11 +795,11 @@ pub const Window = struct {
                     if (s.tail > s.head) {
                         const last = &s.events[(s.tail - 1) % queue_len];
                         if (std.meta.activeTag(last.*) == .mouse_move) {
-                            last.* = .{ .mouse_move = .{ .x = p.x, .y = p.y } };
+                            last.* = .{ .mouse_move = .{ .x = p.x, .y = p.y, .mods = currentMods() } };
                             return 0;
                         }
                     }
-                    s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y } });
+                    s.push(.{ .mouse_move = .{ .x = p.x, .y = p.y, .mods = currentMods() } });
                 }
                 return 0;
             },

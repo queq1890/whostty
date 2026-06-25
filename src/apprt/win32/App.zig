@@ -1162,7 +1162,11 @@ fn runSurface(app: *App) !void {
                     };
                 },
                 .mouse_move => |m| {
-                    if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.mouseDrag(m.x, m.y);
+                    if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.mouseDrag(m.x, m.y, .{
+                        .shift = m.mods.shift,
+                        .alt = m.mods.alt,
+                        .ctrl = m.mods.ctrl,
+                    });
                 },
                 .mouse_capture_lost => {
                     if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.endDrag();
