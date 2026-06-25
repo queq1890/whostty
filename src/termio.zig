@@ -14,6 +14,8 @@ const engine_cwd = @import("engine/cwd.zig");
 /// The attention side channel public types (#135): typed bell / notification /
 /// progress events + the host `Sink` callback.
 const engine_attn = @import("engine/attention.zig");
+/// OSC 133 semantic prompt marks (#136): per-pane semantic state + boundaries.
+const engine_semantic = @import("engine/semantic.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.
@@ -61,11 +63,16 @@ const SideChannel = struct {
     /// so the host can react eagerly instead of waiting for the next poll. Set
     /// via `Termio.setAttentionSink`; guarded by `Termio.mutex` like the rest.
     attention_sink: ?engine_attn.Sink = null,
+    /// OSC 133 semantic prompt marks (#136): the running semantic state, the last
+    /// command's exit code, and the recorded command/prompt boundaries. Captured
+    /// on the reader thread, read on the UI thread under `Termio.mutex`.
+    semantic: engine_semantic.Marks = .{},
 
     fn deinit(self: *SideChannel, alloc: std.mem.Allocator) void {
         self.cwd.deinit(alloc);
         if (self.title) |t| alloc.free(t);
         if (self.notification) |*n| n.deinit(alloc);
+        self.semantic.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -137,6 +144,11 @@ const ResponseHandler = struct {
             .show_desktop_notification => try self.showNotification(value),
             .progress_report => self.captureProgress(value),
             .window_title => try self.setTitle(value.title),
+
+            // OSC 133 semantic prompt marks (#136): capture the boundary for the
+            // host-facing state machine, then delegate to the inner handler so
+            // libghostty-vt still applies the per-row prompt flags + click state.
+            .semantic_prompt => try self.semanticPrompt(value),
 
             // CSI 21t report-title and the CSI 22t/23t title stack are deferred.
             // The vt surfaces 21t muxed into `.size_report = .csi_21_t` (alongside
@@ -357,6 +369,40 @@ const ResponseHandler = struct {
         self.side.notification = .{ .title = title, .body = body };
         if (self.side.attention_sink) |s| s.notify(.{ .notification = .{ .title = n.title, .body = n.body } });
     }
+
+    /// OSC 133 — capture the semantic boundary for the host-facing state machine
+    /// (#136): map the FinalTerm action, read the exit code for a command end,
+    /// and tag it with the cursor's history-stable row. Then delegate to the
+    /// inner handler so libghostty-vt still applies the per-row prompt flags and
+    /// prompt/click state (this arm replaces the default fall-through).
+    ///
+    /// OSC 133 in libghostty-vt carries no cwd field, so there is nothing to
+    /// route into the unified cwd store here; if a future cwd option appears it
+    /// would call `self.side.cwd.set` — the same single store OSC 7 writes (#134).
+    fn semanticPrompt(self: *ResponseHandler, cmd: gvt.StreamAction.Value(.semantic_prompt)) !void {
+        const action: ?engine_semantic.Action = switch (cmd.action) {
+            .fresh_line_new_prompt, .prompt_start => .prompt,
+            .end_prompt_start_input, .end_prompt_start_input_terminate_eol => .input,
+            .end_input_start_output => .command,
+            .end_command => .end,
+            // L (fresh line) and N (new command) are not boundaries we track.
+            .fresh_line, .new_command => null,
+        };
+        if (action) |a| {
+            const exit_code: ?i32 = if (a == .end) cmd.readOption(.exit_code) else null;
+            try self.side.semantic.record(self.alloc, a, self.cursorAbsRow(), exit_code);
+        }
+        try self.inner.vt(.semantic_prompt, cmd);
+    }
+
+    /// The cursor's history-absolute row (rows from the top of scrollback), used
+    /// to tag a semantic boundary so the host can scroll to it. Stable until
+    /// scrollback is trimmed; 0 if the pin can't be mapped.
+    fn cursorAbsRow(self: *ResponseHandler) u64 {
+        const screen = self.inner.terminal.screens.active;
+        const pt = screen.pages.pointFromPin(.screen, screen.cursor.page_pin.*) orelse return 0;
+        return @intCast(pt.screen.y);
+    }
 };
 
 /// Map libghostty-vt's progress report onto the engine's host-facing `Progress`,
@@ -537,6 +583,33 @@ pub const Termio = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.side.attention_sink = sink;
+    }
+
+    /// The pane's current OSC 133 semantic state (#136): at-prompt (waiting for
+    /// input), running, done, or unknown. whomux mirrors this for per-pane agent
+    /// state. Thread-safe.
+    pub fn semanticState(self: *Termio) engine_semantic.State {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.side.semantic.state();
+    }
+
+    /// The most recent command's exit code (the last OSC 133 `D`), or null if no
+    /// command has finished yet. Thread-safe.
+    pub fn lastExitCode(self: *Termio) ?i32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.side.semantic.last_exit_code;
+    }
+
+    /// A snapshot of the recorded OSC 133 command/prompt boundaries (#136),
+    /// oldest first, duplicated into `alloc` for the caller to own (free the
+    /// returned slice). Each carries its kind, the history-stable row it occurred
+    /// at (for navigation), and — for a command end — the exit code. Thread-safe.
+    pub fn commandBoundaries(self: *Termio, alloc: std.mem.Allocator) ![]engine_semantic.Mark {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return alloc.dupe(engine_semantic.Mark, self.side.semantic.boundaries());
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -1358,6 +1431,50 @@ test "termio: attention sink fires eagerly for bell, notification and progress (
     try io.process("\x07");
     try std.testing.expectEqual(@as(u32, 1), cap.bells); // unchanged
     try std.testing.expectEqual(@as(u32, 2), io.takeBellCount()); // both bells counted
+}
+
+test "termio: OSC 133 A/B/C/D drives semantic state, exit code and boundaries (#136)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 5, 1 << 20);
+    defer io.destroy();
+
+    // No OSC 133 yet -> unknown.
+    try std.testing.expectEqual(engine_semantic.State.unknown, io.semanticState());
+
+    // A: new prompt -> at prompt.
+    try io.process("\x1b]133;A\x07");
+    try std.testing.expectEqual(engine_semantic.State.prompt, io.semanticState());
+
+    // B: prompt end / input start -> still at prompt (waiting for the user).
+    try io.process("\x1b]133;B\x07");
+    try std.testing.expectEqual(engine_semantic.State.prompt, io.semanticState());
+
+    // The user "types" a command and runs it.
+    try io.process("ls\r\n");
+
+    // C: command output start -> running.
+    try io.process("\x1b]133;C\x07");
+    try std.testing.expectEqual(engine_semantic.State.running, io.semanticState());
+
+    // D;0: command end, exit 0 -> done with the captured status.
+    try io.process("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(engine_semantic.State.done, io.semanticState());
+    try std.testing.expectEqual(@as(?i32, 0), io.lastExitCode());
+
+    // The boundaries are enumerable for navigation: A, B, C, D.
+    const bounds = try io.commandBoundaries(alloc);
+    defer alloc.free(bounds);
+    try std.testing.expectEqual(@as(usize, 4), bounds.len);
+    try std.testing.expectEqual(engine_semantic.Mark.Kind.prompt_start, bounds[0].kind);
+    try std.testing.expectEqual(engine_semantic.Mark.Kind.input_start, bounds[1].kind);
+    try std.testing.expectEqual(engine_semantic.Mark.Kind.command_start, bounds[2].kind);
+    try std.testing.expectEqual(engine_semantic.Mark.Kind.command_end, bounds[3].kind);
+    try std.testing.expectEqual(@as(?i32, 0), bounds[3].exit_code);
+
+    // A failing command's non-zero status is captured too.
+    try io.process("\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;127\x07");
+    try std.testing.expectEqual(engine_semantic.State.done, io.semanticState());
+    try std.testing.expectEqual(@as(?i32, 127), io.lastExitCode());
 }
 
 test "termio: scrollbar reflects scrollback growth and viewport position" {

@@ -43,6 +43,11 @@ pub const cwd = @import("cwd.zig");
 /// events; the host owns OS surfacing. Stability: experimental (ADR 0010).
 pub const attention = @import("attention.zig");
 
+/// OSC 133 semantic prompt marks (#136): the per-pane semantic `State`
+/// (at-prompt / running / done), the last exit code, and enumerable command
+/// boundaries for navigation. Stability: experimental (ADR 0010).
+pub const semantic = @import("semantic.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -57,6 +62,8 @@ pub const Geometry = surface.Geometry;
 pub const Cwd = cwd.Cwd;
 pub const AttentionEvent = attention.Event;
 pub const AttentionSink = attention.Sink;
+pub const SemanticState = semantic.State;
+pub const SemanticMark = semantic.Mark;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -70,4 +77,5 @@ test {
     _ = surface;
     _ = cwd;
     _ = attention;
+    _ = semantic;
 }
