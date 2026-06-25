@@ -42,6 +42,7 @@ Downstream may import **only** modules whostty registers in its build graph
 | `whostty-engine`'s `cwd` (the unified per-pane working-directory store) | experimental | #134 |
 | `whostty-engine`'s `attention` (typed BEL / OSC 9-777 / OSC 9;4 events + host `Sink`) | experimental | #135 |
 | `whostty-engine`'s `semantic` (OSC 133 prompt/command boundaries + semantic state) | experimental | #136 |
+| `whostty-engine`'s `hyperlink` (OSC 8 link ranges + targets, resolved on `Termio`) | experimental | #139 |
 
 Anything reached by deep-importing whostty source paths that are not part of an
 exported module is unsupported and may break without notice. New exported
