@@ -48,6 +48,14 @@ jobs:
       - name: Platform-free engine unit tests + boundary check (#129)
         run: zig build engine-test
 
+      # The config system is exported as a second importable module
+      # (`whostty-config`, #140) so whomux loads the same `key = value` format +
+      # resolved color/font/theme values. It is self-contained (std only), so it
+      # must build + unit-test standalone — this catches a stray platform/ghostty
+      # import leaking into the config module graph.
+      - name: Config module unit tests standalone (#140)
+        run: zig build config-test
+
       # Force the engine model onto an explicit non-Windows target (compile +
       # link only, never run). On the Linux CI host this overlaps engine-test,
       # but it is the host-independent boundary guard: a platform leak that

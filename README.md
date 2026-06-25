@@ -36,12 +36,14 @@ A downstream package pins whostty in its `build.zig.zon` and imports:
 |---|---|
 | `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame`, `host` (the apprt-free `Host` vtable, #132), `surface` (the `Geometry` cell-metrics/resize/reflow model, #133), `cwd` (the unified per-pane working-directory store, #134), `attention` (the typed BEL / OSC 9-777 / OSC 9;4 side channel + host `Sink`, #135), `semantic` (OSC 133 prompt/command boundaries + semantic state, #136), `hyperlink` (OSC 8 link ranges + targets, #139), `search` (scrollback search results + row access, #138), and `env` (child-process TERM / terminfo / shell-integration env to inject at spawn, #137) — zero Win32 / ConPTY / WGL dependency. |
 | `ghostty-vt` | the pinned libghostty-vt VT core, re-exported so the consumer shares whostty's single pin (no second, drifting ghostty-vt dependency). |
+| `whostty-config` | the config system (#140): the ghostty-style `key = value` parser with non-fatal diagnostics, plus the resolved color / font / theme values (the colors that seed the engine, the font family/size/features for cell sizing). Unknown-to-whostty keys are surfaced (`Config.unknown_keys`) so whomux overlays its own keys without forking the parser. Self-contained (std only). |
 
 ```zig
 // downstream build.zig
 const whostty = b.dependency("whostty", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("whostty-engine", whostty.module("whostty-engine"));
 exe.root_module.addImport("ghostty-vt", whostty.module("ghostty-vt"));
+exe.root_module.addImport("whostty-config", whostty.module("whostty-config"));
 ```
 
 Per the staged minimal-export-first policy
