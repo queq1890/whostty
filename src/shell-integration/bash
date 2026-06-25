@@ -1,0 +1,68 @@
+# whostty bash shell integration — OSC 133 semantic prompt marks (#152).
+#
+# Sourced by an interactive bash when whostty injects GHOSTTY_SHELL_INTEGRATION=1
+# (see src/engine/env.zig). It emits the FinalTerm OSC 133 sequences so whostty's
+# engine records prompt/command boundaries (src/engine/semantic.zig, #136):
+#
+#   ESC ] 133 ; A BEL          prompt start
+#   ESC ] 133 ; B BEL          prompt end / command input start
+#   ESC ] 133 ; C BEL          command output start (the command is running)
+#   ESC ] 133 ; D ; <exit> BEL command end, carrying its exit status
+#
+# Activate by sourcing this file from your ~/.bashrc, e.g.:
+#   [ -n "$GHOSTTY_SHELL_INTEGRATION" ] && . "<whostty>/shell-integration/bash"
+
+# Interactive shells only, and only when the activation contract is present.
+case "$-" in
+  *i*) ;;
+  *) return 0 ;;
+esac
+[ -n "${GHOSTTY_SHELL_INTEGRATION:-}" ] || return 0
+# Guard against double-sourcing (re-source would chain the hooks twice).
+[ -n "${_WHOSTTY_INTEGRATION:-}" ] && return 0
+_WHOSTTY_INTEGRATION=1
+
+# Capture the just-finished command's exit status. Chained FIRST in
+# PROMPT_COMMAND so it reads $? before any user prompt hook clobbers it.
+_whostty_save_ret() { _whostty_last_ret=$?; }
+
+# precmd: chained LAST in PROMPT_COMMAND, so it runs before each prompt and after
+# any user hook. Close the previous command (D, with the saved exit code), open
+# the new prompt (A), and arm preexec for the next command line.
+_whostty_precmd() {
+  if [ -n "${_whostty_executing:-}" ]; then
+    printf '\033]133;D;%s\007' "${_whostty_last_ret:-0}"
+  fi
+  printf '\033]133;A\007'
+  _whostty_executing=""
+  _whostty_at_prompt=1
+}
+
+# preexec: the DEBUG trap fires before EVERY simple command — including each
+# command inside PROMPT_COMMAND — so it must self-gate. Emit C exactly once, on
+# the first command after a prompt: `_whostty_at_prompt` is set by precmd and
+# cleared here, so PROMPT_COMMAND hooks and later commands on the same line don't
+# re-trigger it.
+_whostty_preexec() {
+  [ -n "${COMP_LINE:-}" ] && return            # tab-completion, not a command
+  [ -n "${_whostty_at_prompt:-}" ] || return   # not the first command after a prompt
+  _whostty_at_prompt=""
+  printf '\033]133;C\007'
+  _whostty_executing=1
+}
+
+# Chain save-ret FIRST and precmd LAST around any existing PROMPT_COMMAND: the
+# exit code is captured before, and the prompt marks emitted after, the user's
+# own prompt hooks (git-prompt, starship, …).
+case "${PROMPT_COMMAND:-}" in
+  *_whostty_precmd*) ;;
+  "") PROMPT_COMMAND="_whostty_save_ret;_whostty_precmd" ;;
+  *) PROMPT_COMMAND="_whostty_save_ret;${PROMPT_COMMAND};_whostty_precmd" ;;
+esac
+
+# B (prompt end / input start) at the very end of the prompt; \[ \] mark the
+# sequence as non-printing so bash keeps the prompt width correct.
+PS1="${PS1}\[\033]133;B\007\]"
+
+# Arm the DEBUG trap LAST, so the setup commands above don't trip it.
+trap '_whostty_preexec' DEBUG

@@ -1,0 +1,36 @@
+# whostty zsh shell integration — OSC 133 semantic prompt marks (#152).
+# See the bash script in this directory for the OSC 133 sequence reference.
+#
+# Activate by sourcing this file from your ~/.zshrc, e.g.:
+#   [[ -n "$GHOSTTY_SHELL_INTEGRATION" ]] && source "<whostty>/shell-integration/zsh"
+
+[[ -o interactive ]] || return 0
+[[ -n "${GHOSTTY_SHELL_INTEGRATION:-}" ]] || return 0
+[[ -n "${_WHOSTTY_INTEGRATION:-}" ]] && return 0
+_WHOSTTY_INTEGRATION=1
+
+autoload -Uz add-zsh-hook
+
+# precmd: before each prompt — close the previous command (D) then open the new
+# prompt (A). $? must be read first.
+_whostty_precmd() {
+  local ret=$?
+  if [[ -n "${_whostty_executing:-}" ]]; then
+    printf '\033]133;D;%s\007' "$ret"
+  fi
+  printf '\033]133;A\007'
+  _whostty_executing=""
+}
+
+# preexec: before each command — the command output begins (C).
+_whostty_preexec() {
+  printf '\033]133;C\007'
+  _whostty_executing=1
+}
+
+add-zsh-hook precmd _whostty_precmd
+add-zsh-hook preexec _whostty_preexec
+
+# B (prompt end / input start) at the end of the prompt; %{...%} marks the bytes
+# as zero-width so zsh keeps the prompt width correct.
+PS1="${PS1}%{"$'\033]133;B\007'"%}"

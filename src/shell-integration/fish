@@ -1,0 +1,29 @@
+# whostty fish shell integration — OSC 133 semantic prompt marks (#152).
+# See the bash script in this directory for the OSC 133 sequence reference.
+#
+# Activate by sourcing this file from your config.fish, e.g.:
+#   test -n "$GHOSTTY_SHELL_INTEGRATION"; and source "<whostty>/shell-integration/fish"
+#
+# `return`/`exit` at the top level of a sourced file would exit the shell, so the
+# whole integration is guarded inside one `if` block.
+if status is-interactive
+    and test -n "$GHOSTTY_SHELL_INTEGRATION"
+    and not set -q _WHOSTTY_INTEGRATION
+    set -g _WHOSTTY_INTEGRATION 1
+
+    # Before each command: command output begins (C).
+    function _whostty_preexec --on-event fish_preexec
+        printf '\033]133;C\007'
+    end
+
+    # After each command: the command ended (D), carrying its exit status. $status
+    # holds the just-finished command's code and must be read first.
+    function _whostty_postexec --on-event fish_postexec
+        printf '\033]133;D;%s\007' $status
+    end
+
+    # Before each prompt: a new prompt begins (A).
+    function _whostty_prompt --on-event fish_prompt
+        printf '\033]133;A\007'
+    end
+end

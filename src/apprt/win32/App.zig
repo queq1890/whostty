@@ -440,12 +440,17 @@ const WinState = struct {
 
         pane.pty = try Pty.open(.{ .ws_col = cols, .ws_row = rows });
         errdefer pane.pty.deinit();
-        // Compute the child environment to inject (#137): TERM / COLORTERM +
-        // shell-integration vars. `terminfo_dir` stays null here — compiling and
-        // installing the bundled xterm-ghostty entry and resolving its dir on the
-        // Windows host is the on-device follow-up; apps resolve TERM from the
-        // system terminfo database until then.
+        // Compute the child environment to inject (#137, #152): TERM / COLORTERM /
+        // TERMINFO + shell-integration vars. The bundled xterm-ghostty terminfo is
+        // compiled + installed next to the exe at package time (build.zig); resolve
+        // it here so apps find the entry, falling back to a resolvable
+        // xterm-256color when it isn't present rather than shipping an
+        // unresolvable TERM.
+        const ti = resolveTerminfo(alloc);
+        defer if (ti.dir) |d| alloc.free(d);
         const env_entries = try engine_env.compute(alloc, .{
+            .term = ti.term,
+            .terminfo_dir = ti.dir,
             .shell_integration = self.cfg.shell_integration != .none,
             .features = .{
                 .cursor = self.cfg.shell_integration_features.cursor,
@@ -1380,6 +1385,47 @@ fn runSurface(app: *App) !void {
 /// The shell to launch. Honors COMSPEC, defaulting to cmd.exe.
 fn shellCommandLine() []const u8 {
     return "cmd.exe";
+}
+
+/// The `TERM` to advertise to a spawned pane and, when found, the `TERMINFO`
+/// directory to point it at.
+const ResolvedTerminfo = struct {
+    term: []const u8,
+    /// Owned by the caller's allocator when non-null; null means no bundled
+    /// terminfo dir (and `term` is then the fallback).
+    dir: ?[]u8,
+};
+
+/// Resolve the bundled terminfo (#152). The compiled `xterm-ghostty` entry is
+/// installed next to the exe at `<exe dir>/terminfo` by `tic` at package time
+/// (build.zig); `tic` groups entries by the first letter of the primary name, so
+/// the entry lives at `terminfo/x/xterm-ghostty`. When it is present, advertise
+/// `TERM=xterm-ghostty` and point `TERMINFO` at the dir; when it isn't (e.g. a
+/// build packaged without `tic`), fall back to the always-resolvable
+/// `xterm-256color` with no `TERMINFO`, rather than handing apps an unresolvable
+/// `TERM`. Any failure along the way takes the safe fallback.
+fn resolveTerminfo(alloc: std.mem.Allocator) ResolvedTerminfo {
+    const fallback: ResolvedTerminfo = .{ .term = engine_env.fallback_term, .dir = null };
+
+    const exe_dir = std.fs.selfExeDirPathAlloc(alloc) catch return fallback;
+    defer alloc.free(exe_dir);
+
+    const dir = std.fs.path.join(alloc, &.{ exe_dir, "terminfo" }) catch return fallback;
+
+    // Probe the compiled primary entry; if it's missing the dir is useless. `dir`
+    // is freed explicitly on each early return below and handed to the caller on
+    // success (this fn returns no error, so an errdefer would never fire).
+    const entry = std.fs.path.join(alloc, &.{ dir, "x", engine_env.term }) catch {
+        alloc.free(dir);
+        return fallback;
+    };
+    defer alloc.free(entry);
+    std.fs.cwd().access(entry, .{}) catch {
+        alloc.free(dir);
+        return fallback;
+    };
+
+    return .{ .term = engine_env.term, .dir = dir };
 }
 
 fn readerLoop(pty: *Pty, io: *Termio, stop: *std.atomic.Value(bool), hwnd: w.HWND) void {

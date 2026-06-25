@@ -1,0 +1,7 @@
+# Shell-integration scripts and the terminfo source must stay LF regardless of
+# core.autocrlf: CRLF breaks bash/zsh/fish parsing (a stray \r in the OSC 133
+# sequences and `$'\r'` errors) and `tic` compilation of the terminfo (#152).
+src/shell-integration/bash text eol=lf
+src/shell-integration/zsh  text eol=lf
+src/shell-integration/fish text eol=lf
+src/terminfo/*.terminfo    text eol=lf

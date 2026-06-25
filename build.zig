@@ -80,6 +80,50 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
+    // --- Bundled terminfo + shell integration (#137, #152, epic E0 #141) ---
+    // Resources ship next to the exe (whostty's convention; see config/theme.zig
+    // which resolves `<exe dir>/themes`). The apprt resolves `<exe dir>/terminfo`
+    // and points the spawned shell's $TERMINFO at it (App.resolveTerminfo).
+    {
+        // Ship the terminfo *source* (the `tic` input) for reference / manual
+        // compilation. Always installed — no external tools needed.
+        b.installFile("src/terminfo/xterm-ghostty.terminfo", "bin/terminfo/xterm-ghostty.terminfo");
+
+        // Compile the source into a terminfo database with `tic` and install just
+        // the primary `xterm-ghostty` entry (which `tic` writes to `x/`, grouping
+        // by the first letter of the name). Installing only the primary entry —
+        // not tic's `whostty` alias — sidesteps alias symlink-copy pitfalls, and
+        // the apprt only ever advertises `xterm-ghostty`. `tic` ships with ncurses
+        // and is absent on a stock Windows host (package via WSL/MSYS2), so gate
+        // on availability: when missing, skip and let the apprt fall back to
+        // `xterm-256color` at runtime (#152).
+        if (b.findProgram(&.{"tic"}, &.{})) |tic_path| {
+            const compile = b.addSystemCommand(&.{ tic_path, "-x", "-o" });
+            const out_dir = compile.addOutputDirectoryArg("terminfo");
+            compile.addFileArg(b.path("src/terminfo/xterm-ghostty.terminfo"));
+            _ = compile.captureStdErr(); // tic warns to stderr; don't echo it
+            b.getInstallStep().dependOn(&b.addInstallFile(
+                out_dir.path(b, "x/xterm-ghostty"),
+                "bin/terminfo/x/xterm-ghostty",
+            ).step);
+        } else |_| {
+            std.log.warn(
+                "tic not found: shipping terminfo source only; the apprt falls back to TERM=xterm-256color at runtime. Install ncurses' tic (e.g. via WSL/MSYS2) to bundle the compiled xterm-ghostty entry (#152).",
+                .{},
+            );
+        }
+
+        // Ship the shell-integration scripts (#152). The injected env
+        // (GHOSTTY_SHELL_INTEGRATION=1) is the contract that activates them; the
+        // scripts emit the OSC 133 prompt marks the engine records (#136).
+        b.installDirectory(.{
+            .source_dir = b.path("src/shell-integration"),
+            .install_dir = .{ .custom = "bin" },
+            .install_subdir = "shell-integration",
+            .exclude_extensions = &.{".md"},
+        });
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
