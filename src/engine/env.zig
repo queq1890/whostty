@@ -21,6 +21,14 @@ const std = @import("std");
 /// (via `TERMINFO`) or a system copy.
 pub const term = "xterm-ghostty";
 
+/// The `TERM` to advertise when the `xterm-ghostty` terminfo can't be resolved
+/// (no compiled entry next to the exe, no system copy). It is in every terminfo
+/// database, so apps always resolve it — shipping it is strictly safer than an
+/// unresolvable `xterm-ghostty` (which breaks curses apps). The host selects it
+/// via `Options.term` when it could not find a compiled entry to point
+/// `TERMINFO` at; see the apprt's terminfo resolution (#152).
+pub const fallback_term = "xterm-256color";
+
 /// One environment variable to inject. `key` and `value` are owned by the
 /// allocator passed to `compute` (released by `free`).
 pub const Entry = struct {
@@ -38,6 +46,11 @@ pub const Features = struct {
 };
 
 pub const Options = struct {
+    /// The `TERM` to advertise. Defaults to the engine's `xterm-ghostty`. The
+    /// host overrides it with `fallback_term` when no compiled `xterm-ghostty`
+    /// terminfo is resolvable, so apps never receive an unresolvable `TERM`
+    /// (#152). When set to the fallback, leave `terminfo_dir` null.
+    term: []const u8 = term,
     /// Absolute path to the bundled terminfo dir (the compiled entries). When
     /// null, `TERMINFO` is left unset and apps fall back to the system terminfo
     /// database.
@@ -50,14 +63,15 @@ pub const Options = struct {
 };
 
 /// Compute the child-process environment entries to inject at pane spawn, owned
-/// by `alloc` (release with `free`). Always sets `TERM` and `COLORTERM`; sets
-/// `TERMINFO` when a dir is given; and, when shell integration is enabled, sets
-/// `GHOSTTY_SHELL_INTEGRATION` plus the comma-joined `GHOSTTY_SHELL_FEATURES`.
+/// by `alloc` (release with `free`). Always sets `TERM` (to `opts.term`) and
+/// `COLORTERM`; sets `TERMINFO` when a dir is given; and, when shell integration
+/// is enabled, sets `GHOSTTY_SHELL_INTEGRATION` plus the comma-joined
+/// `GHOSTTY_SHELL_FEATURES`.
 pub fn compute(alloc: std.mem.Allocator, opts: Options) ![]Entry {
     var list: std.ArrayListUnmanaged(Entry) = .empty;
     errdefer freeList(alloc, &list);
 
-    try put(alloc, &list, "TERM", term);
+    try put(alloc, &list, "TERM", opts.term);
     try put(alloc, &list, "COLORTERM", "truecolor");
     if (opts.terminfo_dir) |dir| try put(alloc, &list, "TERMINFO", dir);
 
@@ -140,6 +154,17 @@ test "env: shell-integration vars are injected with the active features" {
 
     try std.testing.expectEqualStrings("1", get(entries, "GHOSTTY_SHELL_INTEGRATION").?);
     try std.testing.expectEqualStrings("cursor,sudo", get(entries, "GHOSTTY_SHELL_FEATURES").?);
+}
+
+test "env: the host can advertise the fallback TERM when no terminfo resolves" {
+    const alloc = std.testing.allocator;
+    // No bundled terminfo found -> host passes the fallback TERM and no dir, so
+    // apps resolve a TERM that is always in the system database (#152).
+    const entries = try compute(alloc, .{ .term = fallback_term });
+    defer free(alloc, entries);
+
+    try std.testing.expectEqualStrings("xterm-256color", get(entries, "TERM").?);
+    try std.testing.expect(get(entries, "TERMINFO") == null);
 }
 
 test "env: shell integration off injects no GHOSTTY_* vars but keeps TERM" {

@@ -1719,6 +1719,46 @@ test "termio: OSC 133 A/B/C/D drives semantic state, exit code and boundaries (#
     try std.testing.expectEqual(@as(?i32, 127), io.lastExitCode());
 }
 
+test "termio: the bundled shell-integration scripts' OSC 133 output is recorded (#152)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 40, 5, 1 << 20);
+    defer io.destroy();
+
+    // The OSC 133 sequence the bundled bash script emits over one
+    // prompt -> command -> prompt cycle (no pre-existing PROMPT_COMMAND),
+    // verified on-device against a live bash (#152). The host test suite has no
+    // shell, so this curated stream — not an in-process capture — stands in for
+    // the script's output and pins the engine's parsing of it:
+    //   precmd:  D;<exit> (skipped on the first prompt) then A
+    //   PS1:     B at the end of the prompt
+    //   preexec: C before the command runs
+    // Running `echo hi` (exit 0) between two prompts produces:
+    try io.process(
+        "\x1b]133;A\x07" ++ // precmd: first prompt start (no preceding D)
+            "user@host:~$ \x1b]133;B\x07" ++ // prompt text + PS1 B (input start)
+            "echo hi\r\n" ++ // the typed command, echoed
+            "\x1b]133;C\x07" ++ // preexec: command output start
+            "hi\r\n" ++ // command output
+            "\x1b]133;D;0\x07" ++ // precmd: command end, exit 0
+            "\x1b]133;A\x07" ++ // precmd: next prompt start
+            "user@host:~$ \x1b]133;B\x07", // prompt text + PS1 B
+    );
+
+    // The engine recorded every boundary the scripts emitted, in order.
+    const bounds = try io.commandBoundaries(alloc);
+    defer alloc.free(bounds);
+    const K = engine_semantic.Mark.Kind;
+    const expected = [_]K{ .prompt_start, .input_start, .command_start, .command_end, .prompt_start, .input_start };
+    try std.testing.expectEqual(expected.len, bounds.len);
+    for (expected, bounds) |want, got| try std.testing.expectEqual(want, got.kind);
+
+    // The command's exit status rode in on D, and after the trailing A/B the pane
+    // is back at a prompt waiting for input.
+    try std.testing.expectEqual(@as(?i32, 0), bounds[3].exit_code);
+    try std.testing.expectEqual(@as(?i32, 0), io.lastExitCode());
+    try std.testing.expectEqual(engine_semantic.State.prompt, io.semanticState());
+}
+
 test "termio: OSC 8 hyperlink attaches a target to a cell run, enumerable (#139)" {
     const alloc = std.testing.allocator;
     const io = try Termio.create(alloc, 20, 3, 1 << 20);
