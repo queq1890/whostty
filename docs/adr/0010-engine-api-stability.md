@@ -44,6 +44,7 @@ Downstream may import **only** modules whostty registers in its build graph
 | `whostty-engine`'s `semantic` (OSC 133 prompt/command boundaries + semantic state) | experimental | #136 |
 | `whostty-engine`'s `hyperlink` (OSC 8 link ranges + targets, resolved on `Termio`) | experimental | #139 |
 | `whostty-engine`'s `search` (scrollback `Match` + `Results` nav; row scan on `Termio`) | experimental | #138 |
+| `whostty-engine`'s `env` (child TERM / terminfo / shell-integration env to inject) | experimental | #137 |
 
 Anything reached by deep-importing whostty source paths that are not part of an
 exported module is unsupported and may break without notice. New exported

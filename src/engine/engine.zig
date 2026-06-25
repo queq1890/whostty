@@ -58,6 +58,11 @@ pub const hyperlink = @import("hyperlink.zig");
 /// access live on `Termio`. Stability: experimental (ADR 0010).
 pub const search = @import("search.zig");
 
+/// Child-process environment for a spawned pane (#137): the platform-free
+/// computation of TERM / TERMINFO / COLORTERM + shell-integration vars to inject
+/// at spawn. The ConPTY spawn applies them. Stability: experimental (ADR 0010).
+pub const env = @import("env.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -92,4 +97,5 @@ test {
     _ = semantic;
     _ = hyperlink;
     _ = search;
+    _ = env;
 }

@@ -1,0 +1,17 @@
+# whostty terminfo source for TERM=xterm-ghostty (#137).
+#
+# Bundled so apps running in a whostty pane resolve $TERM=xterm-ghostty from the
+# $TERMINFO directory whostty injects at spawn (see src/engine/env.zig +
+# src/pty.zig). Compile + install with:
+#
+#     tic -x -o <terminfo-dir> xterm-ghostty.terminfo
+#
+# whostty emits ghostty-compatible sequences, so it advertises ghostty's TERM
+# name. This entry is xterm-256color plus the direct-color and styled-underline
+# extensions whostty supports; OSC 133 prompt marks need no terminfo capability
+# (they are emitted by the shell-integration scripts the injected env activates).
+xterm-ghostty|whostty|whostty terminal emulator,
+	Tc,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,
+	use=xterm-256color,

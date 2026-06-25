@@ -7,6 +7,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const w = @import("os/windows.zig");
+/// Platform-free computation of the child env to inject at spawn (#137); the
+/// ConPTY spawn below applies it as a CreateProcessW environment block.
+const engine_env = @import("engine/env.zig");
 
 const log = std.log.scoped(.pty);
 
@@ -149,11 +152,15 @@ const WindowsPty = struct {
     }
 
     /// Spawn a child process attached to this pty. `command_line` is UTF-8 and
-    /// is the full command line (e.g. "cmd.exe").
+    /// is the full command line (e.g. "cmd.exe"). `env_entries` (#137) are the
+    /// variables to inject (TERM, TERMINFO, shell-integration vars from
+    /// `engine.env.compute`); when empty, the child inherits the parent
+    /// environment unchanged (no env block built).
     pub fn spawn(
         self: *WindowsPty,
         alloc: std.mem.Allocator,
         command_line: []const u8,
+        env_entries: []const engine_env.Entry,
     ) SpawnError!Child {
         // Query the required attribute-list size, then allocate and initialize.
         var attr_size: w.SIZE_T = 0;
@@ -194,15 +201,26 @@ const WindowsPty = struct {
             return error.OutOfMemory;
         defer alloc.free(cmd_w);
 
+        // Inject the child environment (#137): build a UTF-16 env block of the
+        // parent env overlaid with `env_entries` (TERM / TERMINFO / shell
+        // integration). Empty -> null, so the child inherits the parent unchanged.
+        const env_block: ?[]u16 = if (env_entries.len == 0)
+            null
+        else
+            buildEnvBlockW(alloc, env_entries) catch return error.OutOfMemory;
+        defer if (env_block) |b| alloc.free(b);
+
         var pi: w.PROCESS_INFORMATION = std.mem.zeroes(w.PROCESS_INFORMATION);
+        const flags: w.DWORD = w.EXTENDED_STARTUPINFO_PRESENT |
+            @as(w.DWORD, if (env_block != null) w.CREATE_UNICODE_ENVIRONMENT else 0);
         if (w.CreateProcessW(
             null,
             cmd_w.ptr,
             null,
             null,
             w.TRUE, // required for the child to pick up the pseudoconsole handles
-            w.EXTENDED_STARTUPINFO_PRESENT,
-            null,
+            flags,
+            if (env_block) |b| @ptrCast(b.ptr) else null,
             null,
             @ptrCast(&si),
             &pi,
@@ -217,6 +235,81 @@ const WindowsPty = struct {
         return .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
     }
 };
+
+/// Build a UTF-16, double-null-terminated environment block for CreateProcessW
+/// (used with `CREATE_UNICODE_ENVIRONMENT`): the parent environment overlaid with
+/// `entries` (an injected key overrides the parent's). Caller frees (#137). The
+/// `getEnvMap` call reads the parent env; the serialization is platform-free and
+/// unit-tested below.
+fn buildEnvBlockW(alloc: std.mem.Allocator, entries: []const engine_env.Entry) ![]u16 {
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    for (entries) |e| try env.put(e.key, e.value);
+    return serializeEnvBlock(alloc, &env);
+}
+
+/// Serialize an `EnvMap` into a Windows wide environment block: each entry as
+/// `KEY=VALUE\0` (UTF-16LE), with a final `\0` terminating the block.
+fn serializeEnvBlock(alloc: std.mem.Allocator, env: *const std.process.EnvMap) ![]u16 {
+    var buf: std.ArrayListUnmanaged(u16) = .empty;
+    errdefer buf.deinit(alloc);
+    var it = env.iterator();
+    while (it.next()) |kv| {
+        try appendUtf16(alloc, &buf, kv.key_ptr.*);
+        try buf.append(alloc, '=');
+        try appendUtf16(alloc, &buf, kv.value_ptr.*);
+        try buf.append(alloc, 0); // end of this entry
+    }
+    try buf.append(alloc, 0); // end of the block
+    return buf.toOwnedSlice(alloc);
+}
+
+fn appendUtf16(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u16), s: []const u8) !void {
+    const len = try std.unicode.calcUtf16LeLen(s);
+    const start = buf.items.len;
+    try buf.resize(alloc, start + len);
+    _ = try std.unicode.utf8ToUtf16Le(buf.items[start..], s);
+}
+
+test "pty: serializeEnvBlock builds a double-null-terminated UTF-16 block (#137)" {
+    const alloc = std.testing.allocator;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("TERM", "xterm-ghostty");
+
+    const block = try serializeEnvBlock(alloc, &env);
+    defer alloc.free(block);
+
+    // Terminated by the entry's null plus the block's null.
+    try std.testing.expect(block.len >= 2);
+    try std.testing.expectEqual(@as(u16, 0), block[block.len - 1]);
+    try std.testing.expectEqual(@as(u16, 0), block[block.len - 2]);
+
+    // Contains "TERM=xterm-ghostty" encoded as UTF-16LE.
+    var expect: [32]u16 = undefined;
+    const n = try std.unicode.utf8ToUtf16Le(&expect, "TERM=xterm-ghostty");
+    try std.testing.expect(std.mem.indexOf(u16, block, expect[0..n]) != null);
+}
+
+test "pty: an injected entry overrides the parent environment (#137)" {
+    const alloc = std.testing.allocator;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("TERM", "dumb");
+    // Overlay like buildEnvBlockW does.
+    const entries = [_]engine_env.Entry{.{ .key = "TERM", .value = "xterm-ghostty" }};
+    for (entries) |e| try env.put(e.key, e.value);
+
+    const block = try serializeEnvBlock(alloc, &env);
+    defer alloc.free(block);
+
+    var dumb: [16]u16 = undefined;
+    const dn = try std.unicode.utf8ToUtf16Le(&dumb, "TERM=dumb");
+    try std.testing.expect(std.mem.indexOf(u16, block, dumb[0..dn]) == null);
+    var ghostty: [32]u16 = undefined;
+    const gn = try std.unicode.utf8ToUtf16Le(&ghostty, "TERM=xterm-ghostty");
+    try std.testing.expect(std.mem.indexOf(u16, block, ghostty[0..gn]) != null);
+}
 
 /// Stub for non-Windows targets so the package type-checks.
 const UnsupportedPty = struct {
