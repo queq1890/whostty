@@ -16,6 +16,9 @@ const engine_cwd = @import("engine/cwd.zig");
 const engine_attn = @import("engine/attention.zig");
 /// OSC 133 semantic prompt marks (#136): per-pane semantic state + boundaries.
 const engine_semantic = @import("engine/semantic.zig");
+/// OSC 8 hyperlink ranges (#139): the host-facing `Range` type whostty resolves
+/// from live cell hyperlink state.
+const engine_hyperlink = @import("engine/hyperlink.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.
@@ -421,6 +424,23 @@ fn engineProgress(p: gvt.osc.Command.ProgressReport) engine_attn.Progress {
     };
 }
 
+/// Append a hyperlink range, duping the (borrowed) target URI into `alloc`. On
+/// an append failure the freshly-duped URI is freed so nothing leaks (#139).
+fn appendRange(
+    alloc: std.mem.Allocator,
+    ranges: *std.ArrayListUnmanaged(engine_hyperlink.Range),
+    y: u16,
+    x_start: u16,
+    x_end: u16,
+    uri: []const u8,
+) !void {
+    const dup = try alloc.dupe(u8, uri);
+    ranges.append(alloc, .{ .y = y, .x_start = x_start, .x_end = x_end, .target = dup }) catch |e| {
+        alloc.free(dup);
+        return e;
+    };
+}
+
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
 pub const Termio = struct {
@@ -610,6 +630,74 @@ pub const Termio = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return alloc.dupe(engine_semantic.Mark, self.side.semantic.boundaries());
+    }
+
+    /// The OSC 8 hyperlink target at viewport cell (x, y), duplicated into
+    /// `alloc` for the caller to own, or null if that cell carries no hyperlink
+    /// (#139). libghostty-vt has already attached the link to the cell; this
+    /// resolves it to its URI. Thread-safe.
+    pub fn hyperlinkAt(self: *Termio, alloc: std.mem.Allocator, x: u16, y: u16) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const p = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return null;
+        const page = &p.node.data;
+        const rac = p.rowAndCell();
+        if (!rac.cell.hyperlink) return null;
+        const id = page.lookupHyperlink(rac.cell) orelse return null;
+        const uri = page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+        return try alloc.dupe(u8, uri);
+    }
+
+    /// Enumerate the OSC 8 hyperlink ranges in the visible viewport (#139): each
+    /// is a run of consecutive same-link cells on one row, with its target URI,
+    /// so the host can underline + hit-test them (a multi-row link yields one
+    /// range per row). The returned slice and each `target` are owned by `alloc`;
+    /// free the whole result with `engine.hyperlink.freeRanges`. Thread-safe.
+    pub fn hyperlinkRanges(self: *Termio, alloc: std.mem.Allocator) ![]engine_hyperlink.Range {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const screen = self.terminal.screens.active;
+        const cols: u16 = @intCast(self.terminal.cols);
+        const rows: u16 = @intCast(self.terminal.rows);
+
+        var ranges: std.ArrayListUnmanaged(engine_hyperlink.Range) = .empty;
+        errdefer {
+            for (ranges.items) |r| alloc.free(r.target);
+            ranges.deinit(alloc);
+        }
+
+        var y: u16 = 0;
+        while (y < rows) : (y += 1) {
+            const p = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse continue;
+            const page = &p.node.data;
+
+            // Walk the row left to right, grouping consecutive cells that share a
+            // hyperlink id (page-local, so comparable within this single page row).
+            var run_start: ?u16 = null;
+            var run_uri: []const u8 = "";
+            var run_id: ?usize = null;
+            var x: u16 = 0;
+            while (x < cols) : (x += 1) {
+                const rac = page.getRowAndCell(x, p.y);
+                var cur_id: ?usize = null;
+                var cur_uri: []const u8 = "";
+                if (rac.cell.hyperlink) {
+                    if (page.lookupHyperlink(rac.cell)) |id| {
+                        cur_id = @intCast(id);
+                        cur_uri = page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+                    }
+                }
+                if (run_id != cur_id) {
+                    if (run_start) |s| try appendRange(alloc, &ranges, y, s, x - 1, run_uri);
+                    run_start = if (cur_id != null) x else null;
+                    run_id = cur_id;
+                    run_uri = cur_uri;
+                }
+            }
+            if (run_start) |s| try appendRange(alloc, &ranges, y, s, cols - 1, run_uri);
+        }
+        return ranges.toOwnedSlice(alloc);
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -1475,6 +1563,40 @@ test "termio: OSC 133 A/B/C/D drives semantic state, exit code and boundaries (#
     try io.process("\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;127\x07");
     try std.testing.expectEqual(engine_semantic.State.done, io.semanticState());
     try std.testing.expectEqual(@as(?i32, 127), io.lastExitCode());
+}
+
+test "termio: OSC 8 hyperlink attaches a target to a cell run, enumerable (#139)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Open OSC 8 with a URI, print a 4-cell run, close it, then print unlinked
+    // text: cells 0..3 = "link", col 4 = space, then "later".
+    try io.process("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ later");
+
+    // Cells within the run report the target.
+    {
+        const t = (try io.hyperlinkAt(alloc, 0, 0)) orelse return error.NoLink;
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("https://example.com", t);
+    }
+    {
+        const t = (try io.hyperlinkAt(alloc, 3, 0)) orelse return error.NoLink;
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("https://example.com", t);
+    }
+
+    // A cell outside any hyperlink reports no target.
+    try std.testing.expect((try io.hyperlinkAt(alloc, 6, 0)) == null);
+
+    // Enumeration returns the single run [0..3] on row 0 with its target.
+    const ranges = try io.hyperlinkRanges(alloc);
+    defer engine_hyperlink.freeRanges(alloc, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u16, 0), ranges[0].y);
+    try std.testing.expectEqual(@as(u16, 0), ranges[0].x_start);
+    try std.testing.expectEqual(@as(u16, 3), ranges[0].x_end);
+    try std.testing.expectEqualStrings("https://example.com", ranges[0].target);
 }
 
 test "termio: scrollbar reflects scrollback growth and viewport position" {

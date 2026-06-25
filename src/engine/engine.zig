@@ -48,6 +48,11 @@ pub const attention = @import("attention.zig");
 /// boundaries for navigation. Stability: experimental (ADR 0010).
 pub const semantic = @import("semantic.zig");
 
+/// OSC 8 hyperlink ranges (#139): the host-facing `Range` type for a resolved
+/// hyperlink (viewport cell run + target URI). The query/enumeration over live
+/// cells lives on `Termio`. Stability: experimental (ADR 0010).
+pub const hyperlink = @import("hyperlink.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -64,6 +69,7 @@ pub const AttentionEvent = attention.Event;
 pub const AttentionSink = attention.Sink;
 pub const SemanticState = semantic.State;
 pub const SemanticMark = semantic.Mark;
+pub const HyperlinkRange = hyperlink.Range;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -78,4 +84,5 @@ test {
     _ = cwd;
     _ = attention;
     _ = semantic;
+    _ = hyperlink;
 }
