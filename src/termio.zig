@@ -19,6 +19,8 @@ const engine_semantic = @import("engine/semantic.zig");
 /// OSC 8 hyperlink ranges (#139): the host-facing `Range` type whostty resolves
 /// from live cell hyperlink state.
 const engine_hyperlink = @import("engine/hyperlink.zig");
+/// Scrollback search results (#138): the host-facing `Match` + `Results` nav.
+const engine_search = @import("engine/search.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.
@@ -441,6 +443,41 @@ fn appendRange(
     };
 }
 
+/// Append the physical row at row index `pin_y` of `page` (width `cols`) as UTF-8
+/// to `buf` (#138). When `col_map` is non-null, also append — for every byte
+/// written — the cell column that produced it, so a byte offset maps back to a
+/// cell column for search. Wide-char tail spacers are skipped (the wide cell
+/// already contributed its codepoint); empty cells become spaces so columns stay
+/// aligned. `page` is a `*Page` from a pin's node.
+fn appendRowBytes(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    col_map: ?*std.ArrayListUnmanaged(u16),
+    page: anytype,
+    pin_y: u16,
+    cols: u16,
+) !void {
+    var x: u16 = 0;
+    while (x < cols) : (x += 1) {
+        const cell = page.getRowAndCell(x, pin_y).cell;
+        if (cell.wide == .spacer_tail) continue; // second half of a wide char
+        const cp: u21 = blk: {
+            const c = cell.codepoint();
+            break :blk if (c == 0) ' ' else c;
+        };
+        var utf8: [4]u8 = undefined;
+        const len: usize = std.unicode.utf8Encode(cp, &utf8) catch enc: {
+            utf8[0] = '?';
+            break :enc 1;
+        };
+        try buf.appendSlice(alloc, utf8[0..len]);
+        if (col_map) |cm| {
+            var i: usize = 0;
+            while (i < len) : (i += 1) try cm.append(alloc, x);
+        }
+    }
+}
+
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
 pub const Termio = struct {
@@ -482,6 +519,11 @@ pub const Termio = struct {
     sel_anchor: ?*Pin = null,
     sel_anchor_screen: ?ActiveScreen = null,
 
+    /// Scrollback search results (#138): filled by `searchStart` (a UI-thread
+    /// scan over the screen rows), navigated by `searchNext`/`searchPrev`. Guarded
+    /// by `mutex` since the scan reads the grid.
+    search: engine_search.Results = .{},
+
     pub fn create(alloc: std.mem.Allocator, cols: u16, rows: u16, max_scrollback: usize) !*Termio {
         const self = try alloc.create(Termio);
         errdefer alloc.destroy(self);
@@ -494,6 +536,7 @@ pub const Termio = struct {
         self.dirty_gen = 0;
         self.sel_anchor = null;
         self.sel_anchor_screen = null;
+        self.search = .{};
         self.terminal = try vt.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
@@ -516,6 +559,7 @@ pub const Termio = struct {
         self.response.deinit(alloc);
         if (self.clipboard_write) |c| alloc.free(c);
         self.side.deinit(alloc);
+        self.search.deinit(alloc);
         self.terminal.deinit(alloc);
         alloc.destroy(self);
     }
@@ -698,6 +742,116 @@ pub const Termio = struct {
             if (run_start) |s| try appendRange(alloc, &ranges, y, s, cols - 1, run_uri);
         }
         return ranges.toOwnedSlice(alloc);
+    }
+
+    // --- Scrollback row access + search (#138) -----------------------------
+
+    /// The text content of viewport row `y` (0 = top visible row), UTF-8 with
+    /// trailing blanks trimmed, duplicated into `alloc` (caller owns), or null if
+    /// `y` is out of range. whomux scans this for URLs and highlights. Thread-safe.
+    pub fn rowText(self: *Termio, alloc: std.mem.Allocator, y: u16) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const pin = self.terminal.screens.active.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse return null;
+        return try self.rowTextFromPin(alloc, pin);
+    }
+
+    /// The text content of screen-absolute row `screen_y` (rows from the top of
+    /// scrollback, history-inclusive) — the coordinate `Match` and semantic
+    /// boundaries use, stable across viewport scrolls. Null if out of range.
+    /// Thread-safe.
+    pub fn rowTextScreen(self: *Termio, alloc: std.mem.Allocator, screen_y: u64) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const pin = self.terminal.screens.active.pages.pin(.{ .screen = .{ .x = 0, .y = @intCast(screen_y) } }) orelse return null;
+        return try self.rowTextFromPin(alloc, pin);
+    }
+
+    fn rowTextFromPin(self: *Termio, alloc: std.mem.Allocator, pin: Pin) ![]u8 {
+        const cols: u16 = @intCast(self.terminal.cols);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        try appendRowBytes(alloc, &buf, null, &pin.node.data, pin.y, cols);
+        const trimmed = std.mem.trimRight(u8, buf.items, " ");
+        buf.shrinkRetainingCapacity(trimmed.len);
+        return try buf.toOwnedSlice(alloc);
+    }
+
+    /// Start a scrollback search for `query` (#138): scan every screen row
+    /// (scrollback history + active) for the needle and record each match as a
+    /// screen-absolute `engine.search.Match`. Replaces any previous search and
+    /// returns the match count; an empty query just clears it. Matches are
+    /// navigated with `searchNext`/`searchPrev` and dropped with `searchClear`.
+    /// Thread-safe.
+    pub fn searchStart(self: *Termio, query: []const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.search.clear();
+        if (query.len == 0) return 0;
+
+        const screen = self.terminal.screens.active;
+        const cols: u16 = @intCast(self.terminal.cols);
+        const total = screen.pages.scrollbar().total;
+
+        var row_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer row_buf.deinit(self.alloc);
+        var col_map: std.ArrayListUnmanaged(u16) = .empty;
+        defer col_map.deinit(self.alloc);
+
+        var sy: u64 = 0;
+        while (sy < total) : (sy += 1) {
+            const pin = screen.pages.pin(.{ .screen = .{ .x = 0, .y = @intCast(sy) } }) orelse continue;
+            row_buf.clearRetainingCapacity();
+            col_map.clearRetainingCapacity();
+            try appendRowBytes(self.alloc, &row_buf, &col_map, &pin.node.data, pin.y, cols);
+
+            // Record every non-overlapping occurrence of the needle in this row,
+            // mapping the matched byte span back to its cell columns.
+            var off: usize = 0;
+            while (off + query.len <= row_buf.items.len) {
+                const idx = std.mem.indexOf(u8, row_buf.items[off..], query) orelse break;
+                const start_byte = off + idx;
+                const end_byte = start_byte + query.len - 1;
+                try self.search.append(self.alloc, .{
+                    .start_x = col_map.items[start_byte],
+                    .start_y = sy,
+                    .end_x = col_map.items[end_byte],
+                    .end_y = sy,
+                });
+                off = start_byte + query.len;
+            }
+        }
+        return self.search.count();
+    }
+
+    /// The number of matches from the active search (#138). Thread-safe.
+    pub fn searchCount(self: *Termio) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.search.count();
+    }
+
+    /// Advance to and return the next search match (wrapping), or null if there
+    /// are none. The first call selects the first match (#138). Thread-safe.
+    pub fn searchNext(self: *Termio) ?engine_search.Match {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.search.next();
+    }
+
+    /// Step to and return the previous search match (wrapping), or null if there
+    /// are none. The first call selects the last match (#138). Thread-safe.
+    pub fn searchPrev(self: *Termio) ?engine_search.Match {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.search.prev();
+    }
+
+    /// Clear the active search and its matches (#138). Thread-safe.
+    pub fn searchClear(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.search.clear();
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -1597,6 +1751,58 @@ test "termio: OSC 8 hyperlink attaches a target to a cell run, enumerable (#139)
     try std.testing.expectEqual(@as(u16, 0), ranges[0].x_start);
     try std.testing.expectEqual(@as(u16, 3), ranges[0].x_end);
     try std.testing.expectEqualStrings("https://example.com", ranges[0].target);
+}
+
+test "termio: scrollback row access + search navigation, stable across scroll (#138)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20); // 3 visible rows
+
+    defer io.destroy();
+
+    // Seed lines that scroll into history; "needle" appears on two of them.
+    try io.process("alpha needle\r\n"); // -> scrollback row, "needle" at col 6
+    try io.process("beta\r\n");
+    try io.process("gamma needle end\r\n"); // "needle" at col 6
+    try io.process("delta\r\n");
+    try io.process("epsilon"); // current line (cursor row)
+
+    // Row access: the bottom visible row is the current line.
+    {
+        const t = (try io.rowText(alloc, 2)) orelse return error.NoRow;
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("epsilon", t);
+    }
+
+    // Search finds both occurrences, recorded top-to-bottom.
+    try std.testing.expectEqual(@as(usize, 2), try io.searchStart("needle"));
+    try std.testing.expectEqual(@as(usize, 2), io.searchCount());
+
+    // Forward navigation visits both then wraps; columns map to the cells.
+    const m1 = io.searchNext().?;
+    const m2 = io.searchNext().?;
+    try std.testing.expect(m1.start_y < m2.start_y);
+    try std.testing.expectEqual(@as(u16, 6), m1.start_x);
+    try std.testing.expectEqual(@as(u16, 11), m1.end_x); // "needle" is 6 cells: 6..11
+    const m1_again = io.searchNext().?; // wrapped
+    try std.testing.expectEqual(m1.start_y, m1_again.start_y);
+
+    // Backward navigation (from m1 wraps back to m2).
+    try std.testing.expectEqual(m2.start_y, io.searchPrev().?.start_y);
+
+    // The match's screen-absolute row is stable across a viewport scroll: the
+    // row at its screen_y holds the same text before and after scrolling up.
+    const before = (try io.rowTextScreen(alloc, m1.start_y)) orelse return error.NoRow;
+    defer alloc.free(before);
+    io.scrollViewport(-2); // scroll up into scrollback
+    const after = (try io.rowTextScreen(alloc, m1.start_y)) orelse return error.NoRow;
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "needle") != null);
+
+    // Clearing drops the matches.
+    io.searchClear();
+    try std.testing.expectEqual(@as(usize, 0), io.searchCount());
+    try std.testing.expect(io.searchNext() == null);
 }
 
 test "termio: scrollbar reflects scrollback growth and viewport position" {

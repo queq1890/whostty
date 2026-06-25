@@ -53,6 +53,11 @@ pub const semantic = @import("semantic.zig");
 /// cells lives on `Termio`. Stability: experimental (ADR 0010).
 pub const hyperlink = @import("hyperlink.zig");
 
+/// Scrollback search results (#138): the host-facing `Match` (screen-absolute
+/// cell range) + `Results` navigation container. The row scan + row-content
+/// access live on `Termio`. Stability: experimental (ADR 0010).
+pub const search = @import("search.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -70,6 +75,7 @@ pub const AttentionSink = attention.Sink;
 pub const SemanticState = semantic.State;
 pub const SemanticMark = semantic.Mark;
 pub const HyperlinkRange = hyperlink.Range;
+pub const SearchMatch = search.Match;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -85,4 +91,5 @@ test {
     _ = attention;
     _ = semantic;
     _ = hyperlink;
+    _ = search;
 }
