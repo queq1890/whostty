@@ -162,6 +162,17 @@ test "mouse: normal mode drops motion" {
     try testing.expect(encode(&buf, .normal, .sgr, .left, .motion, .{}, 0, 0) == null);
 }
 
+test "mouse: button/any modes report held-button drag motion with the +32 bit" {
+    var buf: [32]u8 = undefined;
+    // Button mode (1002), left held, motion to viewport (5,2) -> 1-based (6,3):
+    // acc = left(0) + motion(32) = 32, press-style final 'M'.
+    try testing.expectEqualStrings("\x1b[<32;6;3M", encode(&buf, .button, .sgr, .left, .motion, .{}, 5, 2).?);
+    // Any mode (1003) reports it too; ctrl(16) + left(0) + motion(32) = 48.
+    try testing.expectEqualStrings("\x1b[<48;6;3M", encode(&buf, .any, .sgr, .left, .motion, .{ .ctrl = true }, 5, 2).?);
+    // X10 mode never reports motion.
+    try testing.expect(encode(&buf, .x10, .sgr, .left, .motion, .{}, 5, 2) == null);
+}
+
 test "mouse: X10 format rejects coordinates past 223" {
     var buf: [32]u8 = undefined;
     try testing.expect(encode(&buf, .normal, .x10, .left, .press, .{}, 300, 0) == null);
