@@ -34,7 +34,7 @@ A downstream package pins whostty in its `build.zig.zon` and imports:
 
 | module | what it is |
 |---|---|
-| `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame`, `host` (the apprt-free `Host` vtable, #132), `surface` (the `Geometry` cell-metrics/resize/reflow model, #133), `cwd` (the unified per-pane working-directory store, #134), and `attention` (the typed BEL / OSC 9-777 / OSC 9;4 side channel + host `Sink`, #135) — zero Win32 / ConPTY / WGL dependency. |
+| `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame`, `host` (the apprt-free `Host` vtable, #132), `surface` (the `Geometry` cell-metrics/resize/reflow model, #133), `cwd` (the unified per-pane working-directory store, #134), `attention` (the typed BEL / OSC 9-777 / OSC 9;4 side channel + host `Sink`, #135), and `semantic` (OSC 133 prompt/command boundaries + semantic state, #136) — zero Win32 / ConPTY / WGL dependency. |
 | `ghostty-vt` | the pinned libghostty-vt VT core, re-exported so the consumer shares whostty's single pin (no second, drifting ghostty-vt dependency). |
 
 ```zig
