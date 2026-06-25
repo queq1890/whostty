@@ -46,6 +46,7 @@ const keymap = @import("keymap.zig");
 const mouse = @import("../../engine/mouse.zig");
 const cli = @import("../../cli.zig");
 const frame = @import("../../engine/frame.zig");
+const engine_env = @import("../../engine/env.zig");
 const discovery = @import("../../font/discovery.zig");
 const apprt = @import("../action.zig");
 
@@ -439,7 +440,21 @@ const WinState = struct {
 
         pane.pty = try Pty.open(.{ .ws_col = cols, .ws_row = rows });
         errdefer pane.pty.deinit();
-        pane.child = try pane.pty.spawn(alloc, self.opts.command orelse shellCommandLine());
+        // Compute the child environment to inject (#137): TERM / COLORTERM +
+        // shell-integration vars. `terminfo_dir` stays null here — compiling and
+        // installing the bundled xterm-ghostty entry and resolving its dir on the
+        // Windows host is the on-device follow-up; apps resolve TERM from the
+        // system terminfo database until then.
+        const env_entries = try engine_env.compute(alloc, .{
+            .shell_integration = self.cfg.shell_integration != .none,
+            .features = .{
+                .cursor = self.cfg.shell_integration_features.cursor,
+                .sudo = self.cfg.shell_integration_features.sudo,
+                .title = self.cfg.shell_integration_features.title,
+            },
+        });
+        defer engine_env.free(alloc, env_entries);
+        pane.child = try pane.pty.spawn(alloc, self.opts.command orelse shellCommandLine(), env_entries);
         errdefer {
             pane.child.kill();
             pane.child.deinit();

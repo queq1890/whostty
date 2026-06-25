@@ -34,7 +34,7 @@ A downstream package pins whostty in its `build.zig.zon` and imports:
 
 | module | what it is |
 |---|---|
-| `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame`, `host` (the apprt-free `Host` vtable, #132), `surface` (the `Geometry` cell-metrics/resize/reflow model, #133), `cwd` (the unified per-pane working-directory store, #134), `attention` (the typed BEL / OSC 9-777 / OSC 9;4 side channel + host `Sink`, #135), `semantic` (OSC 133 prompt/command boundaries + semantic state, #136), `hyperlink` (OSC 8 link ranges + targets, #139), and `search` (scrollback search results + row access, #138) — zero Win32 / ConPTY / WGL dependency. |
+| `whostty-engine` | the platform-free engine model (#129/#130): `grid` (cell/layout geometry), `split` (`SplitTree`/`TabList`), `mouse` (VT mouse-report encoding), `scroll`, `frame`, `host` (the apprt-free `Host` vtable, #132), `surface` (the `Geometry` cell-metrics/resize/reflow model, #133), `cwd` (the unified per-pane working-directory store, #134), `attention` (the typed BEL / OSC 9-777 / OSC 9;4 side channel + host `Sink`, #135), `semantic` (OSC 133 prompt/command boundaries + semantic state, #136), `hyperlink` (OSC 8 link ranges + targets, #139), `search` (scrollback search results + row access, #138), and `env` (child-process TERM / terminfo / shell-integration env to inject at spawn, #137) — zero Win32 / ConPTY / WGL dependency. |
 | `ghostty-vt` | the pinned libghostty-vt VT core, re-exported so the consumer shares whostty's single pin (no second, drifting ghostty-vt dependency). |
 
 ```zig

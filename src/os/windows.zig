@@ -37,6 +37,10 @@ pub const HPCON = HANDLE;
 /// dwCreationFlags: use lpStartupInfo as a STARTUPINFOEXW.
 pub const EXTENDED_STARTUPINFO_PRESENT: DWORD = 0x00080000;
 
+/// dwCreationFlags: lpEnvironment is a UTF-16 (wide) environment block. Required
+/// when passing a non-null wide env block to CreateProcessW (#137).
+pub const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
+
 /// STARTUPINFO.dwFlags: honor the hStdInput/hStdOutput/hStdError fields. With a
 /// pseudoconsole, these are left null and the ConPTY supplies the child's std
 /// handles — but the flag must be set (and bInheritHandles TRUE) for the child

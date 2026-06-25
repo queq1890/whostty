@@ -101,6 +101,8 @@ fn runVtDemo() !void {
 test {
     // Pull in host-testable slice-0 modules' tests.
     _ = @import("termio.zig");
+    _ = @import("terminfo.zig");
+    _ = @import("pty.zig");
     _ = @import("input.zig");
     _ = @import("font/Atlas.zig");
     _ = @import("renderer/OpenGL.zig");
