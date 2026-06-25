@@ -497,6 +497,20 @@ config_files: std.ArrayList([]const u8) = .empty,
 /// matching ghostty's behavior.
 diagnostics: std.ArrayList([]const u8) = .empty,
 
+/// Keys whostty's parser does not recognize, preserved as key/value pairs (owned
+/// by the arena) rather than dropped (#140). A downstream consumer (whomux)
+/// overlays its own config keys on top of whostty's format: it reads these to
+/// pick up its keys without forking the parser. An unrecognized key is still
+/// recorded in `diagnostics` (so a genuine typo is visible), but the value is
+/// retained here so the consumer can use it.
+unknown_keys: std.ArrayList(Unknown) = .empty,
+
+/// An unrecognized `key = value` pair, surfaced to a downstream consumer.
+pub const Unknown = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 // =========================================================================
 // Lifecycle + parsing
 // =========================================================================
@@ -706,13 +720,32 @@ fn set(self: *Config, alloc: std.mem.Allocator, key: []const u8, value: []const 
         if (value.len == 0) return error.ValueRequired;
         try self.config_files.append(alloc, try alloc.dupe(u8, value));
     } else {
+        // Unrecognized by whostty: record the diagnostic (typo visibility) AND
+        // preserve the key/value so a downstream consumer (whomux) can overlay
+        // its own keys instead of seeing them dropped (#140).
         try self.diag(alloc, "unknown config key: {s}", .{key});
+        try self.unknown_keys.append(alloc, .{
+            .key = try alloc.dupe(u8, key),
+            .value = try alloc.dupe(u8, value),
+        });
     }
 }
 
 fn diag(self: *Config, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const msg = try std.fmt.allocPrint(alloc, fmt, args);
     try self.diagnostics.append(alloc, msg);
+}
+
+/// The value of an unrecognized `key` (latest wins), or null — a convenience
+/// over scanning `unknown_keys` for a downstream consumer reading its own
+/// overlaid keys (#140). The returned slice is owned by the config arena.
+pub fn unknownValue(self: *const Config, key: []const u8) ?[]const u8 {
+    var i: usize = self.unknown_keys.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (eq(self.unknown_keys.items[i].key, key)) return self.unknown_keys.items[i].value;
+    }
+    return null;
 }
 
 /// The arena allocator for ad-hoc config-owned allocations (used by the IO
@@ -730,8 +763,9 @@ pub fn allocator(self: *Config) std.mem.Allocator {
 /// are excluded.
 pub fn isFormattable(comptime name: []const u8) bool {
     const excluded = [_][]const u8{
-        "arena",          "diagnostics", "palette", "font_features",
-        "font_variations", "env",        "keybinds", "config_files",
+        "arena",           "diagnostics", "palette",  "font_features",
+        "font_variations", "env",         "keybinds", "config_files",
+        "unknown_keys",
     };
     inline for (excluded) |x| if (comptime eq(name, x)) return false;
     return true;
@@ -1151,6 +1185,50 @@ test "config: unknown key and bad value become diagnostics, not failures" {
 
     try testing.expectEqual(@as(f32, 12), cfg.font_size);
     try testing.expectEqual(@as(usize, 2), cfg.diagnostics.items.len);
+}
+
+test "config: unknown keys are surfaced to the consumer, not just diagnosed (#140)" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\whomux-sidebar-width = 32
+        \\font-size = 14
+    );
+    defer cfg.deinit();
+
+    // The recognized key is resolved normally.
+    try testing.expectEqual(@as(f32, 14), cfg.font_size);
+    // The whomux-specific (unknown-to-whostty) key is preserved with its value
+    // for the downstream consumer rather than discarded.
+    try testing.expectEqualStrings("32", cfg.unknownValue("whomux-sidebar-width").?);
+    try testing.expect(cfg.unknownValue("not-present") == null);
+    try testing.expectEqual(@as(usize, 1), cfg.unknown_keys.items.len);
+    // It is also still a (non-fatal) diagnostic so a genuine typo stays visible.
+    try testing.expectEqual(@as(usize, 1), cfg.diagnostics.items.len);
+}
+
+test "config: parse resolves color and font values (#140)" {
+    const testing = std.testing;
+    var cfg = try Config.parse(testing.allocator,
+        \\background = 1a1b26
+        \\foreground = #c0caf5
+        \\font-family = JetBrains Mono
+        \\font-size = 13.5
+        \\font-feature = -liga
+    );
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 0), cfg.diagnostics.items.len);
+    // Resolved colors whomux uses to seed the engine (ADR 0007).
+    try testing.expectEqual(@as(u8, 0x1a), cfg.background.r);
+    try testing.expectEqual(@as(u8, 0x1b), cfg.background.g);
+    try testing.expectEqual(@as(u8, 0x26), cfg.background.b);
+    try testing.expectEqual(@as(u8, 0xc0), cfg.foreground.r);
+    try testing.expectEqual(@as(u8, 0xca), cfg.foreground.g);
+    try testing.expectEqual(@as(u8, 0xf5), cfg.foreground.b);
+    // Resolved font values whomux uses for cell sizing.
+    try testing.expectEqualStrings("JetBrains Mono", cfg.font_family.?);
+    try testing.expectEqual(@as(f32, 13.5), cfg.font_size);
+    try testing.expectEqual(@as(usize, 1), cfg.font_features.items.len);
 }
 
 test "config: new font tuning keys parse" {

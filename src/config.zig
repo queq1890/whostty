@@ -58,6 +58,9 @@ pub const LineIterator = Config.LineIterator;
 pub const KeyValue = Config.KeyValue;
 pub const parseBool = Config.parseBool;
 
+// Unknown (whomux-overlaid) keys surfaced to the consumer (#140)
+pub const Unknown = Config.Unknown;
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

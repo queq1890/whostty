@@ -145,6 +145,25 @@ pub fn build(b: *std.Build) void {
     const engine_linkcheck_step = b.step("engine-linux", "Link-check the engine model for a non-Windows target (#129)");
     engine_linkcheck_step.dependOn(&engine_linkcheck.step);
 
+    // --- Config module export (#140, epic E0 #141) ---
+    // whomux reuses whostty's config system + themes, then overlays its own keys.
+    // Export the ghostty-style `key = value` parser plus the resolved color / font
+    // / theme values as a second public module rooted at src/config.zig. It is
+    // self-contained (std only — no ghostty-vt, no Win32, no build_options), so it
+    // compiles + unit-tests standalone like the engine layer; `config-test`
+    // proves that, and CI runs it. Per ADR 0010 this is registered in the package
+    // module table so a downstream package resolves it with
+    // `whostty_dep.module("whostty-config")`. Unknown-to-whostty keys are surfaced
+    // (Config.unknown_keys) so whomux overlays its keys without forking the parser.
+    const config_module = b.addModule("whostty-config", .{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const config_tests = b.addTest(.{ .root_module = config_module });
+    const config_test_step = b.step("config-test", "Run the config module unit tests standalone (#140)");
+    config_test_step.dependOn(&b.addRunArtifact(config_tests).step);
+
     // Headless render proof (Linux/EGL + Mesa): exercises the real OpenGL.zig
     // shaders/geometry, font/main.zig (Freetype) and font/Atlas.zig on a genuine
     // GL 3.3 core context and asserts glyphs reach lit pixels — on-device
