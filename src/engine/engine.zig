@@ -38,6 +38,11 @@ pub const surface = @import("surface.zig");
 /// experimental (ADR 0010).
 pub const cwd = @import("cwd.zig");
 
+/// The attention side channel (#135): typed BEL / OSC 9-777 notification / OSC
+/// 9;4 progress events plus the host `Sink` callback. The engine reports the
+/// events; the host owns OS surfacing. Stability: experimental (ADR 0010).
+pub const attention = @import("attention.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -50,6 +55,8 @@ pub const Host = host.Host;
 pub const CursorShape = host.CursorShape;
 pub const Geometry = surface.Geometry;
 pub const Cwd = cwd.Cwd;
+pub const AttentionEvent = attention.Event;
+pub const AttentionSink = attention.Sink;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -62,4 +69,5 @@ test {
     _ = host;
     _ = surface;
     _ = cwd;
+    _ = attention;
 }

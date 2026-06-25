@@ -11,6 +11,9 @@ const mouse = @import("engine/mouse.zig");
 /// The unified per-pane cwd store (#134). OSC 7 and OSC 133 (#136) both write
 /// this single canonical path so consumers never reconcile two sources.
 const engine_cwd = @import("engine/cwd.zig");
+/// The attention side channel public types (#135): typed bell / notification /
+/// progress events + the host `Sink` callback.
+const engine_attn = @import("engine/attention.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.
@@ -53,6 +56,11 @@ const SideChannel = struct {
     /// Latest taskbar progress state (OSC 9;4). A *state*, not an event: it
     /// persists until the app changes it. `.remove` (no bar) is the idle default.
     progress: gvt.osc.Command.ProgressReport = .{ .state = .remove },
+    /// Optional host callback (#135): when set, fired on the reader thread the
+    /// instant an attention event (bell / notification / progress) is captured,
+    /// so the host can react eagerly instead of waiting for the next poll. Set
+    /// via `Termio.setAttentionSink`; guarded by `Termio.mutex` like the rest.
+    attention_sink: ?engine_attn.Sink = null,
 
     fn deinit(self: *SideChannel, alloc: std.mem.Allocator) void {
         self.cwd.deinit(alloc);
@@ -122,11 +130,12 @@ const ResponseHandler = struct {
             .kitty_keyboard_query => try self.queryKittyKeyboard(),
 
             // Out-of-band events the app consumes (not pty replies). The readonly
-            // handler drops these, so we capture them into the side channel.
-            .bell => self.side.bell_count +|= 1,
+            // handler drops these, so we capture them into the side channel and
+            // (if a sink is registered, #135) notify the host eagerly.
+            .bell => self.bell(),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showNotification(value),
-            .progress_report => self.side.progress = value,
+            .progress_report => self.captureProgress(value),
             .window_title => try self.setTitle(value.title),
 
             // CSI 21t report-title and the CSI 22t/23t title stack are deferred.
@@ -322,17 +331,49 @@ const ResponseHandler = struct {
         self.side.title = try self.alloc.dupe(u8, title);
     }
 
+    /// BEL — record a bell edge and notify the host eagerly (#135). The count is
+    /// drained take-and-clear by `takeBellCount`; the sink just learns one rang.
+    fn bell(self: *ResponseHandler) void {
+        self.side.bell_count +|= 1;
+        if (self.side.attention_sink) |s| s.notify(.bell);
+    }
+
+    /// OSC 9;4 — record the latest taskbar progress *level* and notify the host
+    /// (#135). Unlike the edges, the level persists (read via `progress`).
+    fn captureProgress(self: *ResponseHandler, value: gvt.osc.Command.ProgressReport) void {
+        self.side.progress = value;
+        if (self.side.attention_sink) |s| s.notify(.{ .progress = engineProgress(value) });
+    }
+
     /// OSC 9 / OSC 777 — capture a desktop notification (title may be empty for
     /// the OSC 9 form). Both fields are valid only during the call, so they are
-    /// duplicated; the latest notification wins until the app drains it.
+    /// duplicated; the latest notification wins until the app drains it. The host
+    /// sink (#135) is notified with the *borrowed* slices (valid for the call).
     fn showNotification(self: *ResponseHandler, n: gvt.StreamAction.Value(.show_desktop_notification)) !void {
         const title = try self.alloc.dupe(u8, n.title);
         errdefer self.alloc.free(title);
         const body = try self.alloc.dupe(u8, n.body);
         if (self.side.notification) |*old| old.deinit(self.alloc);
         self.side.notification = .{ .title = title, .body = body };
+        if (self.side.attention_sink) |s| s.notify(.{ .notification = .{ .title = n.title, .body = n.body } });
     }
 };
+
+/// Map libghostty-vt's progress report onto the engine's host-facing `Progress`,
+/// decoupling whomux from the VT core's exact type (#135). The state enums share
+/// the same five members; this switch keeps the boundary explicit.
+fn engineProgress(p: gvt.osc.Command.ProgressReport) engine_attn.Progress {
+    return .{
+        .state = switch (p.state) {
+            .remove => .remove,
+            .set => .set,
+            .@"error" => .@"error",
+            .indeterminate => .indeterminate,
+            .pause => .pause,
+        },
+        .percent = p.progress,
+    };
+}
 
 /// Owns the VT parser stream and the terminal state. Heap-allocated so the
 /// stream's handler can hold a stable pointer to `terminal`.
@@ -475,6 +516,27 @@ pub const Termio = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.side.progress;
+    }
+
+    /// The current OSC 9;4 progress as the host-facing `engine.attention.Progress`
+    /// (state + percent), decoupled from the VT core's type — this is the public
+    /// per-Surface progress *level* getter (#135). Persistent (not drained), the
+    /// `.remove` idle default until an app sets it. Thread-safe.
+    pub fn progress(self: *Termio) engine_attn.Progress {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return engineProgress(self.side.progress);
+    }
+
+    /// Register (or clear, with null) the host attention `Sink` (#135). When set,
+    /// it fires on the reader thread under `mutex` the instant a bell /
+    /// notification / progress event is captured, so the host can react eagerly
+    /// (e.g. wake a sleeping frame loop) rather than waiting for the next poll.
+    /// The sink must not block or re-enter `Termio`. Thread-safe.
+    pub fn setAttentionSink(self: *Termio, sink: ?engine_attn.Sink) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.side.attention_sink = sink;
     }
 
     /// Move pending VT replies (DSR/DA/DECRQM) into `buf`, returning the number
@@ -1225,6 +1287,77 @@ test "termio: OSC 9;4 progress report is captured as persistent state" {
     // Remove clears the bar.
     try io.process("\x1b]9;4;0;\x07");
     try std.testing.expectEqual(vt.osc.Command.ProgressReport.State.remove, io.progressReport().state);
+}
+
+test "termio: progress() exposes OSC 9;4 as the engine attention level (#135)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try std.testing.expectEqual(engine_attn.Progress.State.remove, io.progress().state);
+
+    // Error state at 80%.
+    try io.process("\x1b]9;4;2;80\x07");
+    const p = io.progress();
+    try std.testing.expectEqual(engine_attn.Progress.State.@"error", p.state);
+    try std.testing.expectEqual(@as(?u8, 80), p.percent);
+}
+
+test "termio: attention sink fires eagerly for bell, notification and progress (#135)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    const Captured = struct {
+        bells: u32 = 0,
+        notif_title: [64]u8 = undefined,
+        notif_title_len: usize = 0,
+        notif_body: [64]u8 = undefined,
+        notif_body_len: usize = 0,
+        progress_state: ?engine_attn.Progress.State = null,
+        progress_percent: ?u8 = null,
+
+        fn onEvent(ctx: *anyopaque, event: engine_attn.Event) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .bell => c.bells += 1,
+                .notification => |n| {
+                    // Copy out: the slices are borrowed for this call only.
+                    @memcpy(c.notif_title[0..n.title.len], n.title);
+                    c.notif_title_len = n.title.len;
+                    @memcpy(c.notif_body[0..n.body.len], n.body);
+                    c.notif_body_len = n.body.len;
+                },
+                .progress => |p| {
+                    c.progress_state = p.state;
+                    c.progress_percent = p.percent;
+                },
+            }
+        }
+    };
+
+    var cap: Captured = .{};
+    io.setAttentionSink(.{ .ctx = &cap, .on_event = Captured.onEvent });
+
+    // Bell edge.
+    try io.process("\x07");
+    try std.testing.expectEqual(@as(u32, 1), cap.bells);
+
+    // OSC 777 notification (title + body), delivered eagerly with borrowed slices.
+    try io.process("\x1b]777;notify;Build;passed\x07");
+    try std.testing.expectEqualStrings("Build", cap.notif_title[0..cap.notif_title_len]);
+    try std.testing.expectEqualStrings("passed", cap.notif_body[0..cap.notif_body_len]);
+
+    // OSC 9;4 progress level.
+    try io.process("\x1b]9;4;1;25\x07");
+    try std.testing.expectEqual(engine_attn.Progress.State.set, cap.progress_state.?);
+    try std.testing.expectEqual(@as(?u8, 25), cap.progress_percent);
+
+    // Clearing the sink stops eager delivery; the poll API still works.
+    io.setAttentionSink(null);
+    try io.process("\x07");
+    try std.testing.expectEqual(@as(u32, 1), cap.bells); // unchanged
+    try std.testing.expectEqual(@as(u32, 2), io.takeBellCount()); // both bells counted
 }
 
 test "termio: scrollbar reflects scrollback growth and viewport position" {
