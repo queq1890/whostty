@@ -39,6 +39,7 @@ Downstream may import **only** modules whostty registers in its build graph
 | `ghostty-vt` (re-export) | stable (tracks the pinned ghostty tag) | #130 |
 | `whostty-engine`'s `host` (the apprt-free `Host` vtable) | experimental | #132 |
 | `whostty-engine`'s `surface` (the `Geometry` cell-metrics/resize/reflow model) | experimental | #133 |
+| `whostty-engine`'s `cwd` (the unified per-pane working-directory store) | experimental | #134 |
 
 Anything reached by deep-importing whostty source paths that are not part of an
 exported module is unsupported and may break without notice. New exported

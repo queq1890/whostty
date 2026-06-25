@@ -8,6 +8,9 @@
 const std = @import("std");
 const vt = @import("ghostty-vt");
 const mouse = @import("engine/mouse.zig");
+/// The unified per-pane cwd store (#134). OSC 7 and OSC 133 (#136) both write
+/// this single canonical path so consumers never reconcile two sources.
+const engine_cwd = @import("engine/cwd.zig");
 
 /// Module alias for use inside `ResponseHandler`, whose required `vt` method
 /// name shadows the `vt` module import within the struct's scope.
@@ -38,9 +41,10 @@ const SideChannel = struct {
     /// Bells rung since the last drain. The app flashes the window once per
     /// drain regardless of count; the count just records that one happened.
     bell_count: u32 = 0,
-    /// Latest OSC 7 working directory (the raw `file://` URL), owned by `alloc`.
-    /// An empty OSC 7 url clears it (ghostty's "forget the pwd" behavior).
-    cwd: ?[]u8 = null,
+    /// The unified working-directory store (#134): one canonical cwd fed by both
+    /// OSC 7 (the raw `file://` URL) and OSC 133 (#136). An empty OSC 7 url
+    /// clears it (ghostty's "forget the pwd" behavior). Owns its buffer.
+    cwd: engine_cwd.Cwd = .{},
     /// Latest OSC 0/2 window title (UTF-8), owned by `alloc`; latest wins until
     /// drained. An empty title clears it (matching the cwd reset semantics).
     title: ?[]u8 = null,
@@ -51,7 +55,7 @@ const SideChannel = struct {
     progress: gvt.osc.Command.ProgressReport = .{ .state = .remove },
 
     fn deinit(self: *SideChannel, alloc: std.mem.Allocator) void {
-        if (self.cwd) |c| alloc.free(c);
+        self.cwd.deinit(alloc);
         if (self.title) |t| alloc.free(t);
         if (self.notification) |*n| n.deinit(alloc);
         self.* = undefined;
@@ -295,18 +299,14 @@ const ResponseHandler = struct {
         try self.reply(try std.fmt.bufPrint(&buf, "\x1b[?{d}u", .{flags}));
     }
 
-    /// OSC 7 — record the shell's reported working directory (the raw url). An
-    /// empty url resets it (ghostty treats that as "the pwd is unknown"). The
-    /// consumers (window title #89, new-window inheritance #87) read it later;
-    /// here we just capture it. The url slice is only valid during the call, so
-    /// it is duplicated into the side channel.
+    /// OSC 7 — record the shell's reported working directory (the raw url) into
+    /// the unified cwd store (#134). An empty url resets it (ghostty treats that
+    /// as "the pwd is unknown"). OSC 133 (#136) writes the *same* store, so the
+    /// cwd is one canonical path. The consumers (window title #89, new-window
+    /// inheritance #87, whomux's sidebar) read it via `cwdAlloc`. The url slice
+    /// is only valid during the call, so the store duplicates it.
     fn reportPwd(self: *ResponseHandler, url: []const u8) !void {
-        if (self.side.cwd) |old| {
-            self.alloc.free(old);
-            self.side.cwd = null;
-        }
-        if (url.len == 0) return;
-        self.side.cwd = try self.alloc.dupe(u8, url);
+        try self.side.cwd.set(self.alloc, url);
     }
 
     /// OSC 0 / OSC 2 — capture the window title (UTF-8). The vt has already
@@ -434,13 +434,15 @@ pub const Termio = struct {
         return n;
     }
 
-    /// The shell's last-reported working directory (OSC 7), duplicated into
-    /// `alloc` for the caller to own, or null if none has been reported (or it
-    /// was reset). Thread-safe.
+    /// The pane's working directory — the single canonical value fed by OSC 7
+    /// and OSC 133 (#134) — duplicated into `alloc` for the caller to own, or
+    /// null if none has been reported or it was reset (the empty-url "forget the
+    /// pwd" case, so whomux can fall back to the spawn directory). This is the
+    /// per-Surface `cwd()` accessor; reads take the `Termio` mutex. Thread-safe.
     pub fn cwdAlloc(self: *Termio, alloc: std.mem.Allocator) !?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const c = self.side.cwd orelse return null;
+        const c = self.side.cwd.get() orelse return null;
         return try alloc.dupe(u8, c);
     }
 
@@ -1112,6 +1114,34 @@ test "termio: OSC 7 records and resets the working directory" {
     // An empty OSC 7 forgets the pwd.
     try io.process("\x1b]7;\x1b\\");
     try std.testing.expect((try io.cwdAlloc(alloc)) == null);
+}
+
+test "termio: OSC 7 and the OSC 133 path write a single canonical cwd store (#134)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // OSC 7 writes the unified store.
+    try io.process("\x1b]7;file://host/from/osc7\x1b\\");
+    {
+        const c = (try io.cwdAlloc(alloc)) orelse return error.NoCwd;
+        defer alloc.free(c);
+        try std.testing.expectEqualStrings("file://host/from/osc7", c);
+    }
+
+    // The OSC 133 prompt-mark path (#136) routes its reported directory into the
+    // *same* `side.cwd` store rather than a second source — so the latest value
+    // is indistinguishable from an OSC 7 update. Exercise that shared store
+    // directly here (the OSC 133 capture is wired in #136) to assert there is
+    // exactly one cwd field.
+    io.mutex.lock();
+    try io.side.cwd.set(alloc, "/from/osc133");
+    io.mutex.unlock();
+    {
+        const c = (try io.cwdAlloc(alloc)) orelse return error.NoCwd;
+        defer alloc.free(c);
+        try std.testing.expectEqualStrings("/from/osc133", c);
+    }
 }
 
 test "termio: OSC 0 / OSC 2 capture the window title, drained once, empty clears" {

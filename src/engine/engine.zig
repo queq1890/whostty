@@ -33,6 +33,11 @@ pub const host = @import("host.zig");
 /// Stability: experimental (ADR 0010).
 pub const surface = @import("surface.zig");
 
+/// The unified per-pane working-directory store (#134): one canonical cwd path
+/// fed by OSC 7 and OSC 133, with the OSC 7 empty-url reset. Stability:
+/// experimental (ADR 0010).
+pub const cwd = @import("cwd.zig");
+
 // Convenience re-exports of the common engine types.
 pub const SplitTree = split.SplitTree;
 pub const TabList = split.TabList;
@@ -44,6 +49,7 @@ pub const Layout = grid.Layout;
 pub const Host = host.Host;
 pub const CursorShape = host.CursorShape;
 pub const Geometry = surface.Geometry;
+pub const Cwd = cwd.Cwd;
 
 test {
     // Pull in every engine submodule's unit tests so `zig build engine-test`
@@ -55,4 +61,5 @@ test {
     _ = frame;
     _ = host;
     _ = surface;
+    _ = cwd;
 }
