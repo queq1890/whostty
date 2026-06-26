@@ -11,6 +11,7 @@ const cli = @import("cli.zig");
 const w = @import("os/windows.zig");
 const theme = @import("config/theme.zig");
 const discovery = @import("font/discovery.zig");
+const binding = @import("input/Binding.zig");
 
 // Canonical version lives in build.zig.zon (`.version`); keep this literal in
 // lockstep with it and the git release tag when bumping.
@@ -36,6 +37,7 @@ pub fn main() !void {
         .version => return cliPrint(version_string ++ "\n"),
         .list_fonts => return listFontsAction(alloc),
         .list_themes => return listThemesAction(alloc),
+        .list_keybinds => return listKeybindsAction(alloc),
         .run => {},
     }
 
@@ -61,6 +63,7 @@ const help_text =
     \\Actions:
     \\  +list-fonts        List the discoverable system font families.
     \\  +list-themes       List the available themes.
+    \\  +list-keybinds     List the default key bindings.
     \\  +version           Show the version.
     \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
@@ -88,6 +91,18 @@ fn listThemesAction(alloc: std.mem.Allocator) void {
         out.append(alloc, '\n') catch return;
     }
     out.appendSlice(alloc, "\nAdd your own under %APPDATA%\\whostty\\themes\\ or <exe dir>\\themes\\.\n") catch return;
+    cliPrint(out.items);
+}
+
+/// `+list-keybinds`: print the default key bindings in `trigger=action` config
+/// syntax (copy-pasteable into the config file).
+fn listKeybindsAction(alloc: std.mem.Allocator) void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (binding.default_lines) |line| {
+        out.appendSlice(alloc, line) catch return;
+        out.append(alloc, '\n') catch return;
+    }
     cliPrint(out.items);
 }
 

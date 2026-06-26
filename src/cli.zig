@@ -19,6 +19,8 @@ pub const Action = enum {
     list_fonts,
     /// `+list-themes` — print the available themes (built-in catalog).
     list_themes,
+    /// `+list-keybinds` — print the default key bindings.
+    list_keybinds,
 };
 
 pub const Options = struct {
@@ -81,6 +83,8 @@ pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) Error!Options {
                 .list_fonts
             else if (std.mem.eql(u8, name, "list-themes"))
                 .list_themes
+            else if (std.mem.eql(u8, name, "list-keybinds"))
+                .list_keybinds
             else
                 .help;
             continue;
@@ -152,6 +156,7 @@ test "cli: +action subcommands select the action" {
     inline for (.{
         .{ "+list-fonts", Action.list_fonts },
         .{ "+list-themes", Action.list_themes },
+        .{ "+list-keybinds", Action.list_keybinds },
         .{ "+version", Action.version },
         .{ "+help", Action.help },
     }) |c| {

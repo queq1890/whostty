@@ -302,36 +302,50 @@ pub const Set = struct {
     }
 };
 
+/// whostty's default key bindings, in `trigger=action` config syntax. This is the
+/// single source of truth: `addDefaults` seeds a `Set` from it, and the
+/// `+list-keybinds` CLI action (#53) prints it. Each line round-trips through
+/// `parse` (asserted by the test below).
+pub const default_lines = [_][]const u8{
+    "ctrl+shift+n=new_window",
+    "ctrl+shift+t=new_tab",
+    "ctrl+shift+w=close_surface",
+    "ctrl+pagedown=next_tab",
+    "ctrl+pageup=previous_tab",
+    "ctrl+shift+right=new_split:right",
+    "ctrl+shift+left=new_split:left",
+    "ctrl+shift+down=new_split:down",
+    "ctrl+shift+up=new_split:up",
+    "alt+right=goto_split:right",
+    "alt+left=goto_split:left",
+    "alt+down=goto_split:down",
+    "alt+up=goto_split:up",
+    "shift+pageup=scroll_page_up",
+    "shift+pagedown=scroll_page_down",
+    "ctrl+shift+c=copy_to_clipboard",
+    "ctrl+shift+v=paste_from_clipboard",
+    "ctrl+shift+enter=toggle_fullscreen",
+    "ctrl+shift+m=toggle_maximize",
+    "ctrl+shift+b=toggle_window_decorations",
+    "ctrl+shift+q=quit",
+};
+
 /// Seed `set` with whostty's default bindings. Called by the apprt before
 /// applying any user `keybind` lines, which then override per trigger.
 pub fn addDefaults(set: *Set, alloc: std.mem.Allocator) !void {
-    const lines = [_][]const u8{
-        "ctrl+shift+n=new_window",
-        "ctrl+shift+t=new_tab",
-        "ctrl+shift+w=close_surface",
-        "ctrl+pagedown=next_tab",
-        "ctrl+pageup=previous_tab",
-        "ctrl+shift+right=new_split:right",
-        "ctrl+shift+left=new_split:left",
-        "ctrl+shift+down=new_split:down",
-        "ctrl+shift+up=new_split:up",
-        "alt+right=goto_split:right",
-        "alt+left=goto_split:left",
-        "alt+down=goto_split:down",
-        "alt+up=goto_split:up",
-        "shift+pageup=scroll_page_up",
-        "shift+pagedown=scroll_page_down",
-        "ctrl+shift+c=copy_to_clipboard",
-        "ctrl+shift+v=paste_from_clipboard",
-        "ctrl+shift+enter=toggle_fullscreen",
-        "ctrl+shift+m=toggle_maximize",
-        "ctrl+shift+b=toggle_window_decorations",
-        "ctrl+shift+q=quit",
-    };
-    for (lines) |line| try set.putLine(alloc, line);
+    for (default_lines) |line| try set.putLine(alloc, line);
 }
 
 const testing = std.testing;
+
+test "binding: every default line parses (so +list-keybinds prints valid syntax)" {
+    for (default_lines) |line| {
+        _ = parse(line) catch |e| {
+            std.debug.print("default keybind failed to parse: {s} ({})\n", .{ line, e });
+            return e;
+        };
+    }
+}
 
 test "binding: parse a trigger with modifiers and a named key" {
     const t = try parseTrigger("ctrl+shift+right");
