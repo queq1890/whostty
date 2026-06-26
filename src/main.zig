@@ -42,6 +42,7 @@ pub fn main() !void {
         .list_actions => return listActionsAction(alloc),
         .show_config => return showConfigAction(alloc, opts.config_text),
         .validate_config => return validateConfigAction(alloc, opts.config_text),
+        .list_colors => return listColorsAction(alloc),
         .run => {},
     }
 
@@ -71,6 +72,7 @@ const help_text =
     \\  +list-actions      List the bindable keybind actions.
     \\  +show-config       Print the effective config in config-file syntax.
     \\  +validate-config   Load the config and report diagnostics (exit 1 if any).
+    \\  +list-colors       List the recognized named colors and their hex values.
     \\  +version           Show the version.
     \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
@@ -156,6 +158,35 @@ fn showConfigAction(alloc: std.mem.Allocator, override_text: []const u8) void {
     const ff: config.FileFormatter = .{ .config = &cfg };
     ff.format(&buf.writer) catch return;
     cliPrint(buf.written());
+}
+
+/// `+list-colors`: print the recognized named colors and their hex values. The
+/// set is small (the common ANSI names); a hex value like `#rrggbb` is accepted
+/// anywhere a color is, so the header says so to avoid implying these are the only
+/// valid colors.
+fn listColorsAction(alloc: std.mem.Allocator) void {
+    const Color = config.Color;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, "Recognized color names (a hex value like #rrggbb is also accepted anywhere a color is):\n") catch return;
+
+    // Sort the names so the output is alphabetical and deterministic (the map's
+    // own key order is hash-based), matching +list-themes.
+    const sorted = alloc.dupe([]const u8, Color.named.keys()) catch return;
+    defer alloc.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    for (sorted) |name| {
+        const c = Color.named.get(name) orelse continue;
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "  {s: <8} #{x:0>2}{x:0>2}{x:0>2}\n", .{ name, c.r, c.g, c.b }) catch continue;
+        out.appendSlice(alloc, line) catch return;
+    }
+    cliPrint(out.items);
 }
 
 /// `+list-actions`: print the bindable keybind action names (one per line), so a

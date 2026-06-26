@@ -92,8 +92,9 @@ pub const Color = struct {
     }
 
     /// The common ANSI color names. A small subset of X11 colors; full names
-    /// are deferred to libghostty-vt's `x11_color` map.
-    const named = std.StaticStringMap(Color).initComptime(.{
+    /// are deferred to libghostty-vt's `x11_color` map. `pub` so the
+    /// `+list-actions`-style `+list-colors` CLI can enumerate the recognized names.
+    pub const named = std.StaticStringMap(Color).initComptime(.{
         .{ "black", Color{ .r = 0, .g = 0, .b = 0 } },
         .{ "red", Color{ .r = 255, .g = 0, .b = 0 } },
         .{ "green", Color{ .r = 0, .g = 128, .b = 0 } },

@@ -27,6 +27,8 @@ pub const Action = enum {
     show_config,
     /// `+validate-config` — load the config and report any diagnostics.
     validate_config,
+    /// `+list-colors` — print the recognized named colors with their hex values.
+    list_colors,
 };
 
 pub const Options = struct {
@@ -97,6 +99,8 @@ pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) Error!Options {
                 .show_config
             else if (std.mem.eql(u8, name, "validate-config"))
                 .validate_config
+            else if (std.mem.eql(u8, name, "list-colors"))
+                .list_colors
             else
                 .help;
             continue;
@@ -172,6 +176,7 @@ test "cli: +action subcommands select the action" {
         .{ "+list-actions", Action.list_actions },
         .{ "+show-config", Action.show_config },
         .{ "+validate-config", Action.validate_config },
+        .{ "+list-colors", Action.list_colors },
         .{ "+version", Action.version },
         .{ "+help", Action.help },
     }) |c| {
