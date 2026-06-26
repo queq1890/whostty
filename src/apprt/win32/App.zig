@@ -1863,6 +1863,16 @@ fn switchTab(ws: *WinState, comptime which: enum { next, prev }) void {
     ws.syncWindowForFocus();
 }
 
+/// Whether a paste must be confirmed before it reaches the shell (#161): paste
+/// protection is enabled AND the content is unsafe — it contains a newline or a
+/// bracketed-paste terminator, either of which can auto-execute commands at the
+/// shell prompt (and is plantable remotely via an OSC 52 clipboard write). The
+/// check is independent of bracketed-paste mode, matching ghostty's
+/// `clipboard_paste_protection` gate and `vt.input.isSafePaste`.
+fn shouldConfirmPaste(protection: bool, text: []const u8) bool {
+    return protection and !vt.input.isSafePaste(text);
+}
+
 /// Paste the system clipboard into the focused pane's shell. Reads
 /// CF_UNICODETEXT, encodes via libghostty-vt's paste encoder (strips unsafe
 /// bytes, applies bracketed-paste fenceposts when mode 2004 is on), and writes
@@ -1873,6 +1883,19 @@ fn pasteFromClipboard(ws: *WinState) void {
     const text = (w.clipboardRead(alloc, ws.win.handle()) catch return) orelse return;
     defer alloc.free(text);
     if (text.len == 0) return;
+
+    // Paste protection (#161): an unsafe paste requires explicit confirmation, so
+    // remotely-planted multi-line clipboard content cannot silently execute in
+    // the shell. Bracketed-safe single-line pastes go straight through.
+    if (shouldConfirmPaste(ws.cfg.clipboard_paste_protection, text)) {
+        const caption = std.unicode.utf8ToUtf16LeStringLiteral("whostty");
+        const msg = std.unicode.utf8ToUtf16LeStringLiteral(
+            "The clipboard contents contain newlines or terminal control " ++
+                "sequences that could run commands when pasted. Paste anyway?",
+        );
+        const r = w.MessageBoxW(ws.win.handle(), msg, caption, w.MB_YESNO | w.MB_ICONQUESTION);
+        if (r != w.IDYES) return;
+    }
 
     const bracketed = blk: {
         pane.io.lock();
@@ -1890,6 +1913,17 @@ fn pasteFromClipboard(ws: *WinState) void {
     for (parts) |part| {
         if (part.len > 0) _ = pane.pty.write(part) catch {};
     }
+}
+
+test "win32: paste confirmation gates on protection + unsafe content (#161)" {
+    // Safe single-line paste never prompts.
+    try std.testing.expect(!shouldConfirmPaste(true, "echo hello"));
+    // A newline can auto-execute at the prompt -> prompt when protection is on.
+    try std.testing.expect(shouldConfirmPaste(true, "calc & whoami\n"));
+    // A bracketed-paste terminator is always treated as unsafe.
+    try std.testing.expect(shouldConfirmPaste(true, "x\x1b[201~y"));
+    // Protection disabled: never prompt, even for unsafe content.
+    try std.testing.expect(!shouldConfirmPaste(false, "calc & whoami\n"));
 }
 
 /// Copy the focused pane's selection to the system clipboard. A no-op when there
