@@ -99,6 +99,8 @@ User `keybind` lines override the defaults per trigger.
 | `goto_tab` | number | Activate a tab by index. |
 | `scroll_page_up` / `scroll_page_down` | — | Scroll one page through scrollback. |
 | `scroll_to_top` / `scroll_to_bottom` | — | Jump to the ends of scrollback. |
+| `copy_to_clipboard` / `paste_from_clipboard` | — | Copy the selection / paste the clipboard. |
+| `select_all` | — | Select the entire scrollback and screen. |
 
 ### Default bindings
 
@@ -112,6 +114,7 @@ User `keybind` lines override the defaults per trigger.
 | `shift+pageup` / `shift+pagedown` | `scroll_page_up` / `scroll_page_down` |
 | `ctrl+shift+c` / `ctrl+insert` | `copy_to_clipboard` |
 | `ctrl+shift+v` / `shift+insert` | `paste_from_clipboard` |
+| `ctrl+shift+a` | `select_all` |
 
 > Note: the config parsing, keybinding grammar, split/tab models, and scrollback
 > math are implemented and host-tested. Dispatching key events into these models,

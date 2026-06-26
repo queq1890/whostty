@@ -1724,6 +1724,10 @@ fn performAction(ws: *WinState, action: apprt.Action) bool {
             copyToClipboard(ws);
             return true;
         },
+        .select_all => {
+            if (ws.focusedPane()) |p| p.io.selectAll();
+            return true;
+        },
         .paste_from_clipboard => {
             pasteFromClipboard(ws);
             return true;

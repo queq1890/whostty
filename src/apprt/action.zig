@@ -70,6 +70,8 @@ pub const Action = union(enum) {
     /// Copy the selection to / paste from the system clipboard.
     copy_to_clipboard,
     paste_from_clipboard,
+    /// Select the entire scrollback + screen (#53).
+    select_all,
 
     // --- Still stubbed: in-window subdivision (#87) ---
     // Mapped-but-logged. Payloads reuse `binding`'s enums so the mapping is total.
@@ -108,6 +110,7 @@ pub fn fromBinding(b: binding.Action) Action {
         .scroll_to_bottom => .scroll_to_bottom,
         .copy_to_clipboard => .copy_to_clipboard,
         .paste_from_clipboard => .paste_from_clipboard,
+        .select_all => .select_all,
         .new_split => |d| .{ .new_split = d },
         .goto_split => |d| .{ .goto_split = d },
         .new_tab => .new_tab,
@@ -137,6 +140,7 @@ test "apprt.Action: binding maps to the matching apprt action" {
     try testing.expectEqual(Action.scroll_to_bottom, fromBinding(.scroll_to_bottom));
     try testing.expectEqual(Action.copy_to_clipboard, fromBinding(.copy_to_clipboard));
     try testing.expectEqual(Action.paste_from_clipboard, fromBinding(.paste_from_clipboard));
+    try testing.expectEqual(Action.select_all, fromBinding(.select_all));
     // App-lifecycle + windowing actions (#92).
     try testing.expectEqual(Action.quit, fromBinding(.quit));
     try testing.expectEqual(Action.close_window, fromBinding(.close_window));
