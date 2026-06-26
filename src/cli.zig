@@ -25,6 +25,8 @@ pub const Action = enum {
     list_actions,
     /// `+show-config` — print the effective config in config-file syntax.
     show_config,
+    /// `+validate-config` — load the config and report any diagnostics.
+    validate_config,
 };
 
 pub const Options = struct {
@@ -93,6 +95,8 @@ pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) Error!Options {
                 .list_actions
             else if (std.mem.eql(u8, name, "show-config"))
                 .show_config
+            else if (std.mem.eql(u8, name, "validate-config"))
+                .validate_config
             else
                 .help;
             continue;
@@ -167,6 +171,7 @@ test "cli: +action subcommands select the action" {
         .{ "+list-keybinds", Action.list_keybinds },
         .{ "+list-actions", Action.list_actions },
         .{ "+show-config", Action.show_config },
+        .{ "+validate-config", Action.validate_config },
         .{ "+version", Action.version },
         .{ "+help", Action.help },
     }) |c| {

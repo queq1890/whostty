@@ -41,6 +41,7 @@ pub fn main() !void {
         .list_keybinds => return listKeybindsAction(alloc),
         .list_actions => return listActionsAction(alloc),
         .show_config => return showConfigAction(alloc, opts.config_text),
+        .validate_config => return validateConfigAction(alloc, opts.config_text),
         .run => {},
     }
 
@@ -69,6 +70,7 @@ const help_text =
     \\  +list-keybinds     List the default key bindings.
     \\  +list-actions      List the bindable keybind actions.
     \\  +show-config       Print the effective config in config-file syntax.
+    \\  +validate-config   Load the config and report diagnostics (exit 1 if any).
     \\  +version           Show the version.
     \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
@@ -109,6 +111,33 @@ fn listKeybindsAction(alloc: std.mem.Allocator) void {
         out.append(alloc, '\n') catch return;
     }
     cliPrint(out.items);
+}
+
+/// `+validate-config`: load the config the same way `+show-config` does and report
+/// any diagnostics the loader collected (unknown keys, bad values, …). Prints
+/// "Configuration valid." and exits 0 when clean, or the diagnostics and exits 1
+/// when not — so scripts and CI can gate on a config's validity.
+fn validateConfigAction(alloc: std.mem.Allocator, override_text: []const u8) void {
+    var cfg = config.Config.init(alloc);
+    defer cfg.deinit();
+    const dark = if (comptime builtin.os.tag == .windows) w.isSystemDarkMode() else false;
+    const state: config.ConditionalState = .{ .theme = if (dark) .dark else .light };
+    config.loadDefaultFiles(&cfg, alloc, state) catch {};
+    if (override_text.len > 0) cfg.loadString(override_text) catch {};
+
+    if (cfg.diagnostics.items.len == 0) {
+        cliPrint("Configuration valid.\n");
+        return;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (cfg.diagnostics.items) |msg| {
+        out.appendSlice(alloc, msg) catch break;
+        out.append(alloc, '\n') catch break;
+    }
+    cliPrint(out.items);
+    std.process.exit(1);
 }
 
 /// `+show-config`: load the user's config (file + theme + `config-file` includes,
