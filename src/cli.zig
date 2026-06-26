@@ -11,7 +11,15 @@
 //! the file config via `Config.loadString`, keeping CLI and file config in sync.
 const std = @import("std");
 
-pub const Action = enum { run, help, version };
+pub const Action = enum {
+    run,
+    help,
+    version,
+    /// `+list-fonts` — print the discoverable system font families.
+    list_fonts,
+    /// `+list-themes` — print the available themes (built-in catalog).
+    list_themes,
+};
 
 pub const Options = struct {
     action: Action = .run,
@@ -58,6 +66,23 @@ pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) Error!Options {
         }
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             action = .version;
+            continue;
+        }
+
+        // `+name` action subcommands (ghostty-style): `whostty +list-fonts`, etc.
+        // An unrecognized action falls back to showing help.
+        if (arg.len > 1 and arg[0] == '+') {
+            const name = arg[1..];
+            action = if (std.mem.eql(u8, name, "version"))
+                .version
+            else if (std.mem.eql(u8, name, "help"))
+                .help
+            else if (std.mem.eql(u8, name, "list-fonts"))
+                .list_fonts
+            else if (std.mem.eql(u8, name, "list-themes"))
+                .list_themes
+            else
+                .help;
             continue;
         }
 
@@ -121,6 +146,23 @@ test "cli: --help / --version" {
     var v = try parse(testing.allocator, &.{ "-V", "--font-size=10" });
     defer v.deinit();
     try testing.expectEqual(Action.version, v.action);
+}
+
+test "cli: +action subcommands select the action" {
+    inline for (.{
+        .{ "+list-fonts", Action.list_fonts },
+        .{ "+list-themes", Action.list_themes },
+        .{ "+version", Action.version },
+        .{ "+help", Action.help },
+    }) |c| {
+        var o = try parse(testing.allocator, &.{c[0]});
+        defer o.deinit();
+        try testing.expectEqual(c[1], o.action);
+    }
+    // An unknown +action falls back to help rather than launching.
+    var u = try parse(testing.allocator, &.{"+nope"});
+    defer u.deinit();
+    try testing.expectEqual(Action.help, u.action);
 }
 
 test "cli: -e joins the command line" {
