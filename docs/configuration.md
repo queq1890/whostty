@@ -83,7 +83,7 @@ keybind = ctrl+shift+t=new_tab
 - **Keys**: a single printable character (letters fold case; hold `shift`
   separately), or a named key: `enter`/`return`, `tab`, `space`,
   `escape`/`esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`,
-  `pageup`/`page_up`, `pagedown`/`page_down`.
+  `insert`/`ins`, `pageup`/`page_up`, `pagedown`/`page_down`.
 
 User `keybind` lines override the defaults per trigger.
 
@@ -110,6 +110,8 @@ User `keybind` lines override the defaults per trigger.
 | `ctrl+shift+right`/`left`/`down`/`up` | `new_split:<dir>` |
 | `alt+right`/`left`/`down`/`up` | `goto_split:<dir>` |
 | `shift+pageup` / `shift+pagedown` | `scroll_page_up` / `scroll_page_down` |
+| `ctrl+shift+c` / `ctrl+insert` | `copy_to_clipboard` |
+| `ctrl+shift+v` / `shift+insert` | `paste_from_clipboard` |
 
 > Note: the config parsing, keybinding grammar, split/tab models, and scrollback
 > math are implemented and host-tested. Dispatching key events into these models,

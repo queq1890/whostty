@@ -42,6 +42,7 @@ pub const Key = union(enum) {
         right,
         home,
         end,
+        insert,
         page_up,
         page_down,
     };
@@ -185,6 +186,7 @@ fn keyFromName(tok: []const u8) ParseError!Key {
         .{ "up", .up },           .{ "down", .down },
         .{ "left", .left },       .{ "right", .right },
         .{ "home", .home },       .{ "end", .end },
+        .{ "insert", .insert },   .{ "ins", .insert },
         .{ "pageup", .page_up },  .{ "page_up", .page_up },
         .{ "pagedown", .page_down }, .{ "page_down", .page_down },
     });
@@ -324,6 +326,9 @@ pub const default_lines = [_][]const u8{
     "shift+pagedown=scroll_page_down",
     "ctrl+shift+c=copy_to_clipboard",
     "ctrl+shift+v=paste_from_clipboard",
+    // Windows-standard copy/paste (#53): Ctrl+Insert copies, Shift+Insert pastes.
+    "ctrl+insert=copy_to_clipboard",
+    "shift+insert=paste_from_clipboard",
     "ctrl+shift+enter=toggle_fullscreen",
     "ctrl+shift+m=toggle_maximize",
     "ctrl+shift+b=toggle_window_decorations",
@@ -345,6 +350,22 @@ test "binding: every default line parses (so +list-keybinds prints valid syntax)
             return e;
         };
     }
+}
+
+test "binding: ctrl+insert / shift+insert resolve to copy/paste (#53)" {
+    const copy = try parse("ctrl+insert=copy_to_clipboard");
+    try testing.expect(copy.trigger.key.eql(.{ .named = .insert }));
+    try testing.expect(copy.trigger.mods.eql(.{ .ctrl = true }));
+    try testing.expectEqual(Action.copy_to_clipboard, copy.action);
+
+    const pst = try parse("shift+insert=paste_from_clipboard");
+    try testing.expect(pst.trigger.key.eql(.{ .named = .insert }));
+    try testing.expect(pst.trigger.mods.eql(.{ .shift = true }));
+    try testing.expectEqual(Action.paste_from_clipboard, pst.action);
+
+    // "ins" is an accepted alias for the insert key.
+    const alias = try parse("ctrl+ins=copy_to_clipboard");
+    try testing.expect(alias.trigger.key.eql(.{ .named = .insert }));
 }
 
 test "binding: parse a trigger with modifiers and a named key" {
