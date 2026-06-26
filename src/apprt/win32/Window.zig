@@ -170,7 +170,10 @@ pub const Window = struct {
             .cbWndExtra = 0,
             .hInstance = hinstance,
             .hIcon = null,
-            .hCursor = w.LoadCursorW(null, w.IDC_ARROW),
+            // I-beam over the whole client so the terminal reads as text (#52).
+            // (Refinements — an arrow over the tab strip and while an app holds
+            // mouse tracking — are follow-ups; they need per-region app state.)
+            .hCursor = w.LoadCursorW(null, w.IDC_IBEAM),
             .hbrBackground = null,
             .lpszMenuName = null,
             .lpszClassName = class_name,

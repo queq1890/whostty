@@ -421,7 +421,15 @@ pub const VK_RWIN: INT = 0x5C;
 
 pub const GWLP_USERDATA: INT = -21;
 
-pub const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
+// Built-in cursor resource ids are MAKEINTRESOURCE values, not real strings, so
+// they are never dereferenced; type them align(1) since odd ids (e.g. IDC_IBEAM
+// = 32513) aren't 2-byte aligned and an aligned `LPCWSTR` would reject them at
+// comptime.
+pub const ResourceName = [*:0]align(1) const u16;
+pub const IDC_ARROW: ResourceName = @ptrFromInt(32512);
+/// The text-selection (I-beam) cursor — the pointer shown over the terminal grid
+/// so the window reads as text, like every other terminal (#52).
+pub const IDC_IBEAM: ResourceName = @ptrFromInt(32513);
 
 pub const PFD_DRAW_TO_WINDOW: DWORD = 0x00000004;
 pub const PFD_SUPPORT_OPENGL: DWORD = 0x00000020;
@@ -488,7 +496,7 @@ pub fn waitForMessage(timeout_ms: u32) void {
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
 pub extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) INT;
-pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ResourceName) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: INT, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 pub extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: INT) callconv(.winapi) LONG_PTR;
 pub extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
