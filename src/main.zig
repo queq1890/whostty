@@ -10,6 +10,7 @@ const vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
 const w = @import("os/windows.zig");
 const theme = @import("config/theme.zig");
+const config = @import("config.zig");
 const discovery = @import("font/discovery.zig");
 const binding = @import("input/Binding.zig");
 
@@ -39,6 +40,7 @@ pub fn main() !void {
         .list_themes => return listThemesAction(alloc),
         .list_keybinds => return listKeybindsAction(alloc),
         .list_actions => return listActionsAction(alloc),
+        .show_config => return showConfigAction(alloc, opts.config_text),
         .run => {},
     }
 
@@ -66,6 +68,7 @@ const help_text =
     \\  +list-themes       List the available themes.
     \\  +list-keybinds     List the default key bindings.
     \\  +list-actions      List the bindable keybind actions.
+    \\  +show-config       Print the effective config in config-file syntax.
     \\  +version           Show the version.
     \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
@@ -106,6 +109,24 @@ fn listKeybindsAction(alloc: std.mem.Allocator) void {
         out.append(alloc, '\n') catch return;
     }
     cliPrint(out.items);
+}
+
+/// `+show-config`: load the user's config (file + theme + `config-file` includes,
+/// then the `--key value` CLI overrides) and print the effective settings in
+/// config-file syntax, which round-trips back through the loader.
+fn showConfigAction(alloc: std.mem.Allocator, override_text: []const u8) void {
+    var cfg = config.Config.init(alloc);
+    defer cfg.deinit();
+    const dark = if (comptime builtin.os.tag == .windows) w.isSystemDarkMode() else false;
+    const state: config.ConditionalState = .{ .theme = if (dark) .dark else .light };
+    config.loadDefaultFiles(&cfg, alloc, state) catch {};
+    if (override_text.len > 0) cfg.loadString(override_text) catch {};
+
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const ff: config.FileFormatter = .{ .config = &cfg };
+    ff.format(&buf.writer) catch return;
+    cliPrint(buf.written());
 }
 
 /// `+list-actions`: print the bindable keybind action names (one per line), so a
