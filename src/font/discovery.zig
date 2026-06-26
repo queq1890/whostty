@@ -234,6 +234,58 @@ fn discoverWindows(alloc: std.mem.Allocator, desc: Descriptor) !Resolved {
     return .{ .family = chosen_owned, .path = path, .style = desc.style() };
 }
 
+/// Every system font-family name (locale-0), sorted case-sensitively, each plus
+/// the slice owned by `alloc` (free each entry, then the slice). Backs the
+/// `+list-fonts` CLI action (#53). Windows-only; errors on other hosts. The
+/// platform code lives in `listFamiliesWindows` (called only after the comptime
+/// guard) so it isn't analyzed off-Windows — matching `discover`.
+pub fn listFamilies(alloc: std.mem.Allocator) ![][]const u8 {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    return listFamiliesWindows(alloc);
+}
+
+fn listFamiliesWindows(alloc: std.mem.Allocator) ![][]const u8 {
+    var factory_raw: ?*anyopaque = null;
+    if (!dw.SUCCEEDED(dw.DWriteCreateFactory(
+        dw.DWRITE_FACTORY_TYPE_SHARED,
+        &dw.IID_IDWriteFactory,
+        &factory_raw,
+    ))) return error.DWriteFactoryFailed;
+    const factory: *dw.IDWriteFactory = @ptrCast(@alignCast(factory_raw.?));
+    defer _ = factory.Release();
+
+    var collection: ?*dw.IDWriteFontCollection = null;
+    if (!dw.SUCCEEDED(factory.GetSystemFontCollection(&collection, win.FALSE)) or collection == null)
+        return error.DWriteCollectionFailed;
+    const coll = collection.?;
+    defer _ = coll.Release();
+
+    const count = coll.GetFontFamilyCount();
+    var names = std.ArrayList([]const u8){};
+    errdefer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    try names.ensureTotalCapacity(alloc, count);
+
+    var i: dw.UINT32 = 0;
+    while (i < count) : (i += 1) {
+        const name = familyName(alloc, coll, i) catch continue;
+        names.append(alloc, name) catch {
+            alloc.free(name);
+            return error.OutOfMemory;
+        };
+    }
+
+    const slice = try names.toOwnedSlice(alloc);
+    std.mem.sort([]const u8, slice, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return slice;
+}
+
 /// Read family index `i`'s first localized name as owned UTF-8.
 fn familyName(alloc: std.mem.Allocator, coll: *dw.IDWriteFontCollection, i: dw.UINT32) ![]const u8 {
     var family: ?*dw.IDWriteFontFamily = null;

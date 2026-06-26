@@ -9,6 +9,8 @@ const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
 const w = @import("os/windows.zig");
+const theme = @import("config/theme.zig");
+const discovery = @import("font/discovery.zig");
 
 // Canonical version lives in build.zig.zon (`.version`); keep this literal in
 // lockstep with it and the git release tag when bumping.
@@ -32,6 +34,8 @@ pub fn main() !void {
     switch (opts.action) {
         .help => return cliPrint(help_text),
         .version => return cliPrint(version_string ++ "\n"),
+        .list_fonts => return listFontsAction(alloc),
+        .list_themes => return listThemesAction(alloc),
         .run => {},
     }
 
@@ -54,9 +58,58 @@ const help_text =
     \\  --help, -h         Show this help.
     \\  --version, -V      Show the version.
     \\
+    \\Actions:
+    \\  +list-fonts        List the discoverable system font families.
+    \\  +list-themes       List the available themes.
+    \\  +version           Show the version.
+    \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
     \\
 ;
+
+/// `+list-themes`: print the built-in theme catalog (sorted) plus where to add
+/// custom themes. Output goes to the launching console via `cliPrint`.
+fn listThemesAction(alloc: std.mem.Allocator) void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const sorted = alloc.dupe([]const u8, theme.builtin.keys()) catch return;
+    defer alloc.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    out.appendSlice(alloc, "Built-in themes:\n") catch return;
+    for (sorted) |name| {
+        out.appendSlice(alloc, "  ") catch return;
+        out.appendSlice(alloc, name) catch return;
+        out.append(alloc, '\n') catch return;
+    }
+    out.appendSlice(alloc, "\nAdd your own under %APPDATA%\\whostty\\themes\\ or <exe dir>\\themes\\.\n") catch return;
+    cliPrint(out.items);
+}
+
+/// `+list-fonts`: print the discoverable system font families (one per line).
+fn listFontsAction(alloc: std.mem.Allocator) void {
+    const families = discovery.listFamilies(alloc) catch {
+        cliPrint("Unable to list fonts: the DirectWrite system font collection is unavailable.\n");
+        return;
+    };
+    defer {
+        for (families) |f| alloc.free(f);
+        alloc.free(families);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (families) |f| {
+        out.appendSlice(alloc, f) catch return;
+        out.append(alloc, '\n') catch return;
+    }
+    cliPrint(out.items);
+}
 
 /// Print CLI output. whostty is a GUI-subsystem app on Windows (so the spawned
 /// shell can't grab its console), which means it has no console of its own; we
