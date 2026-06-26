@@ -21,6 +21,7 @@ pub fn keyFromVk(vk: u32) ?binding.Key {
         0x22 => .{ .named = .page_down },
         0x24 => .{ .named = .home },
         0x23 => .{ .named = .end },
+        0x2D => .{ .named = .insert }, // VK_INSERT — ctrl/shift+insert copy/paste (#53)
         0x0D => .{ .named = .enter },
         0x09 => .{ .named = .tab },
         0x1B => .{ .named = .escape },
@@ -38,6 +39,7 @@ test "keymap: named keys" {
     try testing.expect(keyFromVk(0x27).?.eql(.{ .named = .right }));
     try testing.expect(keyFromVk(0x21).?.eql(.{ .named = .page_up }));
     try testing.expect(keyFromVk(0x1B).?.eql(.{ .named = .escape }));
+    try testing.expect(keyFromVk(0x2D).?.eql(.{ .named = .insert })); // VK_INSERT (#53)
 }
 
 test "keymap: letters fold to lowercase, digits pass through" {
