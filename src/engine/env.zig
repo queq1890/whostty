@@ -29,6 +29,12 @@ pub const term = "xterm-ghostty";
 /// `TERMINFO` at; see the apprt's terminfo resolution (#152).
 pub const fallback_term = "xterm-256color";
 
+/// The `TERM_PROGRAM` advertised to the child process. By convention each
+/// terminal reports its own name (apps read it for telemetry and feature hints);
+/// whostty reports `whostty`. A host embedding the engine (e.g. whomux) can
+/// override it via `Options.term_program`.
+pub const program = "whostty";
+
 /// One environment variable to inject. `key` and `value` are owned by the
 /// allocator passed to `compute` (released by `free`).
 pub const Entry = struct {
@@ -51,6 +57,9 @@ pub const Options = struct {
     /// terminfo is resolvable, so apps never receive an unresolvable `TERM`
     /// (#152). When set to the fallback, leave `terminfo_dir` null.
     term: []const u8 = term,
+    /// The `TERM_PROGRAM` to advertise. Defaults to the engine's `program`
+    /// (`whostty`); a host embedding the engine can override it.
+    term_program: []const u8 = program,
     /// Absolute path to the bundled terminfo dir (the compiled entries). When
     /// null, `TERMINFO` is left unset and apps fall back to the system terminfo
     /// database.
@@ -63,16 +72,17 @@ pub const Options = struct {
 };
 
 /// Compute the child-process environment entries to inject at pane spawn, owned
-/// by `alloc` (release with `free`). Always sets `TERM` (to `opts.term`) and
-/// `COLORTERM`; sets `TERMINFO` when a dir is given; and, when shell integration
-/// is enabled, sets `GHOSTTY_SHELL_INTEGRATION` plus the comma-joined
-/// `GHOSTTY_SHELL_FEATURES`.
+/// by `alloc` (release with `free`). Always sets `TERM` (to `opts.term`),
+/// `COLORTERM` and `TERM_PROGRAM`; sets `TERMINFO` when a dir is given; and, when
+/// shell integration is enabled, sets `GHOSTTY_SHELL_INTEGRATION` plus the
+/// comma-joined `GHOSTTY_SHELL_FEATURES`.
 pub fn compute(alloc: std.mem.Allocator, opts: Options) ![]Entry {
     var list: std.ArrayListUnmanaged(Entry) = .empty;
     errdefer freeList(alloc, &list);
 
     try put(alloc, &list, "TERM", opts.term);
     try put(alloc, &list, "COLORTERM", "truecolor");
+    try put(alloc, &list, "TERM_PROGRAM", opts.term_program);
     if (opts.terminfo_dir) |dir| try put(alloc, &list, "TERMINFO", dir);
 
     if (opts.shell_integration) {
@@ -144,7 +154,15 @@ test "env: base entries set TERM, COLORTERM and TERMINFO" {
 
     try std.testing.expectEqualStrings("xterm-ghostty", get(entries, "TERM").?);
     try std.testing.expectEqualStrings("truecolor", get(entries, "COLORTERM").?);
+    try std.testing.expectEqualStrings("whostty", get(entries, "TERM_PROGRAM").?);
     try std.testing.expectEqualStrings("C:/whostty/terminfo", get(entries, "TERMINFO").?);
+}
+
+test "env: a host can override TERM_PROGRAM (the engine is reusable)" {
+    const alloc = std.testing.allocator;
+    const entries = try compute(alloc, .{ .term_program = "whomux" });
+    defer free(alloc, entries);
+    try std.testing.expectEqualStrings("whomux", get(entries, "TERM_PROGRAM").?);
 }
 
 test "env: shell-integration vars are injected with the active features" {
