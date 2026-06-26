@@ -1090,6 +1090,17 @@ pub const Termio = struct {
         self.terminal.screens.active.clearSelection();
     }
 
+    /// Select the entire scrollback + screen (the `select_all` keybind, #53).
+    /// Replaces any current selection; a no-op on an empty screen. Drops any
+    /// in-progress drag anchor so a later extend can't reuse a stale pin.
+    pub fn selectAll(self: *Termio) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.releaseAnchorLocked();
+        const screen = self.terminal.screens.active;
+        if (screen.selectAll()) |sel| screen.select(sel) catch {};
+    }
+
     /// Encode a mouse event as a VT report into `buf` if the terminal currently
     /// requests mouse tracking, else null. Reads the mode/format under the lock.
     /// The MouseEvents/MouseFormat enums share integer values with mouse.zig's.
@@ -1175,6 +1186,23 @@ test "termio: selection over written cells yields the selected text" {
     try std.testing.expectEqualStrings("hello", text);
 
     io.selectEnd();
+    io.clearSelection();
+    try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
+}
+
+test "termio: selectAll selects the whole screen, readable via selectionStringAlloc (#53)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    try io.process("alpha\r\nbravo");
+    io.selectAll();
+
+    const text = (try io.selectionStringAlloc(alloc)) orelse return error.NoSelection;
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bravo") != null);
+
     io.clearSelection();
     try std.testing.expect((try io.selectionStringAlloc(alloc)) == null);
 }

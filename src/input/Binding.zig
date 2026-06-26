@@ -95,6 +95,8 @@ pub const Action = union(enum) {
     scroll_to_bottom,
     copy_to_clipboard,
     paste_from_clipboard,
+    /// Select the entire scrollback + screen (#53).
+    select_all,
     /// Window-state actions (#91). Borderless windowed fullscreen, maximize/
     /// restore, and show/hide the titlebar+resize border. Each acts on the
     /// current window (the apprt's single surface). Void-payload, mirroring
@@ -248,6 +250,7 @@ pub fn parseAction(input: []const u8) ParseError!Action {
     if (eqlIgnoreCase(name, "scroll_to_bottom")) return .scroll_to_bottom;
     if (eqlIgnoreCase(name, "copy_to_clipboard")) return .copy_to_clipboard;
     if (eqlIgnoreCase(name, "paste_from_clipboard")) return .paste_from_clipboard;
+    if (eqlIgnoreCase(name, "select_all")) return .select_all;
     if (eqlIgnoreCase(name, "toggle_fullscreen")) return .toggle_fullscreen;
     if (eqlIgnoreCase(name, "toggle_maximize")) return .toggle_maximize;
     if (eqlIgnoreCase(name, "toggle_window_decorations")) return .toggle_window_decorations;
@@ -339,6 +342,7 @@ pub const default_lines = [_][]const u8{
     // Windows-standard copy/paste (#53): Ctrl+Insert copies, Shift+Insert pastes.
     "ctrl+insert=copy_to_clipboard",
     "shift+insert=paste_from_clipboard",
+    "ctrl+shift+a=select_all",
     "ctrl+shift+enter=toggle_fullscreen",
     "ctrl+shift+m=toggle_maximize",
     "ctrl+shift+b=toggle_window_decorations",
@@ -433,6 +437,7 @@ test "binding: parse actions with and without arguments" {
     try testing.expectEqual(Action.scroll_to_bottom, try parseAction("scroll_to_bottom"));
     try testing.expectEqual(Action.copy_to_clipboard, try parseAction("copy_to_clipboard"));
     try testing.expectEqual(Action.paste_from_clipboard, try parseAction("paste_from_clipboard"));
+    try testing.expectEqual(Action.select_all, try parseAction("select_all"));
     // Window-state actions (#91), void-payload.
     try testing.expectEqual(Action.toggle_fullscreen, try parseAction("toggle_fullscreen"));
     try testing.expectEqual(Action.toggle_maximize, try parseAction("toggle_maximize"));
