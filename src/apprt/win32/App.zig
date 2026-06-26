@@ -1162,11 +1162,19 @@ fn runSurface(app: *App) !void {
                     };
                 },
                 .mouse_move => |m| {
-                    if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.mouseDrag(m.x, m.y, .{
-                        .shift = m.mods.shift,
-                        .alt = m.mods.alt,
-                        .ctrl = m.mods.ctrl,
-                    });
+                    const mm: mouse.Mods = .{ .shift = m.mods.shift, .alt = m.mods.alt, .ctrl = m.mods.ctrl };
+                    if (ws.drag_id) |d| {
+                        // A left-drag in progress: extend the selection or report
+                        // held-button motion (1002/1003) for the dragging pane.
+                        if (ws.paneById(d)) |pane| pane.sfc.mouseDrag(m.x, m.y, mm);
+                    } else {
+                        // No drag: route a no-button hover move to the pane under
+                        // the cursor — reported only when an app enabled any-event
+                        // tracking (mode 1003), a no-op otherwise.
+                        const bounds = ws.contentBounds();
+                        if (ws.activeTree().surfaceAt(@floatFromInt(m.x), @floatFromInt(m.y), bounds)) |id|
+                            if (ws.paneById(id)) |pane| pane.sfc.mouseHover(m.x, m.y, mm);
+                    }
                 },
                 .mouse_capture_lost => {
                     if (ws.drag_id) |d| if (ws.paneById(d)) |pane| pane.sfc.endDrag();

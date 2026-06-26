@@ -43,9 +43,11 @@ pub fn encode(
         .x10 => if (action != .press or !isClick(button)) return null,
         // Normal reports presses/releases/wheel but not motion.
         .normal => if (action == .motion) return null,
-        // Button/any: a button (or wheel) must be involved for our first cut
-        // (we don't emit no-button motion yet).
-        .button, .any => if (button == null) return null,
+        // Button (1002): motion is reported only while a button is held.
+        .button => if (button == null) return null,
+        // Any (1003): reports all motion, including no-button hover motion
+        // (encoded with the dedicated "no button" code, 3).
+        .any => {},
     }
 
     const sgr = format == .sgr or format == .sgr_pixels;
@@ -171,6 +173,16 @@ test "mouse: button/any modes report held-button drag motion with the +32 bit" {
     try testing.expectEqualStrings("\x1b[<48;6;3M", encode(&buf, .any, .sgr, .left, .motion, .{ .ctrl = true }, 5, 2).?);
     // X10 mode never reports motion.
     try testing.expect(encode(&buf, .x10, .sgr, .left, .motion, .{}, 5, 2) == null);
+}
+
+test "mouse: any mode reports no-button (hover) motion; button mode does not" {
+    var buf: [32]u8 = undefined;
+    // Any mode (1003): no-button motion uses the "no button" code 3, + motion(32)
+    // = 35, at viewport (5,2) -> 1-based (6,3).
+    try testing.expectEqualStrings("\x1b[<35;6;3M", encode(&buf, .any, .sgr, null, .motion, .{}, 5, 2).?);
+    // Button mode (1002) only reports motion while a button is held, so no-button
+    // motion is dropped.
+    try testing.expect(encode(&buf, .button, .sgr, null, .motion, .{}, 5, 2) == null);
 }
 
 test "mouse: X10 format rejects coordinates past 223" {

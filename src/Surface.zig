@@ -143,6 +143,20 @@ pub const Surface = struct {
         }
     }
 
+    /// Mouse moved with no button held. For an app in any-event tracking (mode
+    /// 1003) this reports no-button motion, deduped per cell; in every other mode
+    /// it is a no-op (button/normal modes don't report hover, and there is no
+    /// local selection to extend). (#52)
+    pub fn mouseHover(self: *Surface, px_x: i32, px_y: i32, mods: mouse.Mods) void {
+        const cell = grid.cellFromPixels(px_x, px_y, self.cell_w, self.cell_h, self.cols, self.rows, self.origin_x, self.origin_y);
+        if (self.last_motion_cell) |lc| if (lc.x == cell.x and lc.y == cell.y) return;
+        var buf: [32]u8 = undefined;
+        if (self.termio.encodeMouseReport(&buf, cell.x, cell.y, null, .motion, mods)) |bytes| {
+            _ = self.pty.write(bytes) catch {};
+            self.last_motion_cell = .{ .x = cell.x, .y = cell.y };
+        }
+    }
+
     /// End an in-progress drag (button release already handled, or capture was
     /// lost). Releases the selection anchor (keeping the selection) and the motion
     /// dedup, so neither outlives the drag — the next left-press re-establishes

@@ -1090,7 +1090,7 @@ pub const Termio = struct {
         buf: []u8,
         col: u16,
         row: u16,
-        button: mouse.Button,
+        button: ?mouse.Button,
         action: mouse.Action,
         mods: mouse.Mods,
     ) ?[]const u8 {
