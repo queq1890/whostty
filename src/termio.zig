@@ -300,10 +300,18 @@ const ResponseHandler = struct {
         const dec = std.base64.standard.Decoder;
         const n = dec.calcSizeForSlice(cc.data) catch return;
         const buf = self.alloc.alloc(u8, n) catch return;
+        // Zero before decoding. A misplaced pad char in a non-final group makes
+        // the std decoder write only the leading bytes and then return
+        // error.InvalidPadding, leaving the tail of `buf` unwritten. We keep that
+        // prefix (see below), so the tail must not be uninitialized heap — that
+        // would leak process memory to the user's clipboard (#162). Zeroed tail
+        // bytes truncate harmlessly at the NUL when the UI thread converts the
+        // payload to CF_UNICODETEXT.
+        @memset(buf, 0);
         dec.decode(buf, cc.data) catch |err| switch (err) {
-            // Non-canonical trailing bits: the decoded prefix is valid and fully
-            // written, so keep it — matching ghostty, which accepts this because
-            // some encoders emit it for otherwise-fine data.
+            // Non-canonical trailing bits: the decoded prefix is valid, so keep
+            // it — matching ghostty, which accepts this because some encoders
+            // emit it for otherwise-fine data. Any unwritten tail is zero (above).
             error.InvalidPadding => {},
             else => {
                 self.alloc.free(buf);
@@ -1415,6 +1423,30 @@ test "termio: OSC 52 accepts non-canonical padding like ghostty" {
     const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
     defer alloc.free(got);
     try std.testing.expectEqualStrings("i", got);
+}
+
+test "termio: OSC 52 mid-stream padding does not leak uninitialized heap (#162)" {
+    const alloc = std.testing.allocator;
+    const io = try Termio.create(alloc, 20, 3, 1 << 20);
+    defer io.destroy();
+
+    // Prime the 9-byte (size-class 16) clipboard slot with non-zero residue and
+    // free it, so an uninitialized-memory leak would surface as 0x41 ('A') rather
+    // than an incidental zero page. "QUFBQUFBQUFB" decodes to 9 bytes of 'A'.
+    try io.process("\x1b]52;c;QUFBQUFBQUFB\x07");
+    const primer = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    try std.testing.expectEqual(@as(usize, 9), primer.len);
+    alloc.free(primer);
+
+    // "QUFBQUFB==AA": a misplaced '=' in a non-final group makes the decoder
+    // write only the leading 7 bytes of the 9-byte buffer and raise
+    // InvalidPadding, leaving 2 bytes that must be zeroed, not heap residue.
+    try io.process("\x1b]52;c;QUFBQUFB==AA\x07");
+    const got = io.takeClipboardWrite() orelse return error.NoClipboardWrite;
+    defer alloc.free(got);
+    try std.testing.expectEqual(@as(usize, 9), got.len);
+    try std.testing.expectEqual(@as(u8, 0), got[7]);
+    try std.testing.expectEqual(@as(u8, 0), got[8]);
 }
 
 test "termio: OSC 52 empty payload clears the clipboard" {
