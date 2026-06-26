@@ -38,6 +38,7 @@ pub fn main() !void {
         .list_fonts => return listFontsAction(alloc),
         .list_themes => return listThemesAction(alloc),
         .list_keybinds => return listKeybindsAction(alloc),
+        .list_actions => return listActionsAction(alloc),
         .run => {},
     }
 
@@ -64,6 +65,7 @@ const help_text =
     \\  +list-fonts        List the discoverable system font families.
     \\  +list-themes       List the available themes.
     \\  +list-keybinds     List the default key bindings.
+    \\  +list-actions      List the bindable keybind actions.
     \\  +version           Show the version.
     \\
     \\Config file: %APPDATA%\whostty\config.whostty (legacy: %APPDATA%\whostty\config)
@@ -101,6 +103,18 @@ fn listKeybindsAction(alloc: std.mem.Allocator) void {
     defer out.deinit(alloc);
     for (binding.default_lines) |line| {
         out.appendSlice(alloc, line) catch return;
+        out.append(alloc, '\n') catch return;
+    }
+    cliPrint(out.items);
+}
+
+/// `+list-actions`: print the bindable keybind action names (one per line), so a
+/// user can discover what the right side of a `keybind = trigger=action` may be.
+fn listActionsAction(alloc: std.mem.Allocator) void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (binding.action_names) |name| {
+        out.appendSlice(alloc, name) catch return;
         out.append(alloc, '\n') catch return;
     }
     cliPrint(out.items);

@@ -21,6 +21,8 @@ pub const Action = enum {
     list_themes,
     /// `+list-keybinds` — print the default key bindings.
     list_keybinds,
+    /// `+list-actions` — print the bindable keybind action names.
+    list_actions,
 };
 
 pub const Options = struct {
@@ -85,6 +87,8 @@ pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) Error!Options {
                 .list_themes
             else if (std.mem.eql(u8, name, "list-keybinds"))
                 .list_keybinds
+            else if (std.mem.eql(u8, name, "list-actions"))
+                .list_actions
             else
                 .help;
             continue;
@@ -157,6 +161,7 @@ test "cli: +action subcommands select the action" {
         .{ "+list-fonts", Action.list_fonts },
         .{ "+list-themes", Action.list_themes },
         .{ "+list-keybinds", Action.list_keybinds },
+        .{ "+list-actions", Action.list_actions },
         .{ "+version", Action.version },
         .{ "+help", Action.help },
     }) |c| {
