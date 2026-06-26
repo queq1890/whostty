@@ -112,6 +112,7 @@ User `keybind` lines override the defaults per trigger.
 | `ctrl+shift+right`/`left`/`down`/`up` | `new_split:<dir>` |
 | `alt+right`/`left`/`down`/`up` | `goto_split:<dir>` |
 | `shift+pageup` / `shift+pagedown` | `scroll_page_up` / `scroll_page_down` |
+| `shift+home` / `shift+end` | `scroll_to_top` / `scroll_to_bottom` |
 | `ctrl+shift+c` / `ctrl+insert` | `copy_to_clipboard` |
 | `ctrl+shift+v` / `shift+insert` | `paste_from_clipboard` |
 | `ctrl+shift+a` | `select_all` |

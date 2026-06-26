@@ -337,6 +337,8 @@ pub const default_lines = [_][]const u8{
     "alt+up=goto_split:up",
     "shift+pageup=scroll_page_up",
     "shift+pagedown=scroll_page_down",
+    "shift+home=scroll_to_top",
+    "shift+end=scroll_to_bottom",
     "ctrl+shift+c=copy_to_clipboard",
     "ctrl+shift+v=paste_from_clipboard",
     // Windows-standard copy/paste (#53): Ctrl+Insert copies, Shift+Insert pastes.
@@ -380,6 +382,18 @@ test "binding: ctrl+insert / shift+insert resolve to copy/paste (#53)" {
     // "ins" is an accepted alias for the insert key.
     const alias = try parse("ctrl+ins=copy_to_clipboard");
     try testing.expect(alias.trigger.key.eql(.{ .named = .insert }));
+}
+
+test "binding: shift+home / shift+end scroll to the scrollback ends (#53)" {
+    const top = try parse("shift+home=scroll_to_top");
+    try testing.expect(top.trigger.key.eql(.{ .named = .home }));
+    try testing.expect(top.trigger.mods.eql(.{ .shift = true }));
+    try testing.expectEqual(Action.scroll_to_top, top.action);
+
+    const bot = try parse("shift+end=scroll_to_bottom");
+    try testing.expect(bot.trigger.key.eql(.{ .named = .end }));
+    try testing.expect(bot.trigger.mods.eql(.{ .shift = true }));
+    try testing.expectEqual(Action.scroll_to_bottom, bot.action);
 }
 
 test "binding: action_names lists every action and each one parses (#53)" {
