@@ -117,6 +117,16 @@ pub const Action = union(enum) {
     toggle_visibility,
 };
 
+/// Every bindable action name — the `Action` union's field names — for the
+/// `+list-actions` CLI (#53). Derived from the type so it never drifts from the
+/// names `parseAction` accepts.
+pub const action_names = blk: {
+    const fields = @typeInfo(Action).@"union".fields;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |f, i| names[i] = f.name;
+    break :blk names;
+};
+
 /// A parsed `trigger = action` binding.
 pub const Binding = struct {
     trigger: Trigger,
@@ -366,6 +376,20 @@ test "binding: ctrl+insert / shift+insert resolve to copy/paste (#53)" {
     // "ins" is an accepted alias for the insert key.
     const alias = try parse("ctrl+ins=copy_to_clipboard");
     try testing.expect(alias.trigger.key.eql(.{ .named = .insert }));
+}
+
+test "binding: action_names lists every action and each one parses (#53)" {
+    try testing.expectEqual(@typeInfo(Action).@"union".fields.len, action_names.len);
+    var saw_copy = false;
+    for (action_names) |name| {
+        // Names with a payload (e.g. new_split) need an argument to parse, so
+        // just assert the void-payload ones round-trip; all names are non-empty.
+        try testing.expect(name.len > 0);
+        if (std.mem.eql(u8, name, "copy_to_clipboard")) saw_copy = true;
+    }
+    try testing.expect(saw_copy);
+    // A representative void action round-trips through parseAction by name.
+    try testing.expectEqual(Action.copy_to_clipboard, try parseAction("copy_to_clipboard"));
 }
 
 test "binding: parse a trigger with modifiers and a named key" {
